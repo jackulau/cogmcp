@@ -390,14 +390,6 @@ impl Database {
             name.to_string()
         };
 
-        let base_query = r#"
-            SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line,
-                   s.signature, s.doc_comment, f.path,
-                   s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported,
-                   s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
-            FROM symbols s JOIN files f ON s.file_id = f.id
-        "#;
-
         let query = if fuzzy {
             r#"SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, s.doc_comment, f.path,
                       s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported, s.is_const, s.is_unsafe,

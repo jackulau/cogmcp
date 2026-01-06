@@ -12,6 +12,7 @@ pub struct FullTextIndex {
     index: Index,
     reader: IndexReader,
     writer: parking_lot::Mutex<IndexWriter>,
+    #[allow(dead_code)]
     schema: Schema,
     // Field handles
     path_field: Field,
@@ -104,7 +105,7 @@ impl FullTextIndex {
 
     /// Index a file's content line by line
     pub fn index_file(&self, path: &str, content: &str) -> Result<()> {
-        let mut writer = self.writer.lock();
+        let writer = self.writer.lock();
 
         // Delete existing documents for this file
         let path_term = tantivy::Term::from_field_text(self.path_field, path);
@@ -188,7 +189,7 @@ impl FullTextIndex {
 
     /// Delete all documents for a file
     pub fn delete_file(&self, path: &str) -> Result<()> {
-        let mut writer = self.writer.lock();
+        let writer = self.writer.lock();
         let path_term = tantivy::Term::from_field_text(self.path_field, path);
         writer.delete_term(path_term);
         Ok(())

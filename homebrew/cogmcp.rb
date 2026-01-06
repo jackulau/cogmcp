@@ -1,36 +1,17 @@
 # Homebrew formula for CogMCP
-# To use: brew install cogmcp/tap/cogmcp
+# To use: brew tap cogmcp/tap && brew install cogmcp
 
-class Contextmcp < Formula
+class Cogmcp < Formula
   desc "Local-first MCP server for AI coding assistants"
   homepage "https://github.com/cogmcp/cogmcp"
-  version "0.1.0"
+  url "https://github.com/cogmcp/cogmcp.git", tag: "v0.1.0"
   license "MIT"
+  head "https://github.com/cogmcp/cogmcp.git", branch: "main"
 
-  on_macos do
-    on_arm do
-      url "https://github.com/cogmcp/cogmcp/releases/download/v0.1.0/cogmcp-darwin-aarch64.tar.gz"
-      sha256 "PLACEHOLDER_SHA256_ARM64"
-    end
-    on_intel do
-      url "https://github.com/cogmcp/cogmcp/releases/download/v0.1.0/cogmcp-darwin-x86_64.tar.gz"
-      sha256 "PLACEHOLDER_SHA256_X64"
-    end
-  end
-
-  on_linux do
-    on_arm do
-      url "https://github.com/cogmcp/cogmcp/releases/download/v0.1.0/cogmcp-linux-aarch64.tar.gz"
-      sha256 "PLACEHOLDER_SHA256_LINUX_ARM64"
-    end
-    on_intel do
-      url "https://github.com/cogmcp/cogmcp/releases/download/v0.1.0/cogmcp-linux-x86_64.tar.gz"
-      sha256 "PLACEHOLDER_SHA256_LINUX_X64"
-    end
-  end
+  depends_on "rust" => :build
 
   def install
-    bin.install "cogmcp"
+    system "cargo", "install", *std_cargo_args(path: "crates/cogmcp-server")
   end
 
   def caveats
@@ -44,6 +25,6 @@ class Contextmcp < Formula
   end
 
   test do
-    assert_match "cogmcp", shell_output("#{bin}/cogmcp --version")
+    assert_match "cogmcp #{version}", shell_output("#{bin}/cogmcp --version")
   end
 end
