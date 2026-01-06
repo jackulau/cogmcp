@@ -3,9 +3,12 @@
 //! This crate provides persistent storage for the file index,
 //! symbols, embeddings, and full-text search.
 
+pub mod cache;
 pub mod sqlite;
 pub mod tantivy_index;
-pub mod cache;
 
-pub use sqlite::Database;
+pub use sqlite::{
+    deserialize_parameters, deserialize_type_params, serialize_parameters, serialize_type_params,
+    Database, ExtendedSymbolMetadata, FileRow, IndexStats, ParameterInfo, SymbolRow,
+};
 pub use tantivy_index::FullTextIndex;
