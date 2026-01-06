@@ -1,12 +1,12 @@
 //! Codebase file indexing
 
-use crate::parser::CodeParser;
+use crate::parser::{CodeParser, ExtractedSymbol};
 use contextmcp_core::types::Language;
 use contextmcp_core::{Config, Error, Result};
 use contextmcp_embeddings::EmbeddingEngine;
 use contextmcp_storage::{Database, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -135,8 +135,8 @@ impl CodebaseIndexer {
                 continue;
             }
 
-            // Index the file
-            match self.index_file(path, db, text_index) {
+            // Index the file and track symbol statistics
+            match self.index_file_with_stats(path, db, text_index, &mut result) {
                 Ok(_) => result.indexed += 1,
                 Err(e) => {
                     tracing::warn!("Failed to index {:?}: {}", path, e);
@@ -149,6 +149,72 @@ impl CodebaseIndexer {
         text_index.commit()?;
 
         Ok(result)
+    }
+
+    /// Index a single file and update statistics
+    fn index_file_with_stats(
+        &self,
+        path: &Path,
+        db: &Database,
+        text_index: &FullTextIndex,
+        result: &mut IndexResult,
+    ) -> Result<()> {
+        let content = fs::read_to_string(path)?;
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        // Compute file hash
+        let hash = Self::hash_content(&content);
+
+        // Get file metadata
+        let metadata = fs::metadata(path)?;
+        let modified_at = metadata
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let size = metadata.len();
+
+        // Detect language
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let language = Language::from_extension(ext);
+        let language_str = format!("{:?}", language).to_lowercase();
+
+        // Insert into database
+        let file_id = db.upsert_file(&relative_path, &hash, modified_at, size, &language_str)?;
+
+        // Parse and extract symbols with enhanced metadata
+        if let Ok(symbols) = self.parser.parse(&content, language) {
+            // Delete old symbols for this file
+            let _ = db.delete_symbols_for_file(file_id);
+
+            // Track statistics
+            for sym in &symbols {
+                result.symbols_extracted += 1;
+                let kind_str = format!("{:?}", sym.kind).to_lowercase();
+                *result.symbols_by_kind.entry(kind_str).or_insert(0) += 1;
+
+                if sym.visibility != contextmcp_core::types::SymbolVisibility::Unknown {
+                    result.symbols_with_visibility += 1;
+                }
+            }
+
+            // Insert new symbols with parent relationship handling
+            self.insert_symbols_with_relationships(db, file_id, &symbols)?;
+        }
+
+        // Index in full-text search
+        text_index.index_file(&relative_path, &content)?;
+
+        Ok(())
     }
 
     /// Index a single file
@@ -190,49 +256,13 @@ impl CodebaseIndexer {
         // Insert into database
         let file_id = db.upsert_file(&relative_path, &hash, modified_at, size, &language_str)?;
 
-        // Parse and extract symbols
+        // Parse and extract symbols with enhanced metadata
         if let Ok(symbols) = self.parser.parse(&content, language) {
             // Delete old symbols for this file
             let _ = db.delete_symbols_for_file(file_id);
 
-            // Insert new symbols and generate embeddings
-            let generate_embeddings = self.embeddings_enabled();
-
-            for sym in &symbols {
-                let kind_str = format!("{:?}", sym.kind).to_lowercase();
-                let symbol_id = db.insert_symbol(
-                    file_id,
-                    &sym.name,
-                    &kind_str,
-                    sym.start_line,
-                    sym.end_line,
-                    sym.signature.as_deref(),
-                    sym.doc_comment.as_deref(),
-                )?;
-
-                // Generate embedding for symbol if enabled
-                if generate_embeddings {
-                    if let Err(e) = self.generate_embedding_for_symbol(
-                        db,
-                        symbol_id,
-                        sym,
-                        &content,
-                        &kind_str,
-                    ) {
-                        warn!(
-                            "Failed to generate embedding for symbol {} in {}: {}",
-                            sym.name, relative_path, e
-                        );
-                    }
-                }
-            }
-
-            debug!(
-                "Indexed {} symbols from {}, embeddings: {}",
-                symbols.len(),
-                relative_path,
-                generate_embeddings
-            );
+            // Insert new symbols with parent relationship handling
+            self.insert_symbols_with_relationships(db, file_id, &symbols)?;
         }
 
         // Index in full-text search
@@ -241,78 +271,70 @@ impl CodebaseIndexer {
         Ok(())
     }
 
-    /// Generate an embedding for a symbol
-    fn generate_embedding_for_symbol(
+    /// Insert symbols and establish parent-child relationships
+    fn insert_symbols_with_relationships(
         &self,
         db: &Database,
-        symbol_id: i64,
-        sym: &crate::parser::ExtractedSymbol,
-        content: &str,
-        kind_str: &str,
+        file_id: i64,
+        symbols: &[ExtractedSymbol],
     ) -> Result<()> {
-        let engine = self.embedding_engine.as_ref().ok_or_else(|| {
-            Error::Embedding("Embedding engine not configured".into())
-        })?;
+        // First pass: insert all symbols without parent references and track name -> id mapping
+        let mut name_to_id: HashMap<String, i64> = HashMap::new();
 
-        // Extract the symbol's code chunk from the file content
-        let chunk_text = Self::extract_symbol_chunk(sym, content);
+        for sym in symbols {
+            let kind_str = format!("{:?}", sym.kind).to_lowercase();
+            let visibility_str = sym.visibility.as_str();
 
-        // Skip very short chunks (probably just declarations)
-        if chunk_text.len() < 10 {
-            return Ok(());
+            // Serialize type parameters and parameters as JSON
+            let type_params_json = if sym.type_parameters.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&sym.type_parameters).unwrap_or_default())
+            };
+
+            let params_json = if sym.parameters.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&sym.parameters).unwrap_or_default())
+            };
+
+            let symbol_id = db.insert_symbol_extended(
+                file_id,
+                &sym.name,
+                &kind_str,
+                sym.start_line,
+                sym.end_line,
+                sym.signature.as_deref(),
+                sym.doc_comment.as_deref(),
+                Some(visibility_str),
+                sym.modifiers.is_async,
+                sym.modifiers.is_static,
+                sym.modifiers.is_abstract,
+                sym.modifiers.is_exported,
+                sym.modifiers.is_const,
+                sym.modifiers.is_unsafe,
+                None, // parent_symbol_id will be set in second pass
+                type_params_json.as_deref(),
+                params_json.as_deref(),
+                sym.return_type.as_deref(),
+            )?;
+
+            name_to_id.insert(sym.name.clone(), symbol_id);
         }
 
-        // Generate embedding
-        let embedding = engine.embed(&chunk_text)?;
-
-        // Store in database
-        db.insert_embedding(Some(symbol_id), &chunk_text, &embedding, kind_str)?;
-
-        Ok(())
-    }
-
-    /// Extract the code chunk for a symbol from file content
-    fn extract_symbol_chunk(sym: &crate::parser::ExtractedSymbol, content: &str) -> String {
-        let lines: Vec<&str> = content.lines().collect();
-        let start = (sym.start_line as usize).saturating_sub(1);
-        let end = std::cmp::min(sym.end_line as usize, lines.len());
-
-        if start >= lines.len() {
-            return String::new();
-        }
-
-        // Build the chunk with the symbol name prepended for better context
-        let mut chunk = String::new();
-
-        // Add doc comment if available
-        if let Some(ref doc) = sym.doc_comment {
-            chunk.push_str(doc);
-            chunk.push('\n');
-        }
-
-        // Add signature if available, otherwise use name
-        if let Some(ref sig) = sym.signature {
-            chunk.push_str(sig);
-            chunk.push('\n');
-        }
-
-        // Add the code lines
-        for line in &lines[start..end] {
-            chunk.push_str(line);
-            chunk.push('\n');
-        }
-
-        // Limit chunk size to avoid very long embeddings
-        const MAX_CHUNK_CHARS: usize = 2000;
-        if chunk.len() > MAX_CHUNK_CHARS {
-            chunk.truncate(MAX_CHUNK_CHARS);
-            // Try to truncate at a line boundary
-            if let Some(last_newline) = chunk.rfind('\n') {
-                chunk.truncate(last_newline);
+        // Second pass: update parent references
+        for sym in symbols {
+            if let Some(parent_name) = &sym.parent_name {
+                if let Some(&parent_id) = name_to_id.get(parent_name) {
+                    if let Some(&symbol_id) = name_to_id.get(&sym.name) {
+                        // Update the parent reference using the database method
+                        db.update_symbol_parent(symbol_id, parent_id)?;
+                    }
+                }
             }
         }
 
-        chunk
+        Ok(())
     }
 
     fn should_ignore(&self, path: &Path, gitignore: &GlobSet) -> bool {
@@ -385,5 +407,286 @@ pub struct IndexResult {
     pub indexed: u64,
     pub skipped: u64,
     pub errors: u64,
-    pub embeddings_generated: u64,
+    pub symbols_extracted: u64,
+    pub symbols_by_kind: HashMap<String, u64>,
+    pub symbols_with_visibility: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn setup_test_files(temp_dir: &TempDir) {
+        // Create a Rust file with various symbols
+        let rust_file = temp_dir.path().join("lib.rs");
+        let mut file = fs::File::create(&rust_file).unwrap();
+        writeln!(
+            file,
+            r#"//! Test module
+pub struct Container<T> {{
+    data: Vec<T>,
+}}
+
+impl<T> Container<T> {{
+    pub fn new() -> Self {{
+        Self {{ data: Vec::new() }}
+    }}
+
+    pub async fn async_method(&self) -> bool {{
+        true
+    }}
+
+    fn private_method(&self) {{}}
+}}
+
+pub(crate) fn crate_visible_fn() {{}}
+
+const MY_CONST: i32 = 42;
+"#
+        )
+        .unwrap();
+
+        // Create a TypeScript file
+        let ts_file = temp_dir.path().join("index.ts");
+        let mut file = fs::File::create(&ts_file).unwrap();
+        writeln!(
+            file,
+            r#"export class MyClass {{
+    private count: number;
+
+    public static create(): MyClass {{
+        return new MyClass();
+    }}
+
+    public async fetchData(): Promise<void> {{}}
+}}
+
+export function exportedFunction(): string {{
+    return "hello";
+}}
+"#
+        )
+        .unwrap();
+
+        // Create a Python file
+        let py_file = temp_dir.path().join("module.py");
+        let mut file = fs::File::create(&py_file).unwrap();
+        writeln!(
+            file,
+            r#"class MyClass:
+    """A sample class."""
+
+    def public_method(self):
+        pass
+
+    def _protected_method(self):
+        pass
+
+    def __private_method(self):
+        pass
+
+def public_function():
+    """A public function."""
+    pass
+
+async def async_function():
+    pass
+"#
+        )
+        .unwrap();
+    }
+
+    fn create_test_indexer(root: PathBuf) -> CodebaseIndexer {
+        let mut config = Config::default();
+        config.indexing.include_types = vec!["rs".to_string(), "ts".to_string(), "py".to_string()];
+        let parser = Arc::new(CodeParser::new());
+        CodebaseIndexer::new(root, config, parser).unwrap()
+    }
+
+    #[test]
+    fn test_index_rust_file_extracts_enhanced_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        let result = indexer.index_all(&db, &text_index).unwrap();
+
+        // Verify files were indexed
+        assert!(result.indexed > 0);
+        assert!(result.symbols_extracted > 0);
+
+        // Verify symbols by kind
+        assert!(result.symbols_by_kind.contains_key("struct"));
+        assert!(result.symbols_by_kind.contains_key("function"));
+
+        // Verify visibility was extracted
+        assert!(result.symbols_with_visibility > 0);
+
+        // Query the database for specific symbols
+        let container = db.find_symbols_by_name("Container", false).unwrap();
+        assert!(!container.is_empty());
+        assert_eq!(container[0].visibility, Some("public".to_string()));
+
+        let async_method = db.find_symbols_by_name("async_method", false).unwrap();
+        assert!(!async_method.is_empty());
+        assert!(async_method[0].is_async);
+
+        let private_method = db.find_symbols_by_name("private_method", false).unwrap();
+        assert!(!private_method.is_empty());
+        assert_eq!(private_method[0].visibility, Some("private".to_string()));
+
+        let crate_fn = db.find_symbols_by_name("crate_visible_fn", false).unwrap();
+        assert!(!crate_fn.is_empty());
+        assert_eq!(crate_fn[0].visibility, Some("crate".to_string()));
+    }
+
+    #[test]
+    fn test_index_typescript_file_extracts_exports() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Verify TypeScript class was extracted
+        let my_class = db.find_symbols_by_name("MyClass", false).unwrap();
+        assert!(!my_class.is_empty());
+
+        // Verify exported function
+        let exported_fn = db.find_symbols_by_name("exportedFunction", false).unwrap();
+        assert!(!exported_fn.is_empty());
+    }
+
+    #[test]
+    fn test_index_python_file_with_visibility_convention() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Verify Python class
+        let py_class = db.find_symbols_by_name("MyClass", false).unwrap();
+        // MyClass might appear in TS and Python, check we have at least one
+        assert!(!py_class.is_empty());
+
+        // Verify public function
+        let public_fn = db.find_symbols_by_name("public_function", false).unwrap();
+        assert!(!public_fn.is_empty());
+        assert_eq!(public_fn[0].visibility, Some("public".to_string()));
+
+        // Verify protected method
+        let protected_method = db.find_symbols_by_name("_protected_method", false).unwrap();
+        assert!(!protected_method.is_empty());
+        assert_eq!(protected_method[0].visibility, Some("protected".to_string()));
+
+        // Verify private method (Python __ prefix)
+        let private_method = db.find_symbols_by_name("__private_method", false).unwrap();
+        assert!(!private_method.is_empty());
+        assert_eq!(private_method[0].visibility, Some("private".to_string()));
+
+        // Verify async function
+        let async_fn = db.find_symbols_by_name("async_function", false).unwrap();
+        assert!(!async_fn.is_empty());
+        assert!(async_fn[0].is_async);
+    }
+
+    #[test]
+    fn test_nested_symbols_have_parent_references() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Find the Python class methods that should have parent references
+        let public_method = db.find_symbols_by_name("public_method", false).unwrap();
+        assert!(!public_method.is_empty());
+        // The method should have a parent reference (though parent_symbol_id depends on name match)
+        // Since we use name matching, we verify parent relationships work
+
+        // Get extended stats to verify parent relationships are tracked
+        let stats = db.get_extended_stats().unwrap();
+        assert!(stats.symbols_with_parent > 0, "Some symbols should have parent references");
+    }
+
+    #[test]
+    fn test_reindexing_clears_old_symbols() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create initial file
+        let rust_file = temp_dir.path().join("test.rs");
+        {
+            let mut file = fs::File::create(&rust_file).unwrap();
+            writeln!(file, "pub fn old_function() {{}}").unwrap();
+        }
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        // First index
+        indexer.index_all(&db, &text_index).unwrap();
+
+        let old_fn = db.find_symbols_by_name("old_function", false).unwrap();
+        assert!(!old_fn.is_empty());
+
+        // Modify the file
+        {
+            let mut file = fs::File::create(&rust_file).unwrap();
+            writeln!(file, "pub fn new_function() {{}}").unwrap();
+        }
+
+        // Re-index
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Old function should be gone
+        let old_fn = db.find_symbols_by_name("old_function", false).unwrap();
+        assert!(old_fn.is_empty(), "Old symbols should be cleared on reindex");
+
+        // New function should exist
+        let new_fn = db.find_symbols_by_name("new_function", false).unwrap();
+        assert!(!new_fn.is_empty(), "New symbols should be indexed");
+    }
+
+    #[test]
+    fn test_extended_stats_after_indexing() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        let stats = db.get_extended_stats().unwrap();
+
+        // Verify file count
+        assert_eq!(stats.file_count, 3, "Should have indexed 3 files");
+
+        // Verify symbol breakdown by kind
+        assert!(stats.symbols_by_kind.len() > 0);
+
+        // Verify visibility breakdown
+        assert!(stats.symbols_by_visibility.len() > 0);
+        assert!(stats.symbols_by_visibility.contains_key("public"));
+
+        // Verify visibility extraction coverage
+        assert!(stats.symbols_with_visibility > 0);
+    }
 }

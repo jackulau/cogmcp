@@ -225,7 +225,7 @@ impl Database {
         Ok(result)
     }
 
-    /// Insert a symbol with extended metadata
+    /// Insert a symbol with basic metadata (backward compatible)
     pub fn insert_symbol(
         &self,
         file_id: i64,
@@ -244,11 +244,17 @@ impl Database {
             end_line,
             signature,
             doc_comment,
-            &ExtendedSymbolMetadata::default(),
+            None,         // visibility
+            false, false, false, false, false, false, // modifiers
+            None,         // parent_symbol_id
+            None,         // type_parameters
+            None,         // parameters
+            None,         // return_type
         )
     }
 
-    /// Insert a symbol with full extended metadata
+    /// Insert a symbol with extended metadata
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_symbol_extended(
         &self,
         file_id: i64,
@@ -258,7 +264,17 @@ impl Database {
         end_line: u32,
         signature: Option<&str>,
         doc_comment: Option<&str>,
-        extended: &ExtendedSymbolMetadata,
+        visibility: Option<&str>,
+        is_async: bool,
+        is_static: bool,
+        is_abstract: bool,
+        is_exported: bool,
+        is_const: bool,
+        is_unsafe: bool,
+        parent_symbol_id: Option<i64>,
+        type_parameters: Option<&str>,
+        parameters: Option<&str>,
+        return_type: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.lock();
 
@@ -269,28 +285,16 @@ impl Database {
             r#"
             INSERT INTO symbols (
                 file_id, name, kind, start_line, end_line, signature, doc_comment,
-                visibility, is_async, is_static, is_abstract, is_exported,
+                visibility, is_async, is_static, is_abstract, is_exported, is_const, is_unsafe,
                 parent_symbol_id, type_parameters, parameters, return_type
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             "#,
             params![
-                file_id,
-                name,
-                kind,
-                start_line,
-                end_line,
-                signature,
-                doc_comment,
-                extended.visibility,
-                extended.is_async as i32,
-                extended.is_static as i32,
-                extended.is_abstract as i32,
-                extended.is_exported as i32,
-                extended.parent_symbol_id,
-                type_params_json,
-                params_json,
-                extended.return_type
+                file_id, name, kind, start_line, end_line, signature, doc_comment,
+                visibility, is_async as i32, is_static as i32, is_abstract as i32,
+                is_exported as i32, is_const as i32, is_unsafe as i32,
+                parent_symbol_id, type_parameters, parameters, return_type
             ],
         )
         .map_err(|e| Error::Storage(format!("Failed to insert symbol: {}", e)))?;
@@ -303,6 +307,17 @@ impl Database {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])
             .map_err(|e| Error::Storage(format!("Failed to delete symbols: {}", e)))?;
+        Ok(())
+    }
+
+    /// Update a symbol's parent reference
+    pub fn update_symbol_parent(&self, symbol_id: i64, parent_id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE symbols SET parent_symbol_id = ?1 WHERE id = ?2",
+            params![parent_id, symbol_id],
+        )
+        .map_err(|e| Error::Storage(format!("Failed to update symbol parent: {}", e)))?;
         Ok(())
     }
 
@@ -324,9 +339,17 @@ impl Database {
         "#;
 
         let query = if fuzzy {
-            format!("{} WHERE s.name LIKE ?1", base_query)
+            r#"SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, s.doc_comment, f.path,
+                      s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported, s.is_const, s.is_unsafe,
+                      s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
+             FROM symbols s JOIN files f ON s.file_id = f.id
+             WHERE s.name LIKE ?1"#
         } else {
-            format!("{} WHERE s.name = ?1", base_query)
+            r#"SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, s.doc_comment, f.path,
+                      s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported, s.is_const, s.is_unsafe,
+                      s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
+             FROM symbols s JOIN files f ON s.file_id = f.id
+             WHERE s.name = ?1"#
         };
 
         let mut stmt = conn
@@ -363,8 +386,31 @@ impl Database {
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![symbol_id], |row| row_to_symbol_row(row))
-            .map_err(|e| Error::Storage(format!("Failed to query symbol children: {}", e)))?;
+            .query_map(params![pattern], |row| {
+                Ok(SymbolRow {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    signature: row.get(6)?,
+                    doc_comment: row.get(7)?,
+                    file_path: row.get(8)?,
+                    visibility: row.get(9)?,
+                    is_async: row.get::<_, i32>(10)? != 0,
+                    is_static: row.get::<_, i32>(11)? != 0,
+                    is_abstract: row.get::<_, i32>(12)? != 0,
+                    is_exported: row.get::<_, i32>(13)? != 0,
+                    is_const: row.get::<_, i32>(14)? != 0,
+                    is_unsafe: row.get::<_, i32>(15)? != 0,
+                    parent_symbol_id: row.get(16)?,
+                    type_parameters: row.get(17)?,
+                    parameters: row.get(18)?,
+                    return_type: row.get(19)?,
+                })
+            })
+            .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -374,26 +420,46 @@ impl Database {
         Ok(results)
     }
 
-    /// Get symbols by visibility
-    pub fn get_symbols_by_visibility(&self, visibility: &str) -> Result<Vec<SymbolRow>> {
+    /// Find symbols by visibility
+    pub fn find_symbols_by_visibility(&self, visibility: &str) -> Result<Vec<SymbolRow>> {
         let conn = self.conn.lock();
-        let query = r#"
-            SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line,
-                   s.signature, s.doc_comment, f.path,
-                   s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported,
-                   s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
-            FROM symbols s JOIN files f ON s.file_id = f.id
-            WHERE s.visibility = ?1
-            ORDER BY f.path, s.start_line
-        "#;
 
         let mut stmt = conn
-            .prepare(query)
+            .prepare(
+                r#"SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, s.doc_comment, f.path,
+                          s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported, s.is_const, s.is_unsafe,
+                          s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
+                   FROM symbols s JOIN files f ON s.file_id = f.id
+                   WHERE s.visibility = ?1"#,
+            )
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![visibility], |row| row_to_symbol_row(row))
-            .map_err(|e| Error::Storage(format!("Failed to query symbols by visibility: {}", e)))?;
+            .query_map(params![visibility], |row| {
+                Ok(SymbolRow {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    signature: row.get(6)?,
+                    doc_comment: row.get(7)?,
+                    file_path: row.get(8)?,
+                    visibility: row.get(9)?,
+                    is_async: row.get::<_, i32>(10)? != 0,
+                    is_static: row.get::<_, i32>(11)? != 0,
+                    is_abstract: row.get::<_, i32>(12)? != 0,
+                    is_exported: row.get::<_, i32>(13)? != 0,
+                    is_const: row.get::<_, i32>(14)? != 0,
+                    is_unsafe: row.get::<_, i32>(15)? != 0,
+                    parent_symbol_id: row.get(16)?,
+                    type_parameters: row.get(17)?,
+                    parameters: row.get(18)?,
+                    return_type: row.get(19)?,
+                })
+            })
+            .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -403,26 +469,96 @@ impl Database {
         Ok(results)
     }
 
-    /// Get all symbols for a file with extended metadata
+    /// Get child symbols (symbols with given parent_symbol_id)
+    pub fn get_symbol_children(&self, parent_id: i64) -> Result<Vec<SymbolRow>> {
+        let conn = self.conn.lock();
+
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, s.doc_comment, f.path,
+                          s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported, s.is_const, s.is_unsafe,
+                          s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
+                   FROM symbols s JOIN files f ON s.file_id = f.id
+                   WHERE s.parent_symbol_id = ?1"#,
+            )
+            .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![parent_id], |row| {
+                Ok(SymbolRow {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    signature: row.get(6)?,
+                    doc_comment: row.get(7)?,
+                    file_path: row.get(8)?,
+                    visibility: row.get(9)?,
+                    is_async: row.get::<_, i32>(10)? != 0,
+                    is_static: row.get::<_, i32>(11)? != 0,
+                    is_abstract: row.get::<_, i32>(12)? != 0,
+                    is_exported: row.get::<_, i32>(13)? != 0,
+                    is_const: row.get::<_, i32>(14)? != 0,
+                    is_unsafe: row.get::<_, i32>(15)? != 0,
+                    parent_symbol_id: row.get(16)?,
+                    type_parameters: row.get(17)?,
+                    parameters: row.get(18)?,
+                    return_type: row.get(19)?,
+                })
+            })
+            .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| Error::Storage(format!("Failed to read row: {}", e)))?);
+        }
+
+        Ok(results)
+    }
+
+    /// Get symbols for a file with enhanced data
     pub fn get_file_symbols(&self, file_id: i64) -> Result<Vec<SymbolRow>> {
         let conn = self.conn.lock();
-        let query = r#"
-            SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line,
-                   s.signature, s.doc_comment, f.path,
-                   s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported,
-                   s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
-            FROM symbols s JOIN files f ON s.file_id = f.id
-            WHERE s.file_id = ?1
-            ORDER BY s.start_line
-        "#;
 
         let mut stmt = conn
-            .prepare(query)
+            .prepare(
+                r#"SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, s.doc_comment, f.path,
+                          s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported, s.is_const, s.is_unsafe,
+                          s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
+                   FROM symbols s JOIN files f ON s.file_id = f.id
+                   WHERE s.file_id = ?1
+                   ORDER BY s.start_line"#,
+            )
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![file_id], |row| row_to_symbol_row(row))
-            .map_err(|e| Error::Storage(format!("Failed to query file symbols: {}", e)))?;
+            .query_map(params![file_id], |row| {
+                Ok(SymbolRow {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    signature: row.get(6)?,
+                    doc_comment: row.get(7)?,
+                    file_path: row.get(8)?,
+                    visibility: row.get(9)?,
+                    is_async: row.get::<_, i32>(10)? != 0,
+                    is_static: row.get::<_, i32>(11)? != 0,
+                    is_abstract: row.get::<_, i32>(12)? != 0,
+                    is_exported: row.get::<_, i32>(13)? != 0,
+                    is_const: row.get::<_, i32>(14)? != 0,
+                    is_unsafe: row.get::<_, i32>(15)? != 0,
+                    parent_symbol_id: row.get(16)?,
+                    type_parameters: row.get(17)?,
+                    parameters: row.get(18)?,
+                    return_type: row.get(19)?,
+                })
+            })
+            .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -716,6 +852,69 @@ impl Database {
             embedding_count: embedding_count as u64,
         })
     }
+
+    /// Get extended index statistics including symbol breakdown
+    pub fn get_extended_stats(&self) -> Result<ExtendedIndexStats> {
+        let conn = self.conn.lock();
+        let mut stats = ExtendedIndexStats::default();
+
+        // Basic counts
+        stats.file_count = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Storage(format!("Failed to count files: {}", e)))? as u64;
+
+        stats.symbol_count = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Storage(format!("Failed to count symbols: {}", e)))? as u64;
+
+        stats.embedding_count = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Storage(format!("Failed to count embeddings: {}", e)))? as u64;
+
+        // Symbols by kind
+        let mut stmt = conn
+            .prepare("SELECT kind, COUNT(*) FROM symbols GROUP BY kind")
+            .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(|e| Error::Storage(format!("Failed to query symbol kinds: {}", e)))?;
+        for row in rows {
+            let (kind, count) = row.map_err(|e| Error::Storage(format!("Failed to read row: {}", e)))?;
+            stats.symbols_by_kind.insert(kind, count as u64);
+        }
+
+        // Symbols by visibility
+        let mut stmt = conn
+            .prepare("SELECT COALESCE(visibility, 'unknown'), COUNT(*) FROM symbols GROUP BY visibility")
+            .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(|e| Error::Storage(format!("Failed to query symbol visibility: {}", e)))?;
+        for row in rows {
+            let (visibility, count) = row.map_err(|e| Error::Storage(format!("Failed to read row: {}", e)))?;
+            stats.symbols_by_visibility.insert(visibility, count as u64);
+        }
+
+        // Count symbols with visibility set
+        stats.symbols_with_visibility = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE visibility IS NOT NULL AND visibility != 'unknown'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| Error::Storage(format!("Failed to count visibility: {}", e)))? as u64;
+
+        // Count symbols with parent
+        stats.symbols_with_parent = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE parent_symbol_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| Error::Storage(format!("Failed to count parent relationships: {}", e)))? as u64;
+
+        Ok(stats)
+    }
 }
 
 /// Helper function to convert a database row to SymbolRow
@@ -776,15 +975,16 @@ pub struct SymbolRow {
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
     pub file_path: String,
-    // Extended metadata (v2)
     pub visibility: Option<String>,
     pub is_async: bool,
     pub is_static: bool,
     pub is_abstract: bool,
     pub is_exported: bool,
+    pub is_const: bool,
+    pub is_unsafe: bool,
     pub parent_symbol_id: Option<i64>,
-    pub type_parameters: Vec<String>,
-    pub parameters: Vec<ParameterInfo>,
+    pub type_parameters: Option<String>,
+    pub parameters: Option<String>,
     pub return_type: Option<String>,
 }
 
@@ -796,67 +996,16 @@ pub struct IndexStats {
     pub embedding_count: u64,
 }
 
-/// Input for batch embedding insert
-#[derive(Debug, Clone)]
-pub struct EmbeddingInput {
-    pub symbol_id: Option<i64>,
-    pub file_id: Option<i64>,
-    pub chunk_text: String,
-    pub embedding: Vec<f32>,
-    pub chunk_type: String,
-}
-
-/// Row from the embeddings table with joined data
-#[derive(Debug, Clone)]
-pub struct EmbeddingRow {
-    pub id: i64,
-    pub symbol_id: Option<i64>,
-    pub file_id: Option<i64>,
-    pub chunk_text: String,
-    pub embedding: Vec<f32>,
-    pub chunk_type: String,
-    pub symbol_name: Option<String>,
-    pub symbol_kind: Option<String>,
-    pub file_path: Option<String>,
-}
-
-/// Result from similarity search
-#[derive(Debug, Clone)]
-pub struct SimilarityResult {
-    pub embedding_id: i64,
-    pub chunk_text: String,
-    pub file_path: Option<String>,
-    pub symbol_name: Option<String>,
-    pub symbol_kind: Option<String>,
-    pub similarity_score: f32,
-}
-
-/// Convert bytes to f32 vector (little-endian format)
-fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().expect("chunk size is 4");
-            f32::from_le_bytes(arr)
-        })
-        .collect()
-}
-
-/// Compute cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot_product / (norm_a * norm_b)
+/// Extended index statistics including symbol breakdown
+#[derive(Debug, Clone, Default)]
+pub struct ExtendedIndexStats {
+    pub file_count: u64,
+    pub symbol_count: u64,
+    pub embedding_count: u64,
+    pub symbols_by_kind: std::collections::HashMap<String, u64>,
+    pub symbols_by_visibility: std::collections::HashMap<String, u64>,
+    pub symbols_with_visibility: u64,
+    pub symbols_with_parent: u64,
 }
 
 /// Database schema
@@ -882,15 +1031,16 @@ CREATE TABLE IF NOT EXISTS symbols (
     end_line INTEGER,
     signature TEXT,
     doc_comment TEXT,
-    -- Extended symbol metadata (v2)
     visibility TEXT,
     is_async INTEGER DEFAULT 0,
     is_static INTEGER DEFAULT 0,
     is_abstract INTEGER DEFAULT 0,
     is_exported INTEGER DEFAULT 0,
+    is_const INTEGER DEFAULT 0,
+    is_unsafe INTEGER DEFAULT 0,
     parent_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
-    type_parameters TEXT,  -- JSON array
-    parameters TEXT,       -- JSON array of {name, type} objects
+    type_parameters TEXT,
+    parameters TEXT,
     return_type TEXT
 );
 
@@ -941,6 +1091,7 @@ CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_parent ON symbols(parent_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_visibility ON symbols(visibility);
 CREATE INDEX IF NOT EXISTS idx_embeddings_symbol ON embeddings(symbol_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file_id);
 "#;
@@ -970,483 +1121,186 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_symbol_basic() {
-        let db = Database::in_memory().unwrap();
-        let file_id = db
-            .upsert_file("src/lib.rs", "hash1", 1234567890, 512, "rust")
-            .unwrap();
-
-        // Test basic insert (backward compatible)
-        let symbol_id = db
-            .insert_symbol(file_id, "my_function", "function", 10, 20, Some("fn my_function()"), None)
-            .unwrap();
-        assert!(symbol_id > 0);
-
-        // Verify it can be found
-        let symbols = db.find_symbols_by_name("my_function", false).unwrap();
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].name, "my_function");
-        assert_eq!(symbols[0].kind, "function");
-        // Extended fields should have defaults
-        assert!(!symbols[0].is_async);
-        assert!(!symbols[0].is_static);
-    }
-
-    #[test]
     fn test_insert_symbol_extended() {
         let db = Database::in_memory().unwrap();
         let file_id = db
-            .upsert_file("src/lib.rs", "hash1", 1234567890, 512, "rust")
+            .upsert_file("src/lib.rs", "hash123", 1234567890, 1024, "rust")
             .unwrap();
-
-        // Create extended metadata
-        let extended = ExtendedSymbolMetadata {
-            visibility: Some("pub".to_string()),
-            is_async: true,
-            is_static: false,
-            is_abstract: false,
-            is_exported: true,
-            parent_symbol_id: None,
-            type_parameters: vec!["T".to_string(), "U".to_string()],
-            parameters: vec![
-                ParameterInfo { name: "input".to_string(), param_type: Some("T".to_string()) },
-                ParameterInfo { name: "count".to_string(), param_type: Some("usize".to_string()) },
-            ],
-            return_type: Some("Result<U>".to_string()),
-        };
 
         let symbol_id = db
             .insert_symbol_extended(
                 file_id,
-                "async_transform",
+                "my_function",
                 "function",
-                50,
-                100,
-                Some("pub async fn async_transform<T, U>(input: T, count: usize) -> Result<U>"),
-                Some("/// Transforms input asynchronously"),
-                &extended,
+                10,
+                20,
+                Some("pub async fn my_function()"),
+                Some("A test function"),
+                Some("public"),
+                true,  // is_async
+                false, // is_static
+                false, // is_abstract
+                false, // is_exported
+                false, // is_const
+                false, // is_unsafe
+                None,  // parent_symbol_id
+                Some("[\"T\", \"U\"]"),
+                Some("[{\"name\": \"x\", \"type_annotation\": \"i32\"}]"),
+                Some("Result<()>"),
             )
             .unwrap();
+
         assert!(symbol_id > 0);
 
-        // Find the symbol and verify extended metadata
-        let symbols = db.find_symbols_by_name("async_transform", false).unwrap();
+        // Find the symbol and verify fields
+        let symbols = db.find_symbols_by_name("my_function", false).unwrap();
         assert_eq!(symbols.len(), 1);
+
         let sym = &symbols[0];
-        assert_eq!(sym.visibility, Some("pub".to_string()));
+        assert_eq!(sym.name, "my_function");
+        assert_eq!(sym.kind, "function");
+        assert_eq!(sym.visibility, Some("public".to_string()));
         assert!(sym.is_async);
         assert!(!sym.is_static);
-        assert!(sym.is_exported);
-        assert_eq!(sym.type_parameters, vec!["T", "U"]);
-        assert_eq!(sym.parameters.len(), 2);
-        assert_eq!(sym.parameters[0].name, "input");
-        assert_eq!(sym.parameters[0].param_type, Some("T".to_string()));
-        assert_eq!(sym.return_type, Some("Result<U>".to_string()));
+        assert_eq!(sym.return_type, Some("Result<()>".to_string()));
     }
 
     #[test]
-    fn test_symbol_children() {
+    fn test_symbol_parent_relationship() {
         let db = Database::in_memory().unwrap();
         let file_id = db
-            .upsert_file("src/lib.rs", "hash1", 1234567890, 512, "rust")
+            .upsert_file("src/lib.rs", "hash123", 1234567890, 1024, "rust")
             .unwrap();
 
-        // Create a parent class/struct
+        // Insert parent symbol (struct)
         let parent_id = db
             .insert_symbol_extended(
                 file_id,
-                "MyClass",
-                "class",
+                "MyStruct",
+                "struct",
+                1,
                 10,
-                100,
-                Some("class MyClass"),
+                Some("pub struct MyStruct"),
                 None,
-                &ExtendedSymbolMetadata {
-                    visibility: Some("pub".to_string()),
-                    ..Default::default()
-                },
+                Some("public"),
+                false, false, false, false, false, false,
+                None, None, None, None,
             )
             .unwrap();
 
-        // Create child methods
-        let _method1_id = db
+        // Insert child symbol (method)
+        let child_id = db
             .insert_symbol_extended(
                 file_id,
-                "method_a",
-                "method",
-                20,
-                30,
-                Some("fn method_a(&self)"),
+                "my_method",
+                "function",
+                5,
+                8,
+                Some("pub fn my_method(&self)"),
                 None,
-                &ExtendedSymbolMetadata {
-                    visibility: Some("pub".to_string()),
-                    parent_symbol_id: Some(parent_id),
-                    ..Default::default()
-                },
+                Some("public"),
+                false, false, false, false, false, false,
+                None, None, None, None,
             )
             .unwrap();
 
-        let _method2_id = db
-            .insert_symbol_extended(
-                file_id,
-                "method_b",
-                "method",
-                40,
-                50,
-                Some("fn method_b(&self)"),
-                None,
-                &ExtendedSymbolMetadata {
-                    visibility: Some("private".to_string()),
-                    parent_symbol_id: Some(parent_id),
-                    is_static: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        // Update parent relationship
+        db.update_symbol_parent(child_id, parent_id).unwrap();
 
-        // Get children
+        // Verify child was updated
         let children = db.get_symbol_children(parent_id).unwrap();
-        assert_eq!(children.len(), 2);
-        assert_eq!(children[0].name, "method_a");
-        assert_eq!(children[1].name, "method_b");
-        assert!(children[1].is_static);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "my_method");
+        assert_eq!(children[0].parent_symbol_id, Some(parent_id));
     }
 
     #[test]
-    fn test_get_symbols_by_visibility() {
+    fn test_find_symbols_by_visibility() {
         let db = Database::in_memory().unwrap();
         let file_id = db
-            .upsert_file("src/lib.rs", "hash1", 1234567890, 512, "rust")
+            .upsert_file("src/lib.rs", "hash123", 1234567890, 1024, "rust")
             .unwrap();
 
-        // Create symbols with different visibility
+        // Insert public function
         db.insert_symbol_extended(
-            file_id, "pub_func", "function", 10, 20, None, None,
-            &ExtendedSymbolMetadata { visibility: Some("pub".to_string()), ..Default::default() },
+            file_id,
+            "public_fn",
+            "function",
+            1, 5,
+            None, None,
+            Some("public"),
+            false, false, false, false, false, false,
+            None, None, None, None,
         ).unwrap();
 
+        // Insert private function
         db.insert_symbol_extended(
-            file_id, "private_func", "function", 30, 40, None, None,
-            &ExtendedSymbolMetadata { visibility: Some("private".to_string()), ..Default::default() },
+            file_id,
+            "private_fn",
+            "function",
+            6, 10,
+            None, None,
+            Some("private"),
+            false, false, false, false, false, false,
+            None, None, None, None,
         ).unwrap();
 
-        db.insert_symbol_extended(
-            file_id, "another_pub", "function", 50, 60, None, None,
-            &ExtendedSymbolMetadata { visibility: Some("pub".to_string()), ..Default::default() },
-        ).unwrap();
+        // Find public symbols
+        let public_symbols = db.find_symbols_by_visibility("public").unwrap();
+        assert_eq!(public_symbols.len(), 1);
+        assert_eq!(public_symbols[0].name, "public_fn");
 
-        // Query by visibility
-        let pub_symbols = db.get_symbols_by_visibility("pub").unwrap();
-        assert_eq!(pub_symbols.len(), 2);
-
-        let private_symbols = db.get_symbols_by_visibility("private").unwrap();
+        // Find private symbols
+        let private_symbols = db.find_symbols_by_visibility("private").unwrap();
         assert_eq!(private_symbols.len(), 1);
-        assert_eq!(private_symbols[0].name, "private_func");
+        assert_eq!(private_symbols[0].name, "private_fn");
     }
 
     #[test]
-    fn test_get_file_symbols() {
+    fn test_extended_stats() {
         let db = Database::in_memory().unwrap();
         let file_id = db
-            .upsert_file("src/lib.rs", "hash1", 1234567890, 512, "rust")
+            .upsert_file("src/lib.rs", "hash123", 1234567890, 1024, "rust")
             .unwrap();
 
-        // Insert multiple symbols
-        db.insert_symbol(file_id, "func_c", "function", 50, 60, None, None).unwrap();
-        db.insert_symbol(file_id, "func_a", "function", 10, 20, None, None).unwrap();
-        db.insert_symbol(file_id, "func_b", "function", 30, 40, None, None).unwrap();
+        // Insert symbols with different kinds and visibilities
+        db.insert_symbol_extended(
+            file_id, "func1", "function", 1, 5, None, None,
+            Some("public"), false, false, false, false, false, false,
+            None, None, None, None,
+        ).unwrap();
 
-        // Get symbols - should be ordered by start_line
-        let symbols = db.get_file_symbols(file_id).unwrap();
-        assert_eq!(symbols.len(), 3);
-        assert_eq!(symbols[0].name, "func_a");
-        assert_eq!(symbols[1].name, "func_b");
-        assert_eq!(symbols[2].name, "func_c");
-    }
+        let parent_id = db.insert_symbol_extended(
+            file_id, "struct1", "struct", 6, 15, None, None,
+            Some("public"), false, false, false, false, false, false,
+            None, None, None, None,
+        ).unwrap();
 
-    #[test]
-    fn test_json_serialization() {
-        // Test type parameters serialization
-        let params = vec!["T".to_string(), "U".to_string()];
-        let json = serialize_type_params(&params);
-        assert!(json.is_some());
-        let deserialized = deserialize_type_params(json.as_deref());
-        assert_eq!(deserialized, params);
+        let child_id = db.insert_symbol_extended(
+            file_id, "method1", "function", 10, 14, None, None,
+            Some("private"), false, false, false, false, false, false,
+            None, None, None, None,
+        ).unwrap();
 
-        // Empty params should return None
-        let empty: Vec<String> = vec![];
-        assert!(serialize_type_params(&empty).is_none());
-        assert!(deserialize_type_params(None).is_empty());
+        db.update_symbol_parent(child_id, parent_id).unwrap();
 
-        // Test parameter info serialization
-        let params = vec![
-            ParameterInfo { name: "x".to_string(), param_type: Some("i32".to_string()) },
-            ParameterInfo { name: "y".to_string(), param_type: None },
-        ];
-        let json = serialize_parameters(&params);
-        assert!(json.is_some());
-        let deserialized = deserialize_parameters(json.as_deref());
-        assert_eq!(deserialized.len(), 2);
-        assert_eq!(deserialized[0].name, "x");
-        assert_eq!(deserialized[0].param_type, Some("i32".to_string()));
-        assert_eq!(deserialized[1].name, "y");
-        assert_eq!(deserialized[1].param_type, None);
-    }
+        // Get extended stats
+        let stats = db.get_extended_stats().unwrap();
+        assert_eq!(stats.file_count, 1);
+        assert_eq!(stats.symbol_count, 3);
 
-    #[test]
-    fn test_existing_queries_backward_compatible() {
-        let db = Database::in_memory().unwrap();
-        let file_id = db
-            .upsert_file("src/main.rs", "hash1", 1234567890, 512, "rust")
-            .unwrap();
+        // Check symbols by kind
+        assert_eq!(*stats.symbols_by_kind.get("function").unwrap_or(&0), 2);
+        assert_eq!(*stats.symbols_by_kind.get("struct").unwrap_or(&0), 1);
 
-        // Use old-style insert (no extended metadata)
-        db.insert_symbol(file_id, "old_func", "function", 10, 20, Some("fn old_func()"), None).unwrap();
+        // Check symbols by visibility
+        assert_eq!(*stats.symbols_by_visibility.get("public").unwrap_or(&0), 2);
+        assert_eq!(*stats.symbols_by_visibility.get("private").unwrap_or(&0), 1);
 
-        // find_symbols_by_name should still work
-        let symbols = db.find_symbols_by_name("old_func", false).unwrap();
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].name, "old_func");
+        // Check visibility extraction (all 3 have visibility set)
+        assert_eq!(stats.symbols_with_visibility, 3);
 
-        // Extended fields should have sensible defaults
-        assert!(symbols[0].visibility.is_none());
-        assert!(!symbols[0].is_async);
-        assert!(symbols[0].type_parameters.is_empty());
-        assert!(symbols[0].parameters.is_empty());
-
-        // fuzzy search should still work
-        let fuzzy = db.find_symbols_by_name("old", true).unwrap();
-        assert_eq!(fuzzy.len(), 1);
-
-        // Stats should still work
-        let stats = db.get_stats().unwrap();
-        assert_eq!(stats.symbol_count, 1);
-    }
-
-    #[test]
-    fn test_insert_embedding_roundtrip() {
-        let db = Database::in_memory().unwrap();
-
-        // Create a file first
-        let file_id = db
-            .upsert_file("src/lib.rs", "def456", 1234567890, 2048, "rust")
-            .unwrap();
-
-        // Insert an embedding
-        let embedding = vec![0.1, 0.2, 0.3, 0.4, 0.5];
-        let emb_id = db
-            .insert_embedding(None, Some(file_id), "test chunk", &embedding, "code")
-            .unwrap();
-        assert!(emb_id > 0);
-
-        // Retrieve embeddings for the file
-        let embeddings = db.get_embeddings_for_file(file_id).unwrap();
-        assert_eq!(embeddings.len(), 1);
-        assert_eq!(embeddings[0].chunk_text, "test chunk");
-        assert_eq!(embeddings[0].chunk_type, "code");
-        assert_eq!(embeddings[0].embedding, embedding);
-    }
-
-    #[test]
-    fn test_get_all_embeddings() {
-        let db = Database::in_memory().unwrap();
-
-        let file_id1 = db
-            .upsert_file("src/a.rs", "aaa", 1234567890, 1024, "rust")
-            .unwrap();
-        let file_id2 = db
-            .upsert_file("src/b.rs", "bbb", 1234567890, 1024, "rust")
-            .unwrap();
-
-        let emb1 = vec![0.1, 0.2, 0.3];
-        let emb2 = vec![0.4, 0.5, 0.6];
-
-        db.insert_embedding(None, Some(file_id1), "chunk a", &emb1, "code")
-            .unwrap();
-        db.insert_embedding(None, Some(file_id2), "chunk b", &emb2, "code")
-            .unwrap();
-
-        let all = db.get_all_embeddings().unwrap();
-        assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn test_delete_embeddings_for_file() {
-        let db = Database::in_memory().unwrap();
-
-        let file_id = db
-            .upsert_file("src/delete.rs", "del", 1234567890, 1024, "rust")
-            .unwrap();
-
-        let emb = vec![0.1, 0.2, 0.3];
-        db.insert_embedding(None, Some(file_id), "chunk 1", &emb, "code")
-            .unwrap();
-        db.insert_embedding(None, Some(file_id), "chunk 2", &emb, "code")
-            .unwrap();
-
-        assert_eq!(db.get_embedding_count().unwrap(), 2);
-
-        let deleted = db.delete_embeddings_for_file(file_id).unwrap();
-        assert_eq!(deleted, 2);
-        assert_eq!(db.get_embedding_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_get_embedding_count() {
-        let db = Database::in_memory().unwrap();
-
-        assert_eq!(db.get_embedding_count().unwrap(), 0);
-
-        let file_id = db
-            .upsert_file("src/count.rs", "cnt", 1234567890, 1024, "rust")
-            .unwrap();
-
-        let emb = vec![0.1, 0.2, 0.3];
-        db.insert_embedding(None, Some(file_id), "chunk", &emb, "code")
-            .unwrap();
-
-        assert_eq!(db.get_embedding_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn test_search_similar_vectors() {
-        let db = Database::in_memory().unwrap();
-
-        let file_id = db
-            .upsert_file("src/search.rs", "src", 1234567890, 1024, "rust")
-            .unwrap();
-
-        // Insert embeddings with different vectors
-        // Vector 1: [1, 0, 0] - should be most similar to query
-        db.insert_embedding(None, Some(file_id), "chunk x", &[1.0, 0.0, 0.0], "code")
-            .unwrap();
-        // Vector 2: [0, 1, 0] - orthogonal to query
-        db.insert_embedding(None, Some(file_id), "chunk y", &[0.0, 1.0, 0.0], "code")
-            .unwrap();
-        // Vector 3: [0.7, 0.7, 0] - partially similar
-        db.insert_embedding(None, Some(file_id), "chunk z", &[0.7, 0.7, 0.0], "code")
-            .unwrap();
-
-        // Search with query vector similar to [1, 0, 0]
-        let query = vec![0.9, 0.1, 0.0];
-        let results = db.search_similar_vectors(&query, 3).unwrap();
-
-        assert_eq!(results.len(), 3);
-        // First result should be the most similar (chunk x)
-        assert_eq!(results[0].chunk_text, "chunk x");
-        // Similarity scores should be in descending order
-        assert!(results[0].similarity_score >= results[1].similarity_score);
-        assert!(results[1].similarity_score >= results[2].similarity_score);
-    }
-
-    #[test]
-    fn test_search_similar_vectors_respects_limit() {
-        let db = Database::in_memory().unwrap();
-
-        let file_id = db
-            .upsert_file("src/limit.rs", "lim", 1234567890, 1024, "rust")
-            .unwrap();
-
-        let emb = vec![0.1, 0.2, 0.3];
-        for i in 0..10 {
-            db.insert_embedding(None, Some(file_id), &format!("chunk {}", i), &emb, "code")
-                .unwrap();
-        }
-
-        let results = db.search_similar_vectors(&emb, 5).unwrap();
-        assert_eq!(results.len(), 5);
-    }
-
-    #[test]
-    fn test_insert_embeddings_batch() {
-        let db = Database::in_memory().unwrap();
-
-        let file_id = db
-            .upsert_file("src/batch.rs", "btch", 1234567890, 1024, "rust")
-            .unwrap();
-
-        let embeddings = vec![
-            EmbeddingInput {
-                symbol_id: None,
-                file_id: Some(file_id),
-                chunk_text: "batch chunk 1".to_string(),
-                embedding: vec![0.1, 0.2, 0.3],
-                chunk_type: "code".to_string(),
-            },
-            EmbeddingInput {
-                symbol_id: None,
-                file_id: Some(file_id),
-                chunk_text: "batch chunk 2".to_string(),
-                embedding: vec![0.4, 0.5, 0.6],
-                chunk_type: "code".to_string(),
-            },
-            EmbeddingInput {
-                symbol_id: None,
-                file_id: Some(file_id),
-                chunk_text: "batch chunk 3".to_string(),
-                embedding: vec![0.7, 0.8, 0.9],
-                chunk_type: "code".to_string(),
-            },
-        ];
-
-        let ids = db.insert_embeddings_batch(&embeddings).unwrap();
-        assert_eq!(ids.len(), 3);
-
-        let all = db.get_embeddings_for_file(file_id).unwrap();
-        assert_eq!(all.len(), 3);
-    }
-
-    #[test]
-    fn test_cosine_similarity_identical() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 0.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!((sim - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_cosine_similarity_orthogonal() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_cosine_similarity_opposite() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![-1.0, 0.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!((sim + 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_bytes_to_f32_vec() {
-        let original = vec![0.1f32, 0.2f32, 0.3f32];
-        let bytes: Vec<u8> = original.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let restored = bytes_to_f32_vec(&bytes);
-        assert_eq!(original, restored);
-    }
-
-    #[test]
-    fn test_embedding_with_symbol() {
-        let db = Database::in_memory().unwrap();
-
-        let file_id = db
-            .upsert_file("src/sym.rs", "sym", 1234567890, 1024, "rust")
-            .unwrap();
-
-        let symbol_id = db
-            .insert_symbol(file_id, "my_function", "function", 10, 20, Some("fn my_function()"), None)
-            .unwrap();
-
-        let emb = vec![0.1, 0.2, 0.3];
-        db.insert_embedding(Some(symbol_id), Some(file_id), "function body", &emb, "function")
-            .unwrap();
-
-        let embeddings = db.get_embeddings_for_file(file_id).unwrap();
-        assert_eq!(embeddings.len(), 1);
-        assert_eq!(embeddings[0].symbol_name, Some("my_function".to_string()));
-        assert_eq!(embeddings[0].symbol_kind, Some("function".to_string()));
+        // Check parent relationships (1 has parent)
+        assert_eq!(stats.symbols_with_parent, 1);
     }
 }
