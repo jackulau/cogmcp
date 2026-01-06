@@ -5,6 +5,7 @@ use contextmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use contextmcp_index::{CodeParser, CodebaseIndexer};
 use contextmcp_search::{HybridSearch, SearchMode, SemanticSearch};
 use contextmcp_storage::{Database, FullTextIndex};
+use parking_lot::Mutex;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
@@ -22,7 +23,7 @@ pub struct ContextMcpServer {
     pub db: Arc<Database>,
     pub text_index: Arc<FullTextIndex>,
     pub parser: Arc<CodeParser>,
-    pub embedding_engine: Option<Arc<EmbeddingEngine>>,
+    pub embedding_engine: Option<Arc<Mutex<EmbeddingEngine>>>,
     pub semantic_search: Option<Arc<SemanticSearch>>,
 }
 
@@ -81,7 +82,7 @@ impl ContextMcpServer {
     fn init_embedding_engine(
         config: &Config,
         db: Arc<Database>,
-    ) -> Result<(Arc<EmbeddingEngine>, Arc<SemanticSearch>)> {
+    ) -> Result<(Arc<Mutex<EmbeddingEngine>>, Arc<SemanticSearch>)> {
         let model_path = config
             .indexing
             .embedding_model
@@ -94,14 +95,17 @@ impl ContextMcpServer {
             ..Default::default()
         };
 
-        let engine = Arc::new(EmbeddingEngine::new(model_config)?);
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::new(model_config)?));
         let semantic = Arc::new(SemanticSearch::new(engine.clone(), db));
 
-        info!(
-            "Embedding engine initialized (model loaded: {}, dim: {})",
-            engine.is_loaded(),
-            engine.embedding_dim()
-        );
+        {
+            let engine_guard = engine.lock();
+            info!(
+                "Embedding engine initialized (model loaded: {}, dim: {})",
+                engine_guard.is_loaded(),
+                engine_guard.embedding_dim()
+            );
+        }
 
         Ok((engine, semantic))
     }
@@ -128,8 +132,8 @@ impl ContextMcpServer {
 
         let result = indexer.index_all(&self.db, &self.text_index)?;
         info!(
-            "Indexed {} files ({} skipped, {} errors, {} embeddings)",
-            result.indexed, result.skipped, result.errors, result.embeddings_generated
+            "Indexed {} files ({} skipped, {} errors, {} symbols)",
+            result.indexed, result.skipped, result.errors, result.symbols_extracted
         );
 
         // Invalidate semantic search cache after indexing

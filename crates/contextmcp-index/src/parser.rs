@@ -1,98 +1,16 @@
 //! Code parsing with tree-sitter
-//!
-//! This module provides enhanced symbol extraction using tree-sitter parsers.
-//! It extracts rich metadata including visibility modifiers, generics, parameters,
-//! return types, and decorators for supported languages.
 
 use contextmcp_core::types::{Language, ParameterInfo, SymbolKind, SymbolModifiers, SymbolVisibility};
 use contextmcp_core::{Error, Result};
 
-/// Visibility modifier for symbols
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Visibility {
-    #[default]
-    Private,
-    Public,
-    Protected,
-    /// Rust: pub(crate), pub(super), etc.
-    Restricted(String),
-}
-
-impl std::fmt::Display for Visibility {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Visibility::Private => write!(f, "private"),
-            Visibility::Public => write!(f, "public"),
-            Visibility::Protected => write!(f, "protected"),
-            Visibility::Restricted(scope) => write!(f, "pub({})", scope),
-        }
-    }
-}
-
-/// A function/method parameter
-#[derive(Debug, Clone)]
-pub struct Parameter {
-    pub name: String,
-    pub type_annotation: Option<String>,
-    pub default_value: Option<String>,
-    pub is_variadic: bool,
-}
-
-impl std::fmt::Display for Parameter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut result = String::new();
-
-        if self.is_variadic {
-            result.push_str("...");
-        }
-
-        result.push_str(&self.name);
-
-        if let Some(ref ty) = self.type_annotation {
-            result.push_str(": ");
-            result.push_str(ty);
-        }
-
-        if let Some(ref default) = self.default_value {
-            result.push_str(" = ");
-            result.push_str(default);
-        }
-
-        write!(f, "{}", result)
-    }
-}
-
-/// Decorator/attribute on a symbol
-#[derive(Debug, Clone)]
-pub struct Decorator {
-    pub name: String,
-    pub arguments: Option<String>,
-}
-
-impl std::fmt::Display for Decorator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(ref args) = self.arguments {
-            write!(f, "@{}({})", self.name, args)
-        } else {
-            write!(f, "@{}", self.name)
-        }
-    }
-}
-
-/// Extracted symbol from source code with rich metadata
+/// Extracted symbol from source code
 #[derive(Debug, Clone)]
 pub struct ExtractedSymbol {
-    /// Symbol name
     pub name: String,
-    /// Symbol kind (function, class, etc.)
     pub kind: SymbolKind,
-    /// Starting line (1-indexed)
     pub start_line: u32,
-    /// Ending line (1-indexed)
     pub end_line: u32,
-    /// Full signature with types
     pub signature: Option<String>,
-    /// Documentation comment
     pub doc_comment: Option<String>,
     /// Visibility of the symbol
     pub visibility: SymbolVisibility,
@@ -147,412 +65,6 @@ impl CodeParser {
         }
     }
 
-    // ==================== Helper Functions ====================
-
-    /// Extract visibility modifier from a node
-    pub fn extract_visibility(&self, node: &tree_sitter::Node, content: &str) -> Visibility {
-        // Look for visibility_modifier child
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            match child.kind() {
-                "visibility_modifier" => {
-                    let text = child.utf8_text(content.as_bytes()).unwrap_or("").trim();
-                    return match text {
-                        "pub" => Visibility::Public,
-                        s if s.starts_with("pub(") => {
-                            // Extract scope from pub(crate), pub(super), etc.
-                            let scope = s
-                                .trim_start_matches("pub(")
-                                .trim_end_matches(')')
-                                .to_string();
-                            Visibility::Restricted(scope)
-                        }
-                        _ => Visibility::Private,
-                    };
-                }
-                // TypeScript/JavaScript modifiers
-                "accessibility_modifier" | "public" | "private" | "protected" => {
-                    let text = child.utf8_text(content.as_bytes()).unwrap_or("").trim();
-                    return match text {
-                        "public" => Visibility::Public,
-                        "private" => Visibility::Private,
-                        "protected" => Visibility::Protected,
-                        _ => Visibility::Private,
-                    };
-                }
-                _ => {}
-            }
-        }
-        Visibility::Private
-    }
-
-    /// Extract generic type parameters from a node
-    pub fn extract_type_params(&self, node: &tree_sitter::Node, content: &str) -> Vec<String> {
-        let mut params = Vec::new();
-
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            match child.kind() {
-                "type_parameters" | "type_parameter_list" => {
-                    let mut inner_cursor = child.walk();
-                    for param in child.children(&mut inner_cursor) {
-                        match param.kind() {
-                            "type_parameter" | "type_identifier" | "constrained_type_parameter" => {
-                                if let Ok(text) = param.utf8_text(content.as_bytes()) {
-                                    params.push(text.trim().to_string());
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        params
-    }
-
-    /// Extract function parameters from a node
-    pub fn extract_parameters(
-        &self,
-        node: &tree_sitter::Node,
-        content: &str,
-        language: Language,
-    ) -> Vec<Parameter> {
-        let mut params = Vec::new();
-
-        // Find parameters node
-        let params_node = node.child_by_field_name("parameters");
-        if params_node.is_none() {
-            return params;
-        }
-        let params_node = params_node.unwrap();
-
-        let mut cursor = params_node.walk();
-        for child in params_node.children(&mut cursor) {
-            match language {
-                Language::Rust => {
-                    if child.kind() == "parameter" {
-                        if let Some(param) = self.extract_rust_parameter(&child, content) {
-                            params.push(param);
-                        }
-                    } else if child.kind() == "self_parameter" {
-                        let text = child.utf8_text(content.as_bytes()).unwrap_or("self");
-                        params.push(Parameter {
-                            name: text.to_string(),
-                            type_annotation: None,
-                            default_value: None,
-                            is_variadic: false,
-                        });
-                    }
-                }
-                Language::TypeScript | Language::JavaScript => {
-                    if matches!(
-                        child.kind(),
-                        "required_parameter"
-                            | "optional_parameter"
-                            | "rest_parameter"
-                            | "formal_parameter"
-                    ) {
-                        if let Some(param) = self.extract_ts_parameter(&child, content) {
-                            params.push(param);
-                        }
-                    }
-                }
-                Language::Python => {
-                    if matches!(
-                        child.kind(),
-                        "identifier"
-                            | "typed_parameter"
-                            | "default_parameter"
-                            | "typed_default_parameter"
-                            | "list_splat_pattern"
-                            | "dictionary_splat_pattern"
-                    ) {
-                        if let Some(param) = self.extract_python_parameter(&child, content) {
-                            params.push(param);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        params
-    }
-
-    fn extract_rust_parameter(
-        &self,
-        node: &tree_sitter::Node,
-        content: &str,
-    ) -> Option<Parameter> {
-        let name = node
-            .child_by_field_name("pattern")
-            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-            .unwrap_or("")
-            .to_string();
-
-        let type_annotation = node
-            .child_by_field_name("type")
-            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-            .map(|s| s.to_string());
-
-        Some(Parameter {
-            name,
-            type_annotation,
-            default_value: None,
-            is_variadic: false,
-        })
-    }
-
-    fn extract_ts_parameter(&self, node: &tree_sitter::Node, content: &str) -> Option<Parameter> {
-        let is_variadic = node.kind() == "rest_parameter";
-
-        let name = if is_variadic {
-            // For rest parameters, the pattern is inside
-            let mut cursor = node.walk();
-            let result = node
-                .children(&mut cursor)
-                .find(|c| c.kind() == "identifier")
-                .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                .unwrap_or("")
-                .to_string();
-            result
-        } else {
-            node.child_by_field_name("pattern")
-                .or_else(|| node.child_by_field_name("name"))
-                .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                .unwrap_or("")
-                .to_string()
-        };
-
-        let type_annotation = node
-            .child_by_field_name("type")
-            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-            .map(|s| s.trim_start_matches(':').trim().to_string());
-
-        let default_value = node
-            .child_by_field_name("value")
-            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-            .map(|s| s.to_string());
-
-        Some(Parameter {
-            name,
-            type_annotation,
-            default_value,
-            is_variadic,
-        })
-    }
-
-    fn extract_python_parameter(
-        &self,
-        node: &tree_sitter::Node,
-        content: &str,
-    ) -> Option<Parameter> {
-        let kind = node.kind();
-        let is_variadic = matches!(kind, "list_splat_pattern" | "dictionary_splat_pattern");
-
-        let (name, type_annotation, default_value) = match kind {
-            "identifier" => {
-                let name = node.utf8_text(content.as_bytes()).ok()?.to_string();
-                (name, None, None)
-            }
-            "typed_parameter" => {
-                let name = node
-                    .child(0)
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .unwrap_or("")
-                    .to_string();
-                let type_ann = node
-                    .child_by_field_name("type")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .map(|s| s.to_string());
-                (name, type_ann, None)
-            }
-            "default_parameter" => {
-                let name = node
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .unwrap_or("")
-                    .to_string();
-                let default = node
-                    .child_by_field_name("value")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .map(|s| s.to_string());
-                (name, None, default)
-            }
-            "typed_default_parameter" => {
-                let name = node
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .unwrap_or("")
-                    .to_string();
-                let type_ann = node
-                    .child_by_field_name("type")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .map(|s| s.to_string());
-                let default = node
-                    .child_by_field_name("value")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .map(|s| s.to_string());
-                (name, type_ann, default)
-            }
-            "list_splat_pattern" | "dictionary_splat_pattern" => {
-                let prefix = if kind == "list_splat_pattern" {
-                    "*"
-                } else {
-                    "**"
-                };
-                let inner_name = node
-                    .child(0)
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .unwrap_or("args");
-                (format!("{}{}", prefix, inner_name), None, None)
-            }
-            _ => return None,
-        };
-
-        Some(Parameter {
-            name,
-            type_annotation,
-            default_value,
-            is_variadic,
-        })
-    }
-
-    /// Extract return type from a function node
-    pub fn extract_return_type(
-        &self,
-        node: &tree_sitter::Node,
-        content: &str,
-        language: Language,
-    ) -> Option<String> {
-        match language {
-            Language::Rust => {
-                node.child_by_field_name("return_type")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .map(|s| s.trim_start_matches("->").trim().to_string())
-            }
-            Language::TypeScript | Language::JavaScript => {
-                node.child_by_field_name("return_type")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .map(|s| s.trim_start_matches(':').trim().to_string())
-            }
-            Language::Python => {
-                node.child_by_field_name("return_type")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    .map(|s| s.trim_start_matches("->").trim().to_string())
-            }
-            _ => None,
-        }
-    }
-
-    /// Check if a function is async
-    fn is_async_function(&self, node: &tree_sitter::Node, content: &str) -> bool {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "async" {
-                return true;
-            }
-            if let Ok(text) = child.utf8_text(content.as_bytes()) {
-                if text == "async" {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Generate a rich signature from extracted metadata
-    pub fn generate_signature(
-        &self,
-        name: &str,
-        kind: SymbolKind,
-        visibility: &Visibility,
-        type_params: &[String],
-        parameters: &[Parameter],
-        return_type: Option<&str>,
-        is_async: bool,
-        language: Language,
-    ) -> String {
-        let mut sig = String::new();
-
-        // Visibility
-        match language {
-            Language::Rust => {
-                if *visibility != Visibility::Private {
-                    sig.push_str(&visibility.to_string());
-                    sig.push(' ');
-                }
-            }
-            Language::TypeScript | Language::JavaScript => {
-                if *visibility != Visibility::Private {
-                    sig.push_str(&format!("{} ", visibility));
-                }
-            }
-            _ => {}
-        }
-
-        // Async
-        if is_async {
-            sig.push_str("async ");
-        }
-
-        // Kind-specific prefix
-        match kind {
-            SymbolKind::Function | SymbolKind::Method => {
-                sig.push_str("fn ");
-            }
-            SymbolKind::Struct => {
-                sig.push_str("struct ");
-            }
-            SymbolKind::Enum => {
-                sig.push_str("enum ");
-            }
-            SymbolKind::Trait => {
-                sig.push_str("trait ");
-            }
-            SymbolKind::Interface => {
-                sig.push_str("interface ");
-            }
-            SymbolKind::Class => {
-                sig.push_str("class ");
-            }
-            SymbolKind::Type => {
-                sig.push_str("type ");
-            }
-            _ => {}
-        }
-
-        // Name
-        sig.push_str(name);
-
-        // Type parameters
-        if !type_params.is_empty() {
-            sig.push('<');
-            sig.push_str(&type_params.join(", "));
-            sig.push('>');
-        }
-
-        // Parameters (for functions/methods)
-        if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-            sig.push('(');
-            let param_strs: Vec<String> = parameters.iter().map(|p| p.to_string()).collect();
-            sig.push_str(&param_strs.join(", "));
-            sig.push(')');
-        }
-
-        // Return type
-        if let Some(ret) = return_type {
-            sig.push_str(" -> ");
-            sig.push_str(ret);
-        }
-
-        sig
-    }
-
-    // ==================== Rust Parsing ====================
-
     fn parse_rust(&self, content: &str) -> Result<Vec<ExtractedSymbol>> {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -566,7 +78,7 @@ impl CodeParser {
         let mut symbols = Vec::new();
         let root = tree.root_node();
 
-        self.extract_rust_symbols(&root, content, &mut symbols, None);
+        self.extract_rust_symbols(&root, content, &mut symbols);
 
         Ok(symbols)
     }
@@ -576,7 +88,6 @@ impl CodeParser {
         node: &tree_sitter::Node,
         content: &str,
         symbols: &mut Vec<ExtractedSymbol>,
-        parent: Option<&str>,
     ) {
         self.extract_rust_symbols_with_parent(node, content, symbols, None);
     }
@@ -611,39 +122,40 @@ impl CodeParser {
         }
     }
 
-    fn extract_rust_function(
+    fn extract_rust_symbol(
         &self,
         node: &tree_sitter::Node,
         content: &str,
         kind_str: &str,
         parent_name: Option<String>,
     ) -> Option<ExtractedSymbol> {
+        // Find the name node
         let name_node = node.child_by_field_name("name")?;
         let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
 
-        let visibility = self.extract_visibility(node, content);
-        let type_params = self.extract_type_params(node, content);
-        let parameters = self.extract_parameters(node, content, Language::Rust);
-        let return_type = self.extract_return_type(node, content, Language::Rust);
-        let is_async = self.is_async_function(node, content);
-
-        let kind = if parent.is_some() {
-            SymbolKind::Method
-        } else {
-            SymbolKind::Function
+        let kind = match kind_str {
+            "function_item" => SymbolKind::Function,
+            "impl_item" => SymbolKind::Class,
+            "struct_item" => SymbolKind::Struct,
+            "enum_item" => SymbolKind::Enum,
+            "trait_item" => SymbolKind::Trait,
+            "mod_item" => SymbolKind::Module,
+            "const_item" => SymbolKind::Constant,
+            "static_item" => SymbolKind::Variable,
+            "type_item" => SymbolKind::Type,
+            _ => SymbolKind::Unknown,
         };
 
-        let signature = self.generate_signature(
-            &name,
-            kind,
-            &visibility,
-            &type_params,
-            &parameters,
-            return_type.as_deref(),
-            is_async,
-            Language::Rust,
-        );
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
 
+        // Extract signature (first line)
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        // Look for doc comment above
         let doc_comment = self.find_doc_comment(node, content);
 
         // Extract visibility
@@ -668,9 +180,9 @@ impl CodeParser {
         Some(ExtractedSymbol {
             name,
             kind,
-            start_line: node.start_position().row as u32 + 1,
-            end_line: node.end_position().row as u32 + 1,
-            signature: Some(signature),
+            start_line,
+            end_line,
+            signature,
             doc_comment,
             visibility,
             modifiers,
@@ -798,7 +310,7 @@ impl CodeParser {
         let mut symbols = Vec::new();
         let root = tree.root_node();
 
-        self.extract_ts_symbols(&root, content, &mut symbols, None, false);
+        self.extract_ts_symbols(&root, content, &mut symbols);
 
         Ok(symbols)
     }
@@ -808,8 +320,6 @@ impl CodeParser {
         node: &tree_sitter::Node,
         content: &str,
         symbols: &mut Vec<ExtractedSymbol>,
-        parent: Option<&str>,
-        is_exported: bool,
     ) {
         self.extract_ts_symbols_with_parent(node, content, symbols, None);
     }
@@ -838,14 +348,13 @@ impl CodeParser {
             _ => parent_name.clone(),
         };
 
-        // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             self.extract_ts_symbols_with_parent(&child, content, symbols, current_parent.clone());
         }
     }
 
-    fn extract_ts_function(
+    fn extract_ts_symbol(
         &self,
         node: &tree_sitter::Node,
         content: &str,
@@ -855,33 +364,26 @@ impl CodeParser {
         let name_node = node.child_by_field_name("name")?;
         let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
 
-        let visibility = if is_exported {
-            Visibility::Public
-        } else {
-            Visibility::Private
+        let kind = match kind_str {
+            "function_declaration" => SymbolKind::Function,
+            "method_definition" => SymbolKind::Method,
+            "class_declaration" => SymbolKind::Class,
+            "interface_declaration" => SymbolKind::Interface,
+            "type_alias_declaration" => SymbolKind::Type,
+            "enum_declaration" => SymbolKind::Enum,
+            "variable_declarator" => SymbolKind::Variable,
+            _ => SymbolKind::Unknown,
         };
 
-        let type_params = self.extract_type_params(node, content);
-        let parameters = self.extract_parameters(node, content, Language::TypeScript);
-        let return_type = self.extract_return_type(node, content, Language::TypeScript);
-        let is_async = self.is_async_function(node, content);
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
 
-        let kind = if parent.is_some() {
-            SymbolKind::Method
-        } else {
-            SymbolKind::Function
-        };
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
 
-        let signature = self.generate_signature(
-            &name,
-            kind,
-            &visibility,
-            &type_params,
-            &parameters,
-            return_type.as_deref(),
-            is_async,
-            Language::TypeScript,
-        );
+        let doc_comment = self.find_doc_comment(node, content);
 
         // Extract visibility and modifiers
         let (visibility, modifiers) = self.extract_ts_visibility_and_modifiers(node, content);
@@ -1030,7 +532,7 @@ impl CodeParser {
         let mut symbols = Vec::new();
         let root = tree.root_node();
 
-        self.extract_python_symbols(&root, content, &mut symbols, None);
+        self.extract_python_symbols(&root, content, &mut symbols);
 
         Ok(symbols)
     }
@@ -1040,7 +542,6 @@ impl CodeParser {
         node: &tree_sitter::Node,
         content: &str,
         symbols: &mut Vec<ExtractedSymbol>,
-        parent: Option<&str>,
     ) {
         self.extract_python_symbols_with_parent(node, content, symbols, None);
     }
@@ -1067,14 +568,13 @@ impl CodeParser {
             _ => parent_name.clone(),
         };
 
-        // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             self.extract_python_symbols_with_parent(&child, content, symbols, current_parent.clone());
         }
     }
 
-    fn extract_python_function(
+    fn extract_python_symbol(
         &self,
         node: &tree_sitter::Node,
         content: &str,
@@ -1097,44 +597,16 @@ impl CodeParser {
             _ => SymbolKind::Unknown,
         };
 
-        // Build signature
-        let mut signature = String::new();
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
 
-        // Add decorators to signature representation
-        for dec in &decorators {
-            signature.push_str(&format!("@{}\n", dec.name));
-        }
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
 
-        if is_async {
-            signature.push_str("async ");
-        }
-
-        signature.push_str("def ");
-        signature.push_str(&name);
-        signature.push('(');
-
-        let param_strs: Vec<String> = parameters.iter().map(|p| p.to_string()).collect();
-        signature.push_str(&param_strs.join(", "));
-        signature.push(')');
-
-        if let Some(ref ret) = return_type {
-            signature.push_str(" -> ");
-            signature.push_str(ret);
-        }
-
-        // Determine visibility based on name convention
-        // Dunder methods (like __init__, __str__) are public
-        // Methods starting with __ but not ending with __ are private (name mangling)
-        // Methods starting with single _ are protected
-        let visibility = if is_dunder {
-            Visibility::Public
-        } else if name.starts_with("__") {
-            Visibility::Private
-        } else if name.starts_with('_') {
-            Visibility::Protected
-        } else {
-            Visibility::Public
-        };
+        // Python docstrings
+        let doc_comment = self.find_python_docstring(node, content);
 
         // Extract visibility from name convention
         let visibility = if name.starts_with("__") && !name.ends_with("__") {
@@ -1279,34 +751,8 @@ impl CodeParser {
     fn find_doc_comment(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
         // Look at previous sibling for comment
         if let Some(prev) = node.prev_sibling() {
-            match prev.kind() {
-                "line_comment" => {
-                    let mut comments = Vec::new();
-                    let mut current = Some(prev);
-                    while let Some(c) = current {
-                        if c.kind() == "line_comment" {
-                            if let Ok(text) = c.utf8_text(content.as_bytes()) {
-                                comments.push(text.trim_start_matches("//").trim().to_string());
-                            }
-                            current = c.prev_sibling();
-                        } else {
-                            break;
-                        }
-                    }
-                    comments.reverse();
-                    if !comments.is_empty() {
-                        return Some(comments.join("\n"));
-                    }
-                }
-                "block_comment" => {
-                    return prev.utf8_text(content.as_bytes()).ok().map(|s| {
-                        s.trim_start_matches("/*")
-                            .trim_end_matches("*/")
-                            .trim()
-                            .to_string()
-                    });
-                }
-                _ => {}
+            if prev.kind() == "line_comment" || prev.kind() == "block_comment" {
+                return prev.utf8_text(content.as_bytes()).ok().map(|s| s.to_string());
             }
         }
         None
@@ -1322,18 +768,10 @@ impl CodeParser {
                     for inner in child.children(&mut inner_cursor) {
                         if inner.kind() == "string" {
                             return inner.utf8_text(content.as_bytes()).ok().map(|s| {
-                                // Handle triple-quoted strings
-                                let trimmed = s
-                                    .trim_start_matches("\"\"\"")
-                                    .trim_start_matches("'''")
-                                    .trim_end_matches("\"\"\"")
-                                    .trim_end_matches("'''")
-                                    .trim_start_matches('"')
-                                    .trim_start_matches('\'')
-                                    .trim_end_matches('"')
-                                    .trim_end_matches('\'')
-                                    .trim();
-                                trimmed.to_string()
+                                s.trim_matches('"')
+                                    .trim_matches('\'')
+                                    .trim()
+                                    .to_string()
                             });
                         }
                     }

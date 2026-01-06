@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn test_symbol_visibility_default() {
         let visibility = SymbolVisibility::default();
-        assert_eq!(visibility, SymbolVisibility::Private);
+        assert_eq!(visibility, SymbolVisibility::Unknown);
     }
 
     #[test]
@@ -288,11 +288,8 @@ mod tests {
         assert!(!modifiers.is_static);
         assert!(!modifiers.is_abstract);
         assert!(!modifiers.is_const);
-        assert!(!modifiers.is_final);
+        assert!(!modifiers.is_exported);
         assert!(!modifiers.is_unsafe);
-        assert!(!modifiers.is_extern);
-        assert!(!modifiers.is_virtual);
-        assert!(!modifiers.is_mut);
     }
 
     #[test]
@@ -301,12 +298,9 @@ mod tests {
             is_async: true,
             is_static: false,
             is_abstract: true,
+            is_exported: false,
             is_const: false,
-            is_final: false,
             is_unsafe: true,
-            is_extern: false,
-            is_virtual: false,
-            is_mut: true,
         };
 
         let json = serde_json::to_string(&modifiers).unwrap();
@@ -326,13 +320,15 @@ mod tests {
             end_line: 20,
             signature: Some("pub async fn test_function<T>(arg: T)".to_string()),
             doc_comment: Some("/// Test doc".to_string()),
-            visibility: Some(SymbolVisibility::Public),
+            visibility: SymbolVisibility::Public,
             modifiers: SymbolModifiers {
                 is_async: true,
                 ..Default::default()
             },
-            parent_symbol: Some("TestModule".to_string()),
+            parent_id: Some(100),
             type_parameters: vec!["T".to_string()],
+            parameters: vec![],
+            return_type: None,
         };
 
         // Test serialization roundtrip
@@ -342,7 +338,7 @@ mod tests {
         assert_eq!(symbol.name, deserialized.name);
         assert_eq!(symbol.visibility, deserialized.visibility);
         assert_eq!(symbol.modifiers.is_async, deserialized.modifiers.is_async);
-        assert_eq!(symbol.parent_symbol, deserialized.parent_symbol);
+        assert_eq!(symbol.parent_id, deserialized.parent_id);
         assert_eq!(symbol.type_parameters, deserialized.type_parameters);
     }
 

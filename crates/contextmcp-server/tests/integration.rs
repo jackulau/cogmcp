@@ -28,7 +28,7 @@ fn test_list_tools_returns_all_tools() {
     let tools = server.list_tools();
 
     // Verify we have the expected 7 tools
-    assert_eq!(tools.len(), 7, "Should have 7 tools");
+    assert_eq!(tools.len(), 8, "Should have 8 tools");
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
 
@@ -256,7 +256,7 @@ mod e2e_tests {
 
         // List tools through the server's list_tools method
         let tools = server.list_tools();
-        assert_eq!(tools.len(), 7, "Should return 7 tools");
+        assert_eq!(tools.len(), 8, "Should return 8 tools");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(tool_names.contains(&"ping"));

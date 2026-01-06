@@ -9,7 +9,7 @@ use std::time::Duration;
 use contextmcp_core::{Error, Result};
 use contextmcp_embeddings::EmbeddingEngine;
 use contextmcp_storage::{cache::Cache, Database};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
@@ -154,7 +154,7 @@ struct EmbeddingRecord {
 /// 3. Enriching results with file path and line number information
 pub struct SemanticSearch {
     /// Embedding engine for generating query embeddings
-    engine: Arc<EmbeddingEngine>,
+    engine: Arc<Mutex<EmbeddingEngine>>,
     /// Database for storing and retrieving embeddings
     db: Arc<Database>,
     /// Cache for query embeddings
@@ -165,7 +165,7 @@ pub struct SemanticSearch {
 
 impl SemanticSearch {
     /// Create a new semantic search instance
-    pub fn new(engine: Arc<EmbeddingEngine>, db: Arc<Database>) -> Self {
+    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
         Self {
             engine,
             db,
@@ -177,12 +177,12 @@ impl SemanticSearch {
 
     /// Check if the embedding engine has a model loaded
     pub fn is_available(&self) -> bool {
-        self.engine.is_loaded()
+        self.engine.lock().is_loaded()
     }
 
     /// Get the embedding dimension
     pub fn embedding_dim(&self) -> usize {
-        self.engine.embedding_dim()
+        self.engine.lock().embedding_dim()
     }
 
     /// Search for semantically similar content using a text query
@@ -289,7 +289,7 @@ impl SemanticSearch {
         }
 
         // Compute embedding
-        let embedding = self.engine.embed(query)?;
+        let embedding = self.engine.lock().embed(query)?;
 
         // Cache the result
         self.query_cache.insert(query.to_string(), embedding.clone());
@@ -380,9 +380,10 @@ impl SemanticSearch {
         symbol_id: Option<i64>,
         chunk_type: ChunkType,
     ) -> Result<i64> {
-        let embedding = self.engine.embed(chunk_text)?;
+        let embedding = self.engine.lock().embed(chunk_text)?;
         let id = self.db.insert_embedding(
             symbol_id,
+            None, // file_id
             chunk_text,
             &embedding,
             chunk_type.as_str(),
@@ -398,7 +399,7 @@ impl SemanticSearch {
 impl Default for SemanticSearch {
     fn default() -> Self {
         Self::new(
-            Arc::new(EmbeddingEngine::without_model()),
+            Arc::new(Mutex::new(EmbeddingEngine::without_model())),
             Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
         )
     }
@@ -461,7 +462,7 @@ mod tests {
         let db = Arc::new(Database::in_memory().unwrap());
 
         // Create a mock embedding engine (without model)
-        let engine = Arc::new(EmbeddingEngine::without_model());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
 
         SemanticSearch::new(engine, db)
     }
@@ -608,13 +609,14 @@ mod tests {
         let embedding: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
         db.insert_embedding(
             Some(symbol_id),
+            None,
             "fn test_function() { /* test code */ }",
             &embedding,
             "function",
         ).unwrap();
 
         // Create search with mock engine
-        let engine = Arc::new(EmbeddingEngine::without_model());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
         let search = SemanticSearch::new(engine, db);
 
         // Load embeddings
@@ -655,12 +657,12 @@ mod tests {
 
         // Insert in reverse order (low first)
         let sym1 = db.insert_symbol(file_id, "low_fn", "function", 1, 5, None, None).unwrap();
-        db.insert_embedding(Some(sym1), "low similarity function", &low_sim, "function").unwrap();
+        db.insert_embedding(Some(sym1), None, "low similarity function", &low_sim, "function").unwrap();
 
         let sym2 = db.insert_symbol(file_id, "high_fn", "function", 10, 15, None, None).unwrap();
-        db.insert_embedding(Some(sym2), "high similarity function", &high_sim, "function").unwrap();
+        db.insert_embedding(Some(sym2), None, "high similarity function", &high_sim, "function").unwrap();
 
-        let engine = Arc::new(EmbeddingEngine::without_model());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
         let search = SemanticSearch::new(engine, db);
 
         let results = search.search_by_embedding(
@@ -687,13 +689,13 @@ mod tests {
             .collect();
 
         let sym = db.insert_symbol(file_id, "test_fn", "function", 1, 5, None, None).unwrap();
-        db.insert_embedding(Some(sym), "test function", &embedding, "function").unwrap();
+        db.insert_embedding(Some(sym), None, "test function", &embedding, "function").unwrap();
 
         let query: Vec<f32> = std::iter::once(1.0)
             .chain(std::iter::repeat(0.0).take(383))
             .collect();
 
-        let engine = Arc::new(EmbeddingEngine::without_model());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
         let search = SemanticSearch::new(engine, db);
 
         // With low threshold, should return result
@@ -722,12 +724,12 @@ mod tests {
         let embedding: Vec<f32> = vec![1.0; 384];
 
         let sym1 = db.insert_symbol(file1_id, "main_fn", "function", 1, 5, None, None).unwrap();
-        db.insert_embedding(Some(sym1), "main function", &embedding, "function").unwrap();
+        db.insert_embedding(Some(sym1), None, "main function", &embedding, "function").unwrap();
 
         let sym2 = db.insert_symbol(file2_id, "test_fn", "function", 1, 5, None, None).unwrap();
-        db.insert_embedding(Some(sym2), "test function", &embedding, "function").unwrap();
+        db.insert_embedding(Some(sym2), None, "test function", &embedding, "function").unwrap();
 
-        let engine = Arc::new(EmbeddingEngine::without_model());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
         let search = SemanticSearch::new(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
@@ -753,13 +755,13 @@ mod tests {
 
         // Insert function
         let sym1 = db.insert_symbol(file_id, "my_function", "function", 1, 5, None, None).unwrap();
-        db.insert_embedding(Some(sym1), "my function", &embedding, "function").unwrap();
+        db.insert_embedding(Some(sym1), None, "my function", &embedding, "function").unwrap();
 
         // Insert type
         let sym2 = db.insert_symbol(file_id, "MyStruct", "struct", 10, 15, None, None).unwrap();
-        db.insert_embedding(Some(sym2), "my struct", &embedding, "type").unwrap();
+        db.insert_embedding(Some(sym2), None, "my struct", &embedding, "type").unwrap();
 
-        let engine = Arc::new(EmbeddingEngine::without_model());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
         let search = SemanticSearch::new(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
@@ -805,10 +807,10 @@ mod tests {
                 None,
                 None,
             ).unwrap();
-            db.insert_embedding(Some(sym), &format!("function {}", i), &embedding, "function").unwrap();
+            db.insert_embedding(Some(sym), None, &format!("function {}", i), &embedding, "function").unwrap();
         }
 
-        let engine = Arc::new(EmbeddingEngine::without_model());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
         let search = SemanticSearch::new(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
