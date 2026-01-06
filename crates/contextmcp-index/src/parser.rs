@@ -1,6 +1,6 @@
 //! Code parsing with tree-sitter
 
-use contextmcp_core::types::{Language, SymbolKind};
+use contextmcp_core::types::{Language, SymbolKind, SymbolModifiers, SymbolVisibility};
 use contextmcp_core::{Error, Result};
 
 /// Extracted symbol from source code
@@ -12,6 +12,14 @@ pub struct ExtractedSymbol {
     pub end_line: u32,
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
+    /// Visibility/access modifier
+    pub visibility: Option<SymbolVisibility>,
+    /// Symbol modifiers (async, static, etc.)
+    pub modifiers: SymbolModifiers,
+    /// Name of the parent symbol (for nested symbols like methods in a class)
+    pub parent_symbol: Option<String>,
+    /// Generic type parameters (e.g., ["T", "U"] for fn foo<T, U>)
+    pub type_parameters: Vec<String>,
 }
 
 /// Code parser using tree-sitter
@@ -119,6 +127,10 @@ impl CodeParser {
             end_line,
             signature,
             doc_comment,
+            visibility: None,
+            modifiers: SymbolModifiers::default(),
+            parent_symbol: None,
+            type_parameters: Vec::new(),
         })
     }
 
@@ -202,6 +214,10 @@ impl CodeParser {
             end_line,
             signature,
             doc_comment,
+            visibility: None,
+            modifiers: SymbolModifiers::default(),
+            parent_symbol: None,
+            type_parameters: Vec::new(),
         })
     }
 
@@ -279,6 +295,10 @@ impl CodeParser {
             end_line,
             signature,
             doc_comment,
+            visibility: None,
+            modifiers: SymbolModifiers::default(),
+            parent_symbol: None,
+            type_parameters: Vec::new(),
         })
     }
 
