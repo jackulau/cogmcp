@@ -76,6 +76,52 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+/// Input for batch embedding insert
+#[derive(Debug, Clone)]
+pub struct EmbeddingInput {
+    pub symbol_id: Option<i64>,
+    pub file_id: Option<i64>,
+    pub chunk_text: String,
+    pub embedding: Vec<f32>,
+    pub chunk_type: String,
+}
+
+/// Row from the embeddings table with joined data
+#[derive(Debug, Clone)]
+pub struct EmbeddingRow {
+    pub id: i64,
+    pub symbol_id: Option<i64>,
+    pub file_id: Option<i64>,
+    pub chunk_text: String,
+    pub embedding: Vec<f32>,
+    pub chunk_type: String,
+    pub symbol_name: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub file_path: Option<String>,
+}
+
+/// Result from similarity search
+#[derive(Debug, Clone)]
+pub struct SimilarityResult {
+    pub embedding_id: i64,
+    pub chunk_text: String,
+    pub file_path: Option<String>,
+    pub symbol_name: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub similarity_score: f32,
+}
+
+/// Convert bytes to f32 vector (little-endian format)
+fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let arr: [u8; 4] = chunk.try_into().expect("chunk size is 4");
+            f32::from_le_bytes(arr)
+        })
+        .collect()
+}
+
 /// SQLite database wrapper with connection pooling
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -295,9 +341,6 @@ impl Database {
     ) -> Result<i64> {
         let conn = self.conn.lock();
 
-        let type_params_json = serialize_type_params(&extended.type_parameters);
-        let params_json = serialize_parameters(&extended.parameters);
-
         conn.execute(
             r#"
             INSERT INTO symbols (
@@ -375,58 +418,6 @@ impl Database {
 
         let rows = stmt
             .query_map(params![pattern], |row| row_to_symbol_row(row))
-            .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| Error::Storage(format!("Failed to read row: {}", e)))?);
-        }
-
-        Ok(results)
-    }
-
-    /// Get children of a symbol (nested symbols)
-    pub fn get_symbol_children(&self, symbol_id: i64) -> Result<Vec<SymbolRow>> {
-        let conn = self.conn.lock();
-        let query = r#"
-            SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line,
-                   s.signature, s.doc_comment, f.path,
-                   s.visibility, s.is_async, s.is_static, s.is_abstract, s.is_exported,
-                   s.parent_symbol_id, s.type_parameters, s.parameters, s.return_type
-            FROM symbols s JOIN files f ON s.file_id = f.id
-            WHERE s.parent_symbol_id = ?1
-            ORDER BY s.start_line
-        "#;
-
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
-
-        let rows = stmt
-            .query_map(params![pattern], |row| {
-                Ok(SymbolRow {
-                    id: row.get(0)?,
-                    file_id: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    end_line: row.get(5)?,
-                    signature: row.get(6)?,
-                    doc_comment: row.get(7)?,
-                    file_path: row.get(8)?,
-                    visibility: row.get(9)?,
-                    is_async: row.get::<_, i32>(10)? != 0,
-                    is_static: row.get::<_, i32>(11)? != 0,
-                    is_abstract: row.get::<_, i32>(12)? != 0,
-                    is_exported: row.get::<_, i32>(13)? != 0,
-                    is_const: row.get::<_, i32>(14)? != 0,
-                    is_unsafe: row.get::<_, i32>(15)? != 0,
-                    parent_symbol_id: row.get(16)?,
-                    type_parameters: row.get(17)?,
-                    parameters: row.get(18)?,
-                    return_type: row.get(19)?,
-                })
-            })
             .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
 
         let mut results = Vec::new();
