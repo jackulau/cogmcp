@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/contextmcp-core",
-    "crates/contextmcp-storage",
-    "crates/contextmcp-index",
-    "crates/contextmcp-search",
-    "crates/contextmcp-embeddings",
-    "crates/contextmcp-watcher",
-    "crates/contextmcp-context",
-    "crates/contextmcp-server",
+    "crates/cogmcp-core",
+    "crates/cogmcp-storage",
+    "crates/cogmcp-index",
+    "crates/cogmcp-search",
+    "crates/cogmcp-embeddings",
+    "crates/cogmcp-watcher",
+    "crates/cogmcp-context",
+    "crates/cogmcp-server",
 ]
 resolver = "2"
 
@@ -15,8 +15,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["ContextMCP Contributors"]
-repository = "https://github.com/contextmcp/contextmcp"
+authors = ["CogMCP Contributors"]
+repository = "https://github.com/cogmcp/cogmcp"
 
 [workspace.dependencies]
 # MCP Protocol
@@ -72,10 +72,10 @@ dirs = "5.0"
 once_cell = "1"
 
 # Internal crates
-contextmcp-core = { path = "crates/contextmcp-core" }
-contextmcp-storage = { path = "crates/contextmcp-storage" }
-contextmcp-index = { path = "crates/contextmcp-index" }
-contextmcp-search = { path = "crates/contextmcp-search" }
-contextmcp-embeddings = { path = "crates/contextmcp-embeddings" }
-contextmcp-watcher = { path = "crates/contextmcp-watcher" }
-contextmcp-context = { path = "crates/contextmcp-context" }
+cogmcp-core = { path = "crates/cogmcp-core" }
+cogmcp-storage = { path = "crates/cogmcp-storage" }
+cogmcp-index = { path = "crates/cogmcp-index" }
+cogmcp-search = { path = "crates/cogmcp-search" }
+cogmcp-embeddings = { path = "crates/cogmcp-embeddings" }
+cogmcp-watcher = { path = "crates/cogmcp-watcher" }
+cogmcp-context = { path = "crates/cogmcp-context" }

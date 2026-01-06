@@ -1,0 +1,19 @@
+[package]
+name = "cogmcp-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cogmcp-core = { workspace = true }
+cogmcp-storage = { workspace = true }
+cogmcp-embeddings = { workspace = true }
+tantivy = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }

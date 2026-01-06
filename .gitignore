@@ -14,7 +14,7 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
-# ContextMCP data
+# CogMCP data
 /data/
 *.db
 *.db-journal
