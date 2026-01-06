@@ -1,0 +1,81 @@
+[workspace]
+members = [
+    "crates/contextmcp-core",
+    "crates/contextmcp-storage",
+    "crates/contextmcp-index",
+    "crates/contextmcp-search",
+    "crates/contextmcp-embeddings",
+    "crates/contextmcp-watcher",
+    "crates/contextmcp-context",
+    "crates/contextmcp-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["ContextMCP Contributors"]
+repository = "https://github.com/contextmcp/contextmcp"
+
+[workspace.dependencies]
+# MCP Protocol
+rmcp = { version = "0.12", features = ["server", "transport-io", "macros"] }
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Database & Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+tantivy = "0.22"
+
+# Note: No external ML models - fully self-contained
+
+# Code Parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+
+# Git Integration
+git2 = "0.19"
+
+# File Watching
+notify = { version = "7.0", features = ["serde"] }
+notify-debouncer-full = "0.4"
+
+# Dependency Parsing
+cargo_toml = "0.20"
+
+# Error Handling & Logging
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+walkdir = "2.5"
+globset = "0.4"
+regex = "1"
+rayon = "1"
+dashmap = "6"
+parking_lot = "0.12"
+dirs = "5.0"
+once_cell = "1"
+
+# Internal crates
+contextmcp-core = { path = "crates/contextmcp-core" }
+contextmcp-storage = { path = "crates/contextmcp-storage" }
+contextmcp-index = { path = "crates/contextmcp-index" }
+contextmcp-search = { path = "crates/contextmcp-search" }
+contextmcp-embeddings = { path = "crates/contextmcp-embeddings" }
+contextmcp-watcher = { path = "crates/contextmcp-watcher" }
+contextmcp-context = { path = "crates/contextmcp-context" }

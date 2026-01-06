@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ContextMCP data
+/data/
+*.db
+*.db-journal
+
+# Models
+/models/*.onnx
+
+# Logs
+*.log

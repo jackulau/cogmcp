@@ -1,0 +1,13 @@
+[package]
+name = "contextmcp-embeddings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# This crate is a stub - no external models used
+# All search is keyword-based via Tantivy
+
+[dependencies]
+contextmcp-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

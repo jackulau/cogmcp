@@ -1,0 +1,18 @@
+[package]
+name = "contextmcp-watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+contextmcp-core = { workspace = true }
+contextmcp-storage = { workspace = true }
+contextmcp-index = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
