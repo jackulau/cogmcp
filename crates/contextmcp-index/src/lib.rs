@@ -9,4 +9,4 @@ pub mod git;
 pub mod dependencies;
 
 pub use codebase::CodebaseIndexer;
-pub use parser::CodeParser;
+pub use parser::{CodeParser, Decorator, ExtractedSymbol, Parameter, Visibility};
