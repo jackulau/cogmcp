@@ -154,46 +154,6 @@ pub enum SymbolKind {
     Unknown,
 }
 
-/// Visibility/access modifier for symbols
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SymbolVisibility {
-    /// Public visibility (accessible from anywhere)
-    Public,
-    /// Private visibility (only accessible within defining scope)
-    #[default]
-    Private,
-    /// Protected visibility (accessible within class hierarchy)
-    Protected,
-    /// Internal visibility (accessible within module/package)
-    Internal,
-    /// Crate visibility (Rust's pub(crate))
-    Crate,
-}
-
-/// Modifiers that can apply to symbols
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub struct SymbolModifiers {
-    /// Whether the symbol is async
-    pub is_async: bool,
-    /// Whether the symbol is static (class-level, not instance)
-    pub is_static: bool,
-    /// Whether the symbol is abstract
-    pub is_abstract: bool,
-    /// Whether the symbol is const (compile-time constant)
-    pub is_const: bool,
-    /// Whether the symbol is final/sealed (cannot be overridden)
-    pub is_final: bool,
-    /// Whether the symbol is unsafe (Rust)
-    pub is_unsafe: bool,
-    /// Whether the symbol is extern (foreign function)
-    pub is_extern: bool,
-    /// Whether the symbol is virtual (can be overridden)
-    pub is_virtual: bool,
-    /// Whether the symbol is mutable
-    pub is_mut: bool,
-}
-
 /// Information about a file in the index
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {

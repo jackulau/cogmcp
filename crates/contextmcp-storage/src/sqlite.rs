@@ -59,6 +59,23 @@ pub fn deserialize_parameters(json: Option<&str>) -> Vec<ParameterInfo> {
         .unwrap_or_default()
 }
 
+/// Compute cosine similarity between two embeddings
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a * norm_b)
+}
+
 /// SQLite database wrapper with connection pooling
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -922,11 +939,8 @@ impl Database {
 /// 0: id, 1: file_id, 2: name, 3: kind, 4: start_line, 5: end_line,
 /// 6: signature, 7: doc_comment, 8: file_path,
 /// 9: visibility, 10: is_async, 11: is_static, 12: is_abstract, 13: is_exported,
-/// 14: parent_symbol_id, 15: type_parameters, 16: parameters, 17: return_type
+/// 14: is_const, 15: is_unsafe, 16: parent_symbol_id, 17: type_parameters, 18: parameters, 19: return_type
 fn row_to_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRow> {
-    let type_params_json: Option<String> = row.get(15)?;
-    let params_json: Option<String> = row.get(16)?;
-
     Ok(SymbolRow {
         id: row.get(0)?,
         file_id: row.get(1)?,
@@ -942,10 +956,12 @@ fn row_to_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRow> {
         is_static: row.get::<_, Option<i32>>(11)?.unwrap_or(0) != 0,
         is_abstract: row.get::<_, Option<i32>>(12)?.unwrap_or(0) != 0,
         is_exported: row.get::<_, Option<i32>>(13)?.unwrap_or(0) != 0,
-        parent_symbol_id: row.get(14)?,
-        type_parameters: deserialize_type_params(type_params_json.as_deref()),
-        parameters: deserialize_parameters(params_json.as_deref()),
-        return_type: row.get(17)?,
+        is_const: row.get::<_, Option<i32>>(14)?.unwrap_or(0) != 0,
+        is_unsafe: row.get::<_, Option<i32>>(15)?.unwrap_or(0) != 0,
+        parent_symbol_id: row.get(16)?,
+        type_parameters: row.get(17)?,
+        parameters: row.get(18)?,
+        return_type: row.get(19)?,
     })
 }
 
