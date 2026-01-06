@@ -3,6 +3,7 @@
 use crate::parser::CodeParser;
 use contextmcp_core::types::Language;
 use contextmcp_core::{Config, Error, Result};
+use contextmcp_embeddings::EmbeddingEngine;
 use contextmcp_storage::{Database, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
@@ -10,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 /// Indexes files in a codebase
@@ -19,6 +21,7 @@ pub struct CodebaseIndexer {
     ignore_patterns: GlobSet,
     include_extensions: HashSet<String>,
     parser: Arc<CodeParser>,
+    embedding_engine: Option<Arc<EmbeddingEngine>>,
 }
 
 impl CodebaseIndexer {
@@ -38,7 +41,31 @@ impl CodebaseIndexer {
             ignore_patterns,
             include_extensions,
             parser,
+            embedding_engine: None,
         })
+    }
+
+    /// Create an indexer with embedding support
+    pub fn with_embedding_engine(
+        root: PathBuf,
+        config: Config,
+        parser: Arc<CodeParser>,
+        engine: Arc<EmbeddingEngine>,
+    ) -> Result<Self> {
+        let mut indexer = Self::new(root, config, parser)?;
+        indexer.embedding_engine = Some(engine);
+        Ok(indexer)
+    }
+
+    /// Set the embedding engine
+    pub fn set_embedding_engine(&mut self, engine: Arc<EmbeddingEngine>) {
+        self.embedding_engine = Some(engine);
+    }
+
+    /// Check if embeddings are enabled and available
+    pub fn embeddings_enabled(&self) -> bool {
+        self.config.indexing.enable_embeddings
+            && self.embedding_engine.as_ref().map_or(false, |e| e.is_loaded())
     }
 
     fn build_ignore_patterns(config: &Config) -> Result<GlobSet> {
@@ -168,10 +195,12 @@ impl CodebaseIndexer {
             // Delete old symbols for this file
             let _ = db.delete_symbols_for_file(file_id);
 
-            // Insert new symbols
-            for sym in symbols {
+            // Insert new symbols and generate embeddings
+            let generate_embeddings = self.embeddings_enabled();
+
+            for sym in &symbols {
                 let kind_str = format!("{:?}", sym.kind).to_lowercase();
-                let _ = db.insert_symbol(
+                let symbol_id = db.insert_symbol(
                     file_id,
                     &sym.name,
                     &kind_str,
@@ -179,14 +208,111 @@ impl CodebaseIndexer {
                     sym.end_line,
                     sym.signature.as_deref(),
                     sym.doc_comment.as_deref(),
-                );
+                )?;
+
+                // Generate embedding for symbol if enabled
+                if generate_embeddings {
+                    if let Err(e) = self.generate_embedding_for_symbol(
+                        db,
+                        symbol_id,
+                        sym,
+                        &content,
+                        &kind_str,
+                    ) {
+                        warn!(
+                            "Failed to generate embedding for symbol {} in {}: {}",
+                            sym.name, relative_path, e
+                        );
+                    }
+                }
             }
+
+            debug!(
+                "Indexed {} symbols from {}, embeddings: {}",
+                symbols.len(),
+                relative_path,
+                generate_embeddings
+            );
         }
 
         // Index in full-text search
         text_index.index_file(&relative_path, &content)?;
 
         Ok(())
+    }
+
+    /// Generate an embedding for a symbol
+    fn generate_embedding_for_symbol(
+        &self,
+        db: &Database,
+        symbol_id: i64,
+        sym: &crate::parser::ExtractedSymbol,
+        content: &str,
+        kind_str: &str,
+    ) -> Result<()> {
+        let engine = self.embedding_engine.as_ref().ok_or_else(|| {
+            Error::Embedding("Embedding engine not configured".into())
+        })?;
+
+        // Extract the symbol's code chunk from the file content
+        let chunk_text = Self::extract_symbol_chunk(sym, content);
+
+        // Skip very short chunks (probably just declarations)
+        if chunk_text.len() < 10 {
+            return Ok(());
+        }
+
+        // Generate embedding
+        let embedding = engine.embed(&chunk_text)?;
+
+        // Store in database
+        db.insert_embedding(Some(symbol_id), &chunk_text, &embedding, kind_str)?;
+
+        Ok(())
+    }
+
+    /// Extract the code chunk for a symbol from file content
+    fn extract_symbol_chunk(sym: &crate::parser::ExtractedSymbol, content: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let start = (sym.start_line as usize).saturating_sub(1);
+        let end = std::cmp::min(sym.end_line as usize, lines.len());
+
+        if start >= lines.len() {
+            return String::new();
+        }
+
+        // Build the chunk with the symbol name prepended for better context
+        let mut chunk = String::new();
+
+        // Add doc comment if available
+        if let Some(ref doc) = sym.doc_comment {
+            chunk.push_str(doc);
+            chunk.push('\n');
+        }
+
+        // Add signature if available, otherwise use name
+        if let Some(ref sig) = sym.signature {
+            chunk.push_str(sig);
+            chunk.push('\n');
+        }
+
+        // Add the code lines
+        for line in &lines[start..end] {
+            chunk.push_str(line);
+            chunk.push('\n');
+        }
+
+        // Limit chunk size to avoid very long embeddings
+        const MAX_CHUNK_CHARS: usize = 2000;
+        if chunk.len() > MAX_CHUNK_CHARS {
+            chunk.truncate(MAX_CHUNK_CHARS);
+            // Try to truncate at a line boundary
+            if let Some(last_newline) = chunk.rfind('\n') {
+                chunk.truncate(last_newline);
+            }
+        }
+
+        chunk
     }
 
     fn should_ignore(&self, path: &Path, gitignore: &GlobSet) -> bool {
@@ -259,4 +385,5 @@ pub struct IndexResult {
     pub indexed: u64,
     pub skipped: u64,
     pub errors: u64,
+    pub embeddings_generated: u64,
 }

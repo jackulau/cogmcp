@@ -14,6 +14,7 @@ pub struct Config {
     pub watching: WatchingConfig,
     pub context: ContextConfig,
     pub git: GitConfig,
+    pub search: SearchConfig,
 }
 
 impl Default for Config {
@@ -24,6 +25,7 @@ impl Default for Config {
             watching: WatchingConfig::default(),
             context: ContextConfig::default(),
             git: GitConfig::default(),
+            search: SearchConfig::default(),
         }
     }
 }
@@ -237,6 +239,37 @@ impl Default for GitConfig {
     }
 }
 
+/// Search configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Default search mode: keyword, semantic, or hybrid
+    pub default_mode: String,
+    /// Minimum similarity threshold for semantic search (0.0 - 1.0)
+    pub min_similarity: f32,
+    /// Weight for keyword results in hybrid search (0.0 - 1.0)
+    pub keyword_weight: f32,
+    /// Weight for semantic results in hybrid search (0.0 - 1.0)
+    pub semantic_weight: f32,
+    /// RRF constant k (higher = more weight to lower-ranked results)
+    pub rrf_k: f32,
+    /// Default result limit
+    pub default_limit: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: "hybrid".to_string(),
+            min_similarity: 0.3,
+            keyword_weight: 0.5,
+            semantic_weight: 0.5,
+            rrf_k: 60.0,
+            default_limit: 20,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +282,16 @@ mod tests {
         assert!(config.watching.enabled);
         assert_eq!(config.context.default_max_tokens, 8000);
         assert!(config.git.enabled);
+    }
+
+    #[test]
+    fn test_search_config_defaults() {
+        let config = SearchConfig::default();
+        assert_eq!(config.default_mode, "hybrid");
+        assert_eq!(config.min_similarity, 0.3);
+        assert_eq!(config.keyword_weight, 0.5);
+        assert_eq!(config.semantic_weight, 0.5);
+        assert_eq!(config.rrf_k, 60.0);
+        assert_eq!(config.default_limit, 20);
     }
 }

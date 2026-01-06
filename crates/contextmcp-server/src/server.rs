@@ -1,8 +1,9 @@
 //! Main MCP server implementation
 
 use contextmcp_core::{Config, Result};
+use contextmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use contextmcp_index::{CodeParser, CodebaseIndexer};
-use contextmcp_search::HybridSearch;
+use contextmcp_search::{HybridSearch, SearchMode, SemanticSearch};
 use contextmcp_storage::{Database, FullTextIndex};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -11,6 +12,7 @@ use rmcp::model::{
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 /// MCP server for context management
 #[derive(Clone)]
@@ -20,6 +22,8 @@ pub struct ContextMcpServer {
     pub db: Arc<Database>,
     pub text_index: Arc<FullTextIndex>,
     pub parser: Arc<CodeParser>,
+    pub embedding_engine: Option<Arc<EmbeddingEngine>>,
+    pub semantic_search: Option<Arc<SemanticSearch>>,
 }
 
 impl ContextMcpServer {
@@ -30,12 +34,28 @@ impl ContextMcpServer {
         let text_index = Arc::new(FullTextIndex::open(&Config::tantivy_path()?)?);
         let parser = Arc::new(CodeParser::new());
 
+        // Initialize embedding engine if enabled
+        let (embedding_engine, semantic_search) = if config.indexing.enable_embeddings {
+            match Self::init_embedding_engine(&config, db.clone()) {
+                Ok((engine, search)) => (Some(engine), Some(search)),
+                Err(e) => {
+                    warn!("Failed to initialize embedding engine: {}. Semantic search disabled.", e);
+                    (None, None)
+                }
+            }
+        } else {
+            debug!("Embeddings disabled in configuration");
+            (None, None)
+        };
+
         Ok(Self {
             root,
             config,
             db,
             text_index,
             parser,
+            embedding_engine,
+            semantic_search,
         })
     }
 
@@ -52,13 +72,71 @@ impl ContextMcpServer {
             db,
             text_index,
             parser,
+            embedding_engine: None,
+            semantic_search: None,
         })
+    }
+
+    /// Initialize the embedding engine and semantic search
+    fn init_embedding_engine(
+        config: &Config,
+        db: Arc<Database>,
+    ) -> Result<(Arc<EmbeddingEngine>, Arc<SemanticSearch>)> {
+        let model_path = config
+            .indexing
+            .embedding_model
+            .clone()
+            .or_else(|| Config::model_path().ok().map(|p| p.to_string_lossy().to_string()))
+            .unwrap_or_default();
+
+        let model_config = ModelConfig {
+            model_path,
+            ..Default::default()
+        };
+
+        let engine = Arc::new(EmbeddingEngine::new(model_config)?);
+        let semantic = Arc::new(SemanticSearch::new(engine.clone(), db));
+
+        info!(
+            "Embedding engine initialized (model loaded: {}, dim: {})",
+            engine.is_loaded(),
+            engine.embedding_dim()
+        );
+
+        Ok((engine, semantic))
+    }
+
+    /// Check if semantic search is available
+    pub fn has_semantic_search(&self) -> bool {
+        self.semantic_search
+            .as_ref()
+            .map_or(false, |s| s.is_available())
     }
 
     /// Index the codebase
     pub fn index(&self) -> Result<()> {
-        let indexer = CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone())?;
-        indexer.index_all(&self.db, &self.text_index)?;
+        let indexer = if let Some(ref engine) = self.embedding_engine {
+            CodebaseIndexer::with_embedding_engine(
+                self.root.clone(),
+                self.config.clone(),
+                self.parser.clone(),
+                engine.clone(),
+            )?
+        } else {
+            CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone())?
+        };
+
+        let result = indexer.index_all(&self.db, &self.text_index)?;
+        info!(
+            "Indexed {} files ({} skipped, {} errors, {} embeddings)",
+            result.indexed, result.skipped, result.errors, result.embeddings_generated
+        );
+
+        // Invalidate semantic search cache after indexing
+        if let Some(ref semantic) = self.semantic_search {
+            semantic.invalidate_cache();
+        }
+
         Ok(())
     }
 
@@ -165,6 +243,18 @@ impl ContextMcpServer {
                     }
                 }),
             ),
+            make_tool(
+                "semantic_search",
+                "Search for code using semantic similarity (requires embeddings)",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Natural language search query" },
+                        "limit": { "type": "integer", "description": "Maximum results (default: 10)" }
+                    },
+                    "required": ["query"]
+                }),
+            ),
         ]
     }
 
@@ -211,6 +301,14 @@ impl ContextMcpServer {
             }
             "index_status" => Ok(self.index_status()),
             "reindex" => Ok(self.reindex()),
+            "semantic_search" => {
+                let query = arguments["query"]
+                    .as_str()
+                    .ok_or("Missing query")?
+                    .to_string();
+                let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
+                Ok(self.semantic_search(&query, limit))
+            }
             _ => Err(format!("Unknown tool: {}", name)),
         }
     }
@@ -247,28 +345,47 @@ impl ContextMcpServer {
     }
 
     fn context_search(&self, query: &str, limit: usize, mode: &str) -> String {
-        use contextmcp_search::hybrid::SearchMode;
+        // Use configured default mode if not specified
+        let mode_str = if mode.is_empty() {
+            &self.config.search.default_mode
+        } else {
+            mode
+        };
+        let search_mode = SearchMode::from_str(mode_str);
 
-        let search_mode = match mode {
-            "keyword" => SearchMode::Keyword,
-            "semantic" => SearchMode::Semantic,
-            _ => SearchMode::Hybrid,
+        // Create hybrid search with semantic capability if available
+        let search = if let Some(ref semantic) = self.semantic_search {
+            let config = contextmcp_search::HybridSearchConfig {
+                keyword_weight: self.config.search.keyword_weight,
+                semantic_weight: self.config.search.semantic_weight,
+                min_similarity: self.config.search.min_similarity,
+                rrf_k: self.config.search.rrf_k,
+            };
+            HybridSearch::with_semantic(&self.text_index, semantic.clone()).with_config(config)
+        } else {
+            HybridSearch::new(&self.text_index)
         };
 
-        let search = HybridSearch::new(&self.text_index);
         match search.search(query, search_mode, limit) {
             Ok(results) => {
                 if results.is_empty() {
                     return "No matches found.".to_string();
                 }
+
+                let mode_info = if search.has_semantic() {
+                    format!("(mode: {:?}, semantic enabled)", search_mode)
+                } else {
+                    format!("(mode: {:?}, semantic disabled)", search_mode)
+                };
+
                 let mut output = String::new();
-                output.push_str(&format!("## Search results for: {}\n\n", query));
+                output.push_str(&format!("## Search results for: {} {}\n\n", query, mode_info));
                 for hit in results {
                     output.push_str(&format!("### `{}`", hit.path));
                     if let Some(line) = hit.line_number {
                         output.push_str(&format!(":{}", line));
                     }
-                    output.push_str(&format!(" (score: {:.2})\n", hit.score));
+                    output.push_str(&format!(" (score: {:.2}, type: {:?})\n", hit.score, hit.match_type));
                     output.push_str("```\n");
                     output.push_str(&hit.content);
                     output.push_str("\n```\n\n");
@@ -371,20 +488,77 @@ impl ContextMcpServer {
     }
 
     fn reindex(&self) -> String {
-        match CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone()) {
+        let indexer_result = if let Some(ref engine) = self.embedding_engine {
+            CodebaseIndexer::with_embedding_engine(
+                self.root.clone(),
+                self.config.clone(),
+                self.parser.clone(),
+                engine.clone(),
+            )
+        } else {
+            CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone())
+        };
+
+        match indexer_result {
             Ok(indexer) => match indexer.index_all(&self.db, &self.text_index) {
                 Ok(result) => {
+                    // Invalidate semantic search cache
+                    if let Some(ref semantic) = self.semantic_search {
+                        semantic.invalidate_cache();
+                    }
+
                     format!(
                         "## Reindex Complete\n\n\
                         - **Files indexed:** {}\n\
                         - **Files skipped:** {}\n\
-                        - **Errors:** {}\n",
-                        result.indexed, result.skipped, result.errors
+                        - **Errors:** {}\n\
+                        - **Embeddings generated:** {}\n",
+                        result.indexed, result.skipped, result.errors, result.embeddings_generated
                     )
                 }
                 Err(e) => format!("Indexing failed: {}", e),
             },
             Err(e) => format!("Failed to create indexer: {}", e),
+        }
+    }
+
+    /// Semantic search for code using natural language
+    fn semantic_search(&self, query: &str, limit: usize) -> String {
+        let Some(ref semantic) = self.semantic_search else {
+            return "Semantic search is not available. Enable embeddings in configuration.".to_string();
+        };
+
+        if !semantic.is_available() {
+            return "Semantic search is not available. Model not loaded.".to_string();
+        }
+
+        match semantic.search(query, limit) {
+            Ok(results) => {
+                if results.is_empty() {
+                    return "No matches found.".to_string();
+                }
+
+                let mut output = String::new();
+                output.push_str(&format!("## Semantic search results for: {}\n\n", query));
+                for result in results {
+                    output.push_str(&format!(
+                        "### `{}`",
+                        result.path
+                    ));
+                    if let Some(line) = result.start_line {
+                        output.push_str(&format!(":{}", line));
+                    }
+                    output.push_str(&format!(
+                        " (similarity: {:.2}, type: {:?})\n",
+                        result.similarity, result.chunk_type
+                    ));
+                    output.push_str("```\n");
+                    output.push_str(&result.chunk_text);
+                    output.push_str("\n```\n\n");
+                }
+                output
+            }
+            Err(e) => format!("Semantic search failed: {}", e),
         }
     }
 }

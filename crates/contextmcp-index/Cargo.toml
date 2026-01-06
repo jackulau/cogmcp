@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 contextmcp-core = { workspace = true }
 contextmcp-storage = { workspace = true }
+contextmcp-embeddings = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }
