@@ -4,5 +4,7 @@
 
 pub mod server;
 pub mod tools;
+pub mod transport;
 
 pub use server::ContextMcpServer;
+pub use transport::StdioTransport;
