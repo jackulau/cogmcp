@@ -197,7 +197,7 @@ impl ModelManager {
 
             // Log progress for large files
             if let Some(len) = content_length {
-                if total_bytes % (10 * 1024 * 1024) == 0 {
+                if total_bytes.is_multiple_of(10 * 1024 * 1024) {
                     let percent = (total_bytes as f64 / len as f64) * 100.0;
                     debug!("Download progress: {:.1}%", percent);
                 }

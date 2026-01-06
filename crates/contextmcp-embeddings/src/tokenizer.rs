@@ -1,5 +1,6 @@
 //! Tokenization utilities for text preprocessing
 
+use std::fmt;
 use std::path::Path;
 
 use tokenizers::Tokenizer as HfTokenizer;
@@ -11,6 +12,14 @@ use contextmcp_core::{Error, Result};
 pub struct Tokenizer {
     inner: HfTokenizer,
     max_length: usize,
+}
+
+impl fmt::Debug for Tokenizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tokenizer")
+            .field("max_length", &self.max_length)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Tokenizer {
@@ -110,9 +119,9 @@ impl Tokenizer {
             // Pad to seq_length
             let padding_len = seq_length - len;
             if padding_len > 0 {
-                input_ids.extend(std::iter::repeat(0i64).take(padding_len));
-                attention_mask.extend(std::iter::repeat(0i64).take(padding_len));
-                token_type_ids.extend(std::iter::repeat(0i64).take(padding_len));
+                input_ids.extend(std::iter::repeat_n(0i64, padding_len));
+                attention_mask.extend(std::iter::repeat_n(0i64, padding_len));
+                token_type_ids.extend(std::iter::repeat_n(0i64, padding_len));
             }
         }
 

@@ -14,6 +14,7 @@ use crate::model::ModelConfig;
 use crate::tokenizer::Tokenizer;
 
 /// Embedding engine for generating text embeddings using ONNX Runtime
+#[derive(Debug)]
 pub struct EmbeddingEngine {
     /// Model configuration
     config: ModelConfig,
