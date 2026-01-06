@@ -8,6 +8,68 @@ pub type FileId = i64;
 /// Unique identifier for symbols
 pub type SymbolId = i64;
 
+/// Visibility/access modifier for symbols
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolVisibility {
+    /// Public - accessible from anywhere
+    Public,
+    /// Private - accessible only within the same scope
+    Private,
+    /// Protected - accessible within class and subclasses
+    Protected,
+    /// Internal - accessible within the same module/package
+    Internal,
+    /// Crate-level visibility (Rust pub(crate))
+    Crate,
+    /// Unknown or not applicable
+    #[default]
+    Unknown,
+}
+
+impl SymbolVisibility {
+    /// Parse visibility from a string
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "public" | "pub" => Self::Public,
+            "private" | "priv" => Self::Private,
+            "protected" => Self::Protected,
+            "internal" => Self::Internal,
+            "crate" | "pub(crate)" => Self::Crate,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Convert to string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+            Self::Protected => "protected",
+            Self::Internal => "internal",
+            Self::Crate => "crate",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Modifiers that can be applied to symbols
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct SymbolModifiers {
+    /// Is the symbol async (Rust async fn, JS async function)
+    pub is_async: bool,
+    /// Is the symbol static (class static method, Rust static)
+    pub is_static: bool,
+    /// Is the symbol abstract (abstract class/method)
+    pub is_abstract: bool,
+    /// Is the symbol exported (JS/TS export)
+    pub is_exported: bool,
+    /// Is the symbol const (Rust const, JS const)
+    pub is_const: bool,
+    /// Is the symbol unsafe (Rust unsafe)
+    pub is_unsafe: bool,
+}
+
 /// Supported programming languages for parsing
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -113,6 +175,25 @@ pub struct SymbolInfo {
     pub end_line: u32,
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
+    /// Visibility of the symbol
+    pub visibility: SymbolVisibility,
+    /// Symbol modifiers (async, static, etc.)
+    pub modifiers: SymbolModifiers,
+    /// Parent symbol ID for nested symbols
+    pub parent_id: Option<SymbolId>,
+    /// Generic type parameters
+    pub type_parameters: Vec<String>,
+    /// Function/method parameters
+    pub parameters: Vec<ParameterInfo>,
+    /// Return type for functions/methods
+    pub return_type: Option<String>,
+}
+
+/// Information about a function/method parameter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterInfo {
+    pub name: String,
+    pub type_annotation: Option<String>,
 }
 
 /// A location in the codebase

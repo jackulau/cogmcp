@@ -1,11 +1,11 @@
 //! Codebase file indexing
 
-use crate::parser::CodeParser;
+use crate::parser::{CodeParser, ExtractedSymbol};
 use contextmcp_core::types::Language;
 use contextmcp_core::{Config, Error, Result};
 use contextmcp_storage::{Database, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -108,8 +108,8 @@ impl CodebaseIndexer {
                 continue;
             }
 
-            // Index the file
-            match self.index_file(path, db, text_index) {
+            // Index the file and track symbol statistics
+            match self.index_file_with_stats(path, db, text_index, &mut result) {
                 Ok(_) => result.indexed += 1,
                 Err(e) => {
                     tracing::warn!("Failed to index {:?}: {}", path, e);
@@ -122,6 +122,72 @@ impl CodebaseIndexer {
         text_index.commit()?;
 
         Ok(result)
+    }
+
+    /// Index a single file and update statistics
+    fn index_file_with_stats(
+        &self,
+        path: &Path,
+        db: &Database,
+        text_index: &FullTextIndex,
+        result: &mut IndexResult,
+    ) -> Result<()> {
+        let content = fs::read_to_string(path)?;
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        // Compute file hash
+        let hash = Self::hash_content(&content);
+
+        // Get file metadata
+        let metadata = fs::metadata(path)?;
+        let modified_at = metadata
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let size = metadata.len();
+
+        // Detect language
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let language = Language::from_extension(ext);
+        let language_str = format!("{:?}", language).to_lowercase();
+
+        // Insert into database
+        let file_id = db.upsert_file(&relative_path, &hash, modified_at, size, &language_str)?;
+
+        // Parse and extract symbols with enhanced metadata
+        if let Ok(symbols) = self.parser.parse(&content, language) {
+            // Delete old symbols for this file
+            let _ = db.delete_symbols_for_file(file_id);
+
+            // Track statistics
+            for sym in &symbols {
+                result.symbols_extracted += 1;
+                let kind_str = format!("{:?}", sym.kind).to_lowercase();
+                *result.symbols_by_kind.entry(kind_str).or_insert(0) += 1;
+
+                if sym.visibility != contextmcp_core::types::SymbolVisibility::Unknown {
+                    result.symbols_with_visibility += 1;
+                }
+            }
+
+            // Insert new symbols with parent relationship handling
+            self.insert_symbols_with_relationships(db, file_id, &symbols)?;
+        }
+
+        // Index in full-text search
+        text_index.index_file(&relative_path, &content)?;
+
+        Ok(())
     }
 
     /// Index a single file
@@ -163,28 +229,83 @@ impl CodebaseIndexer {
         // Insert into database
         let file_id = db.upsert_file(&relative_path, &hash, modified_at, size, &language_str)?;
 
-        // Parse and extract symbols
+        // Parse and extract symbols with enhanced metadata
         if let Ok(symbols) = self.parser.parse(&content, language) {
             // Delete old symbols for this file
             let _ = db.delete_symbols_for_file(file_id);
 
-            // Insert new symbols
-            for sym in symbols {
-                let kind_str = format!("{:?}", sym.kind).to_lowercase();
-                let _ = db.insert_symbol(
-                    file_id,
-                    &sym.name,
-                    &kind_str,
-                    sym.start_line,
-                    sym.end_line,
-                    sym.signature.as_deref(),
-                    sym.doc_comment.as_deref(),
-                );
-            }
+            // Insert new symbols with parent relationship handling
+            self.insert_symbols_with_relationships(db, file_id, &symbols)?;
         }
 
         // Index in full-text search
         text_index.index_file(&relative_path, &content)?;
+
+        Ok(())
+    }
+
+    /// Insert symbols and establish parent-child relationships
+    fn insert_symbols_with_relationships(
+        &self,
+        db: &Database,
+        file_id: i64,
+        symbols: &[ExtractedSymbol],
+    ) -> Result<()> {
+        // First pass: insert all symbols without parent references and track name -> id mapping
+        let mut name_to_id: HashMap<String, i64> = HashMap::new();
+
+        for sym in symbols {
+            let kind_str = format!("{:?}", sym.kind).to_lowercase();
+            let visibility_str = sym.visibility.as_str();
+
+            // Serialize type parameters and parameters as JSON
+            let type_params_json = if sym.type_parameters.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&sym.type_parameters).unwrap_or_default())
+            };
+
+            let params_json = if sym.parameters.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&sym.parameters).unwrap_or_default())
+            };
+
+            let symbol_id = db.insert_symbol_extended(
+                file_id,
+                &sym.name,
+                &kind_str,
+                sym.start_line,
+                sym.end_line,
+                sym.signature.as_deref(),
+                sym.doc_comment.as_deref(),
+                Some(visibility_str),
+                sym.modifiers.is_async,
+                sym.modifiers.is_static,
+                sym.modifiers.is_abstract,
+                sym.modifiers.is_exported,
+                sym.modifiers.is_const,
+                sym.modifiers.is_unsafe,
+                None, // parent_symbol_id will be set in second pass
+                type_params_json.as_deref(),
+                params_json.as_deref(),
+                sym.return_type.as_deref(),
+            )?;
+
+            name_to_id.insert(sym.name.clone(), symbol_id);
+        }
+
+        // Second pass: update parent references
+        for sym in symbols {
+            if let Some(parent_name) = &sym.parent_name {
+                if let Some(&parent_id) = name_to_id.get(parent_name) {
+                    if let Some(&symbol_id) = name_to_id.get(&sym.name) {
+                        // Update the parent reference using the database method
+                        db.update_symbol_parent(symbol_id, parent_id)?;
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -259,4 +380,7 @@ pub struct IndexResult {
     pub indexed: u64,
     pub skipped: u64,
     pub errors: u64,
+    pub symbols_extracted: u64,
+    pub symbols_by_kind: HashMap<String, u64>,
+    pub symbols_with_visibility: u64,
 }

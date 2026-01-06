@@ -133,7 +133,8 @@ impl ContextMcpServer {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "Symbol name" },
-                        "kind": { "type": "string", "description": "Symbol kind filter" },
+                        "kind": { "type": "string", "description": "Symbol kind filter (function, class, method, etc.)" },
+                        "visibility": { "type": "string", "description": "Visibility filter (public, private, protected)" },
                         "fuzzy": { "type": "boolean", "description": "Enable fuzzy matching" }
                     },
                     "required": ["name"]
@@ -199,8 +200,14 @@ impl ContextMcpServer {
                     .ok_or("Missing name")?
                     .to_string();
                 let kind = arguments["kind"].as_str().map(|s| s.to_string());
+                let visibility = arguments["visibility"].as_str().map(|s| s.to_string());
                 let fuzzy = arguments["fuzzy"].as_bool().unwrap_or(false);
-                Ok(self.find_symbol(&name, kind.as_deref(), fuzzy))
+                Ok(self.find_symbol_with_visibility(
+                    &name,
+                    kind.as_deref(),
+                    visibility.as_deref(),
+                    fuzzy,
+                ))
             }
             "get_file_outline" => {
                 let file_path = arguments["file_path"]
@@ -279,12 +286,20 @@ impl ContextMcpServer {
         }
     }
 
-    fn find_symbol(&self, name: &str, kind: Option<&str>, fuzzy: bool) -> String {
+    fn find_symbol_with_visibility(
+        &self,
+        name: &str,
+        kind: Option<&str>,
+        visibility: Option<&str>,
+        fuzzy: bool,
+    ) -> String {
         match self.db.find_symbols_by_name(name, fuzzy) {
             Ok(symbols) => {
                 if symbols.is_empty() {
                     return format!("No symbols found matching '{}'", name);
                 }
+
+                // Filter by kind if specified
                 let symbols: Vec<_> = if let Some(k) = kind {
                     symbols
                         .into_iter()
@@ -294,15 +309,66 @@ impl ContextMcpServer {
                     symbols
                 };
 
+                // Filter by visibility if specified
+                let symbols: Vec<_> = if let Some(v) = visibility {
+                    symbols
+                        .into_iter()
+                        .filter(|s| {
+                            s.visibility
+                                .as_ref()
+                                .map(|vis| vis.to_lowercase() == v.to_lowercase())
+                                .unwrap_or(false)
+                        })
+                        .collect()
+                } else {
+                    symbols
+                };
+
+                if symbols.is_empty() {
+                    return format!("No symbols found matching '{}' with given filters", name);
+                }
+
                 let mut output = String::new();
                 output.push_str(&format!("## Symbols matching '{}'\n\n", name));
                 for sym in symbols {
+                    // Build modifiers string
+                    let mut modifiers = Vec::new();
+                    if sym.is_async {
+                        modifiers.push("async");
+                    }
+                    if sym.is_static {
+                        modifiers.push("static");
+                    }
+                    if sym.is_abstract {
+                        modifiers.push("abstract");
+                    }
+                    if sym.is_exported {
+                        modifiers.push("exported");
+                    }
+                    if sym.is_const {
+                        modifiers.push("const");
+                    }
+                    if sym.is_unsafe {
+                        modifiers.push("unsafe");
+                    }
+
+                    let visibility_str = sym.visibility.as_deref().unwrap_or("unknown");
+                    let modifiers_str = if modifiers.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", modifiers.join(", "))
+                    };
+
                     output.push_str(&format!(
-                        "- **{}** ({}) in `{}:{}-{}`\n",
-                        sym.name, sym.kind, sym.file_path, sym.start_line, sym.end_line
+                        "- **{}** ({}, {}{}) in `{}:{}-{}`\n",
+                        sym.name, sym.kind, visibility_str, modifiers_str,
+                        sym.file_path, sym.start_line, sym.end_line
                     ));
                     if let Some(sig) = &sym.signature {
                         output.push_str(&format!("  `{}`\n", sig.trim()));
+                    }
+                    if let Some(ret_type) = &sym.return_type {
+                        output.push_str(&format!("  Returns: `{}`\n", ret_type));
                     }
                 }
                 output
@@ -334,15 +400,55 @@ impl ContextMcpServer {
                 let mut output = String::new();
                 output.push_str(&format!("## Outline: {}\n\n", file_path));
                 for sym in symbols {
+                    // Build modifiers string
+                    let mut modifiers = Vec::new();
+                    if sym.modifiers.is_async {
+                        modifiers.push("async");
+                    }
+                    if sym.modifiers.is_static {
+                        modifiers.push("static");
+                    }
+                    if sym.modifiers.is_abstract {
+                        modifiers.push("abstract");
+                    }
+                    if sym.modifiers.is_exported {
+                        modifiers.push("exported");
+                    }
+                    if sym.modifiers.is_const {
+                        modifiers.push("const");
+                    }
+                    if sym.modifiers.is_unsafe {
+                        modifiers.push("unsafe");
+                    }
+
+                    let visibility_str = sym.visibility.as_str();
+                    let modifiers_str = if modifiers.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", modifiers.join(", "))
+                    };
+
+                    let parent_str = if let Some(parent) = &sym.parent_name {
+                        format!(" (in {})", parent)
+                    } else {
+                        String::new()
+                    };
+
                     output.push_str(&format!(
-                        "- **{}** ({}) lines {}-{}\n",
+                        "- **{}** ({}, {}{}) lines {}-{}{}\n",
                         sym.name,
                         format!("{:?}", sym.kind).to_lowercase(),
+                        visibility_str,
+                        modifiers_str,
                         sym.start_line,
-                        sym.end_line
+                        sym.end_line,
+                        parent_str
                     ));
                     if let Some(sig) = &sym.signature {
                         output.push_str(&format!("  `{}`\n", sig.trim()));
+                    }
+                    if let Some(ret_type) = &sym.return_type {
+                        output.push_str(&format!("  Returns: `{}`\n", ret_type));
                     }
                 }
                 output
@@ -352,9 +458,9 @@ impl ContextMcpServer {
     }
 
     fn index_status(&self) -> String {
-        match self.db.get_stats() {
+        match self.db.get_extended_stats() {
             Ok(stats) => {
-                format!(
+                let mut output = format!(
                     "## Index Status\n\n\
                     - **Files indexed:** {}\n\
                     - **Symbols extracted:** {}\n\
@@ -364,7 +470,46 @@ impl ContextMcpServer {
                     stats.symbol_count,
                     stats.embedding_count,
                     self.root.display()
-                )
+                );
+
+                // Add symbol breakdown by kind
+                if !stats.symbols_by_kind.is_empty() {
+                    output.push_str("\n### Symbols by Kind\n\n");
+                    let mut kinds: Vec<_> = stats.symbols_by_kind.iter().collect();
+                    kinds.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
+                    for (kind, count) in kinds {
+                        output.push_str(&format!("- {}: {}\n", kind, count));
+                    }
+                }
+
+                // Add visibility stats
+                if !stats.symbols_by_visibility.is_empty() {
+                    output.push_str("\n### Symbols by Visibility\n\n");
+                    let mut visibilities: Vec<_> = stats.symbols_by_visibility.iter().collect();
+                    visibilities.sort_by(|a, b| b.1.cmp(a.1));
+                    for (vis, count) in visibilities {
+                        output.push_str(&format!("- {}: {}\n", vis, count));
+                    }
+                }
+
+                // Add extraction coverage
+                if stats.symbol_count > 0 {
+                    let visibility_coverage =
+                        (stats.symbols_with_visibility as f64 / stats.symbol_count as f64) * 100.0;
+                    let parent_coverage =
+                        (stats.symbols_with_parent as f64 / stats.symbol_count as f64) * 100.0;
+                    output.push_str("\n### Extraction Coverage\n\n");
+                    output.push_str(&format!(
+                        "- Visibility extracted: {:.1}% ({} symbols)\n",
+                        visibility_coverage, stats.symbols_with_visibility
+                    ));
+                    output.push_str(&format!(
+                        "- Parent relationships: {:.1}% ({} symbols)\n",
+                        parent_coverage, stats.symbols_with_parent
+                    ));
+                }
+
+                output
             }
             Err(e) => format!("Failed to get stats: {}", e),
         }
@@ -374,13 +519,31 @@ impl ContextMcpServer {
         match CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone()) {
             Ok(indexer) => match indexer.index_all(&self.db, &self.text_index) {
                 Ok(result) => {
-                    format!(
+                    let mut output = format!(
                         "## Reindex Complete\n\n\
                         - **Files indexed:** {}\n\
                         - **Files skipped:** {}\n\
-                        - **Errors:** {}\n",
-                        result.indexed, result.skipped, result.errors
-                    )
+                        - **Errors:** {}\n\
+                        - **Symbols extracted:** {}\n\
+                        - **Symbols with visibility:** {}\n",
+                        result.indexed,
+                        result.skipped,
+                        result.errors,
+                        result.symbols_extracted,
+                        result.symbols_with_visibility
+                    );
+
+                    // Add breakdown by kind
+                    if !result.symbols_by_kind.is_empty() {
+                        output.push_str("\n### Symbols by Kind\n\n");
+                        let mut kinds: Vec<_> = result.symbols_by_kind.iter().collect();
+                        kinds.sort_by(|a, b| b.1.cmp(a.1));
+                        for (kind, count) in kinds {
+                            output.push_str(&format!("- {}: {}\n", kind, count));
+                        }
+                    }
+
+                    output
                 }
                 Err(e) => format!("Indexing failed: {}", e),
             },
