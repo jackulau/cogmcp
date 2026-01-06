@@ -1,7 +1,11 @@
-//! ContextMCP Embeddings - Placeholder
+//! ContextMCP Embeddings - Text embedding for semantic search
 //!
-//! This crate is intentionally minimal. ContextMCP uses keyword-based
-//! search via Tantivy rather than external ML models for embeddings.
-//! This keeps the server fully self-contained with no external dependencies.
+//! This crate provides embedding generation for semantic search functionality.
+//! It supports ONNX runtime for model inference when models are available,
+//! or can operate in mock mode for testing.
 
-// No embedding functionality - search is handled by Tantivy full-text search
+pub mod model;
+pub mod inference;
+
+pub use model::ModelConfig;
+pub use inference::EmbeddingEngine;
