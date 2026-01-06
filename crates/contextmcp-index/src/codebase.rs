@@ -384,3 +384,282 @@ pub struct IndexResult {
     pub symbols_by_kind: HashMap<String, u64>,
     pub symbols_with_visibility: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn setup_test_files(temp_dir: &TempDir) {
+        // Create a Rust file with various symbols
+        let rust_file = temp_dir.path().join("lib.rs");
+        let mut file = fs::File::create(&rust_file).unwrap();
+        writeln!(
+            file,
+            r#"//! Test module
+pub struct Container<T> {{
+    data: Vec<T>,
+}}
+
+impl<T> Container<T> {{
+    pub fn new() -> Self {{
+        Self {{ data: Vec::new() }}
+    }}
+
+    pub async fn async_method(&self) -> bool {{
+        true
+    }}
+
+    fn private_method(&self) {{}}
+}}
+
+pub(crate) fn crate_visible_fn() {{}}
+
+const MY_CONST: i32 = 42;
+"#
+        )
+        .unwrap();
+
+        // Create a TypeScript file
+        let ts_file = temp_dir.path().join("index.ts");
+        let mut file = fs::File::create(&ts_file).unwrap();
+        writeln!(
+            file,
+            r#"export class MyClass {{
+    private count: number;
+
+    public static create(): MyClass {{
+        return new MyClass();
+    }}
+
+    public async fetchData(): Promise<void> {{}}
+}}
+
+export function exportedFunction(): string {{
+    return "hello";
+}}
+"#
+        )
+        .unwrap();
+
+        // Create a Python file
+        let py_file = temp_dir.path().join("module.py");
+        let mut file = fs::File::create(&py_file).unwrap();
+        writeln!(
+            file,
+            r#"class MyClass:
+    """A sample class."""
+
+    def public_method(self):
+        pass
+
+    def _protected_method(self):
+        pass
+
+    def __private_method(self):
+        pass
+
+def public_function():
+    """A public function."""
+    pass
+
+async def async_function():
+    pass
+"#
+        )
+        .unwrap();
+    }
+
+    fn create_test_indexer(root: PathBuf) -> CodebaseIndexer {
+        let mut config = Config::default();
+        config.indexing.include_types = vec!["rs".to_string(), "ts".to_string(), "py".to_string()];
+        let parser = Arc::new(CodeParser::new());
+        CodebaseIndexer::new(root, config, parser).unwrap()
+    }
+
+    #[test]
+    fn test_index_rust_file_extracts_enhanced_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        let result = indexer.index_all(&db, &text_index).unwrap();
+
+        // Verify files were indexed
+        assert!(result.indexed > 0);
+        assert!(result.symbols_extracted > 0);
+
+        // Verify symbols by kind
+        assert!(result.symbols_by_kind.contains_key("struct"));
+        assert!(result.symbols_by_kind.contains_key("function"));
+
+        // Verify visibility was extracted
+        assert!(result.symbols_with_visibility > 0);
+
+        // Query the database for specific symbols
+        let container = db.find_symbols_by_name("Container", false).unwrap();
+        assert!(!container.is_empty());
+        assert_eq!(container[0].visibility, Some("public".to_string()));
+
+        let async_method = db.find_symbols_by_name("async_method", false).unwrap();
+        assert!(!async_method.is_empty());
+        assert!(async_method[0].is_async);
+
+        let private_method = db.find_symbols_by_name("private_method", false).unwrap();
+        assert!(!private_method.is_empty());
+        assert_eq!(private_method[0].visibility, Some("private".to_string()));
+
+        let crate_fn = db.find_symbols_by_name("crate_visible_fn", false).unwrap();
+        assert!(!crate_fn.is_empty());
+        assert_eq!(crate_fn[0].visibility, Some("crate".to_string()));
+    }
+
+    #[test]
+    fn test_index_typescript_file_extracts_exports() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Verify TypeScript class was extracted
+        let my_class = db.find_symbols_by_name("MyClass", false).unwrap();
+        assert!(!my_class.is_empty());
+
+        // Verify exported function
+        let exported_fn = db.find_symbols_by_name("exportedFunction", false).unwrap();
+        assert!(!exported_fn.is_empty());
+    }
+
+    #[test]
+    fn test_index_python_file_with_visibility_convention() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Verify Python class
+        let py_class = db.find_symbols_by_name("MyClass", false).unwrap();
+        // MyClass might appear in TS and Python, check we have at least one
+        assert!(!py_class.is_empty());
+
+        // Verify public function
+        let public_fn = db.find_symbols_by_name("public_function", false).unwrap();
+        assert!(!public_fn.is_empty());
+        assert_eq!(public_fn[0].visibility, Some("public".to_string()));
+
+        // Verify protected method
+        let protected_method = db.find_symbols_by_name("_protected_method", false).unwrap();
+        assert!(!protected_method.is_empty());
+        assert_eq!(protected_method[0].visibility, Some("protected".to_string()));
+
+        // Verify private method (Python __ prefix)
+        let private_method = db.find_symbols_by_name("__private_method", false).unwrap();
+        assert!(!private_method.is_empty());
+        assert_eq!(private_method[0].visibility, Some("private".to_string()));
+
+        // Verify async function
+        let async_fn = db.find_symbols_by_name("async_function", false).unwrap();
+        assert!(!async_fn.is_empty());
+        assert!(async_fn[0].is_async);
+    }
+
+    #[test]
+    fn test_nested_symbols_have_parent_references() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Find the Python class methods that should have parent references
+        let public_method = db.find_symbols_by_name("public_method", false).unwrap();
+        assert!(!public_method.is_empty());
+        // The method should have a parent reference (though parent_symbol_id depends on name match)
+        // Since we use name matching, we verify parent relationships work
+
+        // Get extended stats to verify parent relationships are tracked
+        let stats = db.get_extended_stats().unwrap();
+        assert!(stats.symbols_with_parent > 0, "Some symbols should have parent references");
+    }
+
+    #[test]
+    fn test_reindexing_clears_old_symbols() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create initial file
+        let rust_file = temp_dir.path().join("test.rs");
+        {
+            let mut file = fs::File::create(&rust_file).unwrap();
+            writeln!(file, "pub fn old_function() {{}}").unwrap();
+        }
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        // First index
+        indexer.index_all(&db, &text_index).unwrap();
+
+        let old_fn = db.find_symbols_by_name("old_function", false).unwrap();
+        assert!(!old_fn.is_empty());
+
+        // Modify the file
+        {
+            let mut file = fs::File::create(&rust_file).unwrap();
+            writeln!(file, "pub fn new_function() {{}}").unwrap();
+        }
+
+        // Re-index
+        indexer.index_all(&db, &text_index).unwrap();
+
+        // Old function should be gone
+        let old_fn = db.find_symbols_by_name("old_function", false).unwrap();
+        assert!(old_fn.is_empty(), "Old symbols should be cleared on reindex");
+
+        // New function should exist
+        let new_fn = db.find_symbols_by_name("new_function", false).unwrap();
+        assert!(!new_fn.is_empty(), "New symbols should be indexed");
+    }
+
+    #[test]
+    fn test_extended_stats_after_indexing() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        indexer.index_all(&db, &text_index).unwrap();
+
+        let stats = db.get_extended_stats().unwrap();
+
+        // Verify file count
+        assert_eq!(stats.file_count, 3, "Should have indexed 3 files");
+
+        // Verify symbol breakdown by kind
+        assert!(stats.symbols_by_kind.len() > 0);
+
+        // Verify visibility breakdown
+        assert!(stats.symbols_by_visibility.len() > 0);
+        assert!(stats.symbols_by_visibility.contains_key("public"));
+
+        // Verify visibility extraction coverage
+        assert!(stats.symbols_with_visibility > 0);
+    }
+}

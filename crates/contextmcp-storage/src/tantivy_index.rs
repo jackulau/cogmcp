@@ -132,6 +132,10 @@ impl FullTextIndex {
         writer
             .commit()
             .map_err(|e| Error::Storage(format!("Failed to commit: {}", e)))?;
+        // Reload the reader to see the committed changes
+        self.reader
+            .reload()
+            .map_err(|e| Error::Storage(format!("Failed to reload reader: {}", e)))?;
         Ok(())
     }
 
@@ -216,7 +220,6 @@ mod tests {
             .unwrap();
         index.commit().unwrap();
 
-        // Need to reload reader after commit
         let results = index.search("println", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].path, "src/main.rs");
