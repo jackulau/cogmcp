@@ -8,7 +8,7 @@ pub mod methods;
 use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpMethod, RpcError,
 };
-use crate::server::ContextMcpServer;
+use crate::server::CogMcpServer;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -19,13 +19,13 @@ pub use methods::*;
 /// Holds a reference to the server and dispatches incoming requests
 /// to the appropriate method handlers.
 pub struct RequestHandler {
-    server: Arc<ContextMcpServer>,
+    server: Arc<CogMcpServer>,
     initialized: bool,
 }
 
 impl RequestHandler {
     /// Create a new request handler with a reference to the server
-    pub fn new(server: Arc<ContextMcpServer>) -> Self {
+    pub fn new(server: Arc<CogMcpServer>) -> Self {
         Self {
             server,
             initialized: false,
@@ -163,7 +163,7 @@ mod tests {
 
     fn create_test_handler() -> RequestHandler {
         let server = Arc::new(
-            ContextMcpServer::in_memory(PathBuf::from("/tmp/test"))
+            CogMcpServer::in_memory(PathBuf::from("/tmp/test"))
                 .expect("Failed to create test server"),
         );
         RequestHandler::new(server)

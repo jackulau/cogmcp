@@ -1,7 +1,7 @@
 //! Code parsing with tree-sitter
 
-use contextmcp_core::types::{Language, SymbolKind};
-use contextmcp_core::{Error, Result};
+use cogmcp_core::types::{Language, SymbolKind};
+use cogmcp_core::{Error, Result};
 
 /// Extracted symbol from source code
 #[derive(Debug, Clone)]

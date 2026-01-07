@@ -1,4 +1,4 @@
-//! ContextMCP Server - MCP server implementation
+//! CogMCP Server - MCP server implementation
 //!
 //! This crate implements the MCP server with all context tools.
 
@@ -8,4 +8,4 @@ pub mod server;
 pub mod tools;
 
 pub use handler::RequestHandler;
-pub use server::ContextMcpServer;
+pub use server::CogMcpServer;

@@ -4,14 +4,14 @@
 //! These functions are called by the RequestHandler to process specific requests.
 
 use crate::protocol::{RpcError, MCP_VERSION};
-use crate::server::ContextMcpServer;
+use crate::server::CogMcpServer;
 use serde_json::{json, Value};
 
 /// Handle the initialize request
 ///
 /// Returns server info and capabilities, and marks the server as initialized.
 pub fn handle_initialize(
-    server: &ContextMcpServer,
+    server: &CogMcpServer,
     params: Option<Value>,
     initialized: &mut bool,
 ) -> Result<Value, RpcError> {
@@ -39,8 +39,8 @@ pub fn handle_initialize(
     *initialized = true;
 
     // Build server info response
-    let server_info = ContextMcpServer::server_info();
-    let capabilities = ContextMcpServer::capabilities();
+    let server_info = CogMcpServer::server_info();
+    let capabilities = CogMcpServer::capabilities();
 
     Ok(json!({
         "protocolVersion": MCP_VERSION,
@@ -50,7 +50,7 @@ pub fn handle_initialize(
             "version": server_info.version
         },
         "instructions": format!(
-            "ContextMCP provides intelligent code context for AI assistants. \
+            "CogMCP provides intelligent code context for AI assistants. \
              Root: {}",
             server.root.display()
         )
@@ -75,7 +75,7 @@ pub fn handle_ping() -> Result<Value, RpcError> {
 /// Handle the tools/list request
 ///
 /// Returns the list of available tools in MCP format.
-pub fn handle_tools_list(server: &ContextMcpServer, params: Option<Value>) -> Result<Value, RpcError> {
+pub fn handle_tools_list(server: &CogMcpServer, params: Option<Value>) -> Result<Value, RpcError> {
     // Handle pagination cursor if provided (not implemented yet)
     let _cursor = params
         .as_ref()
@@ -104,7 +104,7 @@ pub fn handle_tools_list(server: &ContextMcpServer, params: Option<Value>) -> Re
 /// Handle the tools/call request
 ///
 /// Invokes a tool and returns the result in MCP CallToolResult format.
-pub fn handle_tools_call(server: &ContextMcpServer, params: Option<Value>) -> Result<Value, RpcError> {
+pub fn handle_tools_call(server: &CogMcpServer, params: Option<Value>) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| {
         RpcError::invalid_params_with_message("Missing params for tools/call")
     })?;
@@ -149,9 +149,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn create_test_server() -> Arc<ContextMcpServer> {
+    fn create_test_server() -> Arc<CogMcpServer> {
         Arc::new(
-            ContextMcpServer::in_memory(PathBuf::from("/tmp/test"))
+            CogMcpServer::in_memory(PathBuf::from("/tmp/test"))
                 .expect("Failed to create test server"),
         )
     }
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(value["protocolVersion"], MCP_VERSION);
         assert!(value.get("capabilities").is_some());
         assert!(value.get("serverInfo").is_some());
-        assert_eq!(value["serverInfo"]["name"], "contextmcp");
+        assert_eq!(value["serverInfo"]["name"], "cogmcp");
     }
 
     #[test]
