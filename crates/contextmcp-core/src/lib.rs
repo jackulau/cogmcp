@@ -1,7 +1,7 @@
-//! ContextMCP Core - Configuration, error types, and shared utilities
+//! CogMCP Core - Configuration, error types, and shared utilities
 //!
 //! This crate provides the foundational types and utilities used across
-//! all ContextMCP crates.
+//! all CogMCP crates.
 
 pub mod config;
 pub mod error;

@@ -1,8 +1,8 @@
-//! Error types for ContextMCP
+//! Error types for CogMCP
 
 use thiserror::Error;
 
-/// Main error type for ContextMCP operations
+/// Main error type for CogMCP operations
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Configuration error: {0}")]
@@ -48,5 +48,5 @@ pub enum Error {
     Other(String),
 }
 
-/// Result type alias for ContextMCP operations
+/// Result type alias for CogMCP operations
 pub type Result<T> = std::result::Result<T, Error>;
