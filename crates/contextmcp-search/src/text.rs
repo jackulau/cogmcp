@@ -1,7 +1,7 @@
 //! Full-text search using Tantivy
 
-use contextmcp_core::Result;
-use contextmcp_storage::FullTextIndex;
+use cogmcp_core::Result;
+use cogmcp_storage::FullTextIndex;
 
 /// Full-text search engine wrapper
 pub struct TextSearch<'a> {

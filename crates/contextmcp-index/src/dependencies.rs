@@ -1,6 +1,6 @@
 //! Dependency parsing for various package managers
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;

@@ -1,11 +1,11 @@
 [package]
-name = "contextmcp-embeddings"
+name = "cogmcp-embeddings"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-contextmcp-core = { workspace = true }
+cogmcp-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

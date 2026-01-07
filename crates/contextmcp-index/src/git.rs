@@ -1,6 +1,6 @@
 //! Git integration for history and blame
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 use git2::{DiffOptions, Repository};
 use std::path::Path;
 

@@ -8,7 +8,7 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tracing::{debug, info};
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 
 use crate::model::ModelConfig;
 use crate::tokenizer::Tokenizer;

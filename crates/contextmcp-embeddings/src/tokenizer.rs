@@ -6,7 +6,7 @@ use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::debug;
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 
 /// Tokenizer wrapper for preparing text inputs
 pub struct Tokenizer {

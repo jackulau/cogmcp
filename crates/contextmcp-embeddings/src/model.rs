@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 
 /// Model file information
 const MODEL_NAME: &str = "all-MiniLM-L6-v2";
@@ -89,11 +89,11 @@ impl ModelManager {
         }
     }
 
-    /// Get the default model directory (~/.local/share/contextmcp/models/)
+    /// Get the default model directory (~/.local/share/cogmcp/models/)
     pub fn default_model_dir() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir()
             .ok_or_else(|| Error::Config("Could not determine local data directory".into()))?;
-        Ok(data_dir.join("contextmcp").join("models"))
+        Ok(data_dir.join("cogmcp").join("models"))
     }
 
     /// Get the model directory for a specific model

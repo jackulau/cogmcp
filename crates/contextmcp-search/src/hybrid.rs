@@ -1,7 +1,7 @@
 //! Hybrid search combining text and semantic search
 
-use contextmcp_core::Result;
-use contextmcp_storage::FullTextIndex;
+use cogmcp_core::Result;
+use cogmcp_storage::FullTextIndex;
 
 use crate::text::{TextSearch, TextSearchResult};
 

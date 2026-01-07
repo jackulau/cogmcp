@@ -1,6 +1,6 @@
 //! File priority scoring and tiering
 
-use contextmcp_core::types::PriorityTier;
+use cogmcp_core::types::PriorityTier;
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
 

@@ -1,11 +1,11 @@
 //! Integration tests for the embedding engine
 //!
 //! These tests require the model to be downloaded. They are ignored by default
-//! and can be run with: cargo test -p contextmcp-embeddings --test integration -- --ignored
+//! and can be run with: cargo test -p cogmcp-embeddings --test integration -- --ignored
 //!
 //! To download the model, use ModelManager::ensure_model_available() first.
 
-use contextmcp_embeddings::{EmbeddingEngine, ModelManager};
+use cogmcp_embeddings::{EmbeddingEngine, ModelManager};
 
 /// Test that model can be downloaded and loaded successfully
 #[test]
@@ -204,7 +204,7 @@ fn test_embed_batch_multiple() {
 /// Test missing model file returns clear error
 #[test]
 fn test_missing_model_error() {
-    use contextmcp_embeddings::ModelConfig;
+    use cogmcp_embeddings::ModelConfig;
 
     let config = ModelConfig::with_path("/nonexistent/path/model.onnx");
     let result = EmbeddingEngine::new(config);
