@@ -1,6 +1,6 @@
 //! Semantic search using embeddings
 
-use contextmcp_core::Result;
+use cogmcp_core::Result;
 
 /// Semantic search result
 #[derive(Debug, Clone)]

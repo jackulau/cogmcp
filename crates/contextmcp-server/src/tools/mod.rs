@@ -1,6 +1,6 @@
 //! MCP tool implementations
 //!
-//! Tools are implemented directly on the ContextMcpServer struct
+//! Tools are implemented directly on the CogMcpServer struct
 //! using the rmcp::tool macro. This module can be used for
 //! additional helper functions.
 
