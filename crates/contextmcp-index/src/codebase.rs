@@ -1,9 +1,9 @@
 //! Codebase file indexing
 
 use crate::parser::CodeParser;
-use contextmcp_core::types::Language;
-use contextmcp_core::{Config, Error, Result};
-use contextmcp_storage::{Database, FullTextIndex};
+use cogmcp_core::types::Language;
+use cogmcp_core::{Config, Error, Result};
+use cogmcp_storage::{Database, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
 use std::fs;

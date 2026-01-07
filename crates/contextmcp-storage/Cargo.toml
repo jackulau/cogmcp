@@ -1,11 +1,11 @@
 [package]
-name = "contextmcp-storage"
+name = "cogmcp-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-contextmcp-core = { workspace = true }
+cogmcp-core = { workspace = true }
 rusqlite = { workspace = true }
 tantivy = { workspace = true }
 serde = { workspace = true }

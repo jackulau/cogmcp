@@ -1,0 +1,11 @@
+id: semantic-search-impl
+status: pending
+branch: parallel/semantic-search-impl
+worktree_path: null
+assigned_to: null
+started_at: null
+completed_at: null
+dependencies_met: false
+conflicts: []
+commit_sha: null
+tests_passing: null

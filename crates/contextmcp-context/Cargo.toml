@@ -1,14 +1,14 @@
 [package]
-name = "contextmcp-context"
+name = "cogmcp-context"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-contextmcp-core = { workspace = true }
-contextmcp-storage = { workspace = true }
-contextmcp-search = { workspace = true }
-contextmcp-embeddings = { workspace = true }
+cogmcp-core = { workspace = true }
+cogmcp-storage = { workspace = true }
+cogmcp-search = { workspace = true }
+cogmcp-embeddings = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

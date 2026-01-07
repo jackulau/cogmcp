@@ -1,4 +1,4 @@
-//! ContextMCP Storage - SQLite and Tantivy storage layer
+//! CogMCP Storage - SQLite and Tantivy storage layer
 //!
 //! This crate provides persistent storage for the file index,
 //! symbols, embeddings, and full-text search.

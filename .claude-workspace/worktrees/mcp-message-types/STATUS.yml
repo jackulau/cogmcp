@@ -1,0 +1,11 @@
+id: mcp-message-types
+status: pending
+branch: parallel/mcp-message-types
+worktree_path: null
+assigned_to: null
+started_at: null
+completed_at: null
+dependencies_met: true
+conflicts: []
+commit_sha: null
+tests_passing: null

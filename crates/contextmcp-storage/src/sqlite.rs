@@ -1,6 +1,6 @@
 //! SQLite database for structured data storage
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -334,7 +334,7 @@ impl Database {
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![pattern], |row| row_to_symbol_row(row))
+            .query_map(params![pattern], row_to_symbol_row)
             .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
 
         let mut results = Vec::new();
@@ -363,7 +363,7 @@ impl Database {
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![symbol_id], |row| row_to_symbol_row(row))
+            .query_map(params![symbol_id], row_to_symbol_row)
             .map_err(|e| Error::Storage(format!("Failed to query symbol children: {}", e)))?;
 
         let mut results = Vec::new();
@@ -392,7 +392,7 @@ impl Database {
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![visibility], |row| row_to_symbol_row(row))
+            .query_map(params![visibility], row_to_symbol_row)
             .map_err(|e| Error::Storage(format!("Failed to query symbols by visibility: {}", e)))?;
 
         let mut results = Vec::new();
@@ -421,7 +421,7 @@ impl Database {
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![file_id], |row| row_to_symbol_row(row))
+            .query_map(params![file_id], row_to_symbol_row)
             .map_err(|e| Error::Storage(format!("Failed to query file symbols: {}", e)))?;
 
         let mut results = Vec::new();

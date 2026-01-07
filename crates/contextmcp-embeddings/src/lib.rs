@@ -1,6 +1,6 @@
-//! ContextMCP Embeddings - Placeholder
+//! CogMCP Embeddings - Placeholder
 //!
-//! This crate is intentionally minimal. ContextMCP uses keyword-based
+//! This crate is intentionally minimal. CogMCP uses keyword-based
 //! search via Tantivy rather than external ML models for embeddings.
 //! This keeps the server fully self-contained with no external dependencies.
 
