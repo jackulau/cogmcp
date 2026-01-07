@@ -1,9 +1,9 @@
 //! Codebase file indexing
 
 use crate::parser::{CodeParser, ExtractedSymbol};
-use contextmcp_core::types::Language;
-use contextmcp_core::{Config, Error, Result};
-use contextmcp_storage::{Database, FullTextIndex};
+use cogmcp_core::types::Language;
+use cogmcp_core::{Config, Error, Result};
+use cogmcp_storage::{Database, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -175,7 +175,7 @@ impl CodebaseIndexer {
                 let kind_str = format!("{:?}", sym.kind).to_lowercase();
                 *result.symbols_by_kind.entry(kind_str).or_insert(0) += 1;
 
-                if sym.visibility != contextmcp_core::types::SymbolVisibility::Unknown {
+                if sym.visibility != cogmcp_core::types::SymbolVisibility::Unknown {
                     result.symbols_with_visibility += 1;
                 }
             }

@@ -1,13 +1,13 @@
 [package]
-name = "contextmcp-watcher"
+name = "cogmcp-watcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-contextmcp-core = { workspace = true }
-contextmcp-storage = { workspace = true }
-contextmcp-index = { workspace = true }
+cogmcp-core = { workspace = true }
+cogmcp-storage = { workspace = true }
+cogmcp-index = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 tokio = { workspace = true }

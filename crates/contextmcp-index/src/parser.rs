@@ -1,7 +1,7 @@
 //! Code parsing with tree-sitter
 
-use contextmcp_core::types::{Language, ParameterInfo, SymbolKind, SymbolModifiers, SymbolVisibility};
-use contextmcp_core::{Error, Result};
+use cogmcp_core::types::{Language, ParameterInfo, SymbolKind, SymbolModifiers, SymbolVisibility};
+use cogmcp_core::{Error, Result};
 
 /// Extracted symbol from source code
 #[derive(Debug, Clone)]
@@ -792,7 +792,7 @@ impl Default for CodeParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use contextmcp_core::types::{Language, SymbolKind, SymbolVisibility};
+    use cogmcp_core::types::{Language, SymbolKind, SymbolVisibility};
 
     #[test]
     fn test_parse_rust_with_visibility() {

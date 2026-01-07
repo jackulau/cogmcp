@@ -1,21 +1,21 @@
 [package]
-name = "contextmcp-server"
+name = "cogmcp-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "contextmcp"
+name = "cogmcp"
 path = "src/main.rs"
 
 [dependencies]
-contextmcp-core = { workspace = true }
-contextmcp-storage = { workspace = true }
-contextmcp-index = { workspace = true }
-contextmcp-search = { workspace = true }
-contextmcp-embeddings = { workspace = true }
-contextmcp-watcher = { workspace = true }
-contextmcp-context = { workspace = true }
+cogmcp-core = { workspace = true }
+cogmcp-storage = { workspace = true }
+cogmcp-index = { workspace = true }
+cogmcp-search = { workspace = true }
+cogmcp-embeddings = { workspace = true }
+cogmcp-watcher = { workspace = true }
+cogmcp-context = { workspace = true }
 rmcp = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

@@ -1,11 +1,11 @@
-//! Configuration management for ContextMCP
+//! Configuration management for CogMCP
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// Main configuration for ContextMCP
+/// Main configuration for CogMCP
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -56,16 +56,16 @@ impl Config {
         let mut locations = Vec::new();
 
         // 1. Current directory
-        locations.push(PathBuf::from(".contextmcp.toml"));
+        locations.push(PathBuf::from(".cogmcp.toml"));
 
         // 2. User config directory
         if let Some(config_dir) = dirs::config_dir() {
-            locations.push(config_dir.join("contextmcp").join("config.toml"));
+            locations.push(config_dir.join("cogmcp").join("config.toml"));
         }
 
         // 3. Home directory
         if let Some(home) = dirs::home_dir() {
-            locations.push(home.join(".contextmcp.toml"));
+            locations.push(home.join(".cogmcp.toml"));
         }
 
         locations
@@ -74,7 +74,7 @@ impl Config {
     /// Get the data directory for storing index and cache
     pub fn data_dir() -> Result<PathBuf> {
         if let Some(data_dir) = dirs::data_local_dir() {
-            let path = data_dir.join("contextmcp");
+            let path = data_dir.join("cogmcp");
             std::fs::create_dir_all(&path)?;
             Ok(path)
         } else {

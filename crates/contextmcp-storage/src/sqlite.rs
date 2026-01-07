@@ -1,6 +1,6 @@
 //! SQLite database for structured data storage
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::path::Path;

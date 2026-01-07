@@ -1,12 +1,12 @@
 [package]
-name = "contextmcp-index"
+name = "cogmcp-index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-contextmcp-core = { workspace = true }
-contextmcp-storage = { workspace = true }
+cogmcp-core = { workspace = true }
+cogmcp-storage = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }

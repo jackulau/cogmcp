@@ -1,6 +1,6 @@
 //! Real-time file watching
 
-use contextmcp_core::Result;
+use cogmcp_core::Result;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::mpsc;
@@ -41,7 +41,7 @@ impl FileWatcher {
                 let _ = notify_tx.send(event);
             }
         })
-        .map_err(|e| contextmcp_core::Error::FileSystem(format!("Failed to create watcher: {}", e)))?;
+        .map_err(|e| cogmcp_core::Error::FileSystem(format!("Failed to create watcher: {}", e)))?;
 
         // Start background task to process events
         let root_path = root.to_path_buf();

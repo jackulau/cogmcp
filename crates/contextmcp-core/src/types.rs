@@ -1,4 +1,4 @@
-//! Shared types used across ContextMCP crates
+//! Shared types used across CogMCP crates
 
 use serde::{Deserialize, Serialize};
 
