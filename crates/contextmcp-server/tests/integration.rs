@@ -1,17 +1,17 @@
-//! Integration tests for the ContextMCP server
+//! Integration tests for the CogMCP server
 //!
 //! These tests verify the server handles MCP protocol messages correctly.
 
-use contextmcp_server::{ContextMcpServer, RunnerConfig, ServerRunner};
+use cogmcp_server::{CogMcpServer, RunnerConfig, ServerRunner};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
 /// Create a test server with in-memory storage
-fn create_test_server() -> ContextMcpServer {
-    let temp_dir = std::env::temp_dir().join("contextmcp-test");
+fn create_test_server() -> CogMcpServer {
+    let temp_dir = std::env::temp_dir().join("cogmcp-test");
     std::fs::create_dir_all(&temp_dir).ok();
 
-    ContextMcpServer::in_memory(temp_dir).expect("Failed to create test server")
+    CogMcpServer::in_memory(temp_dir).expect("Failed to create test server")
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn test_ping_tool() {
     assert!(result.is_ok(), "Ping should succeed");
     let output = result.unwrap();
     assert!(
-        output.contains("ContextMCP server is running"),
+        output.contains("CogMCP server is running"),
         "Should contain server status"
     );
 }
@@ -211,14 +211,14 @@ fn test_tool_schema_validation() {
 
 #[test]
 fn test_server_info() {
-    let info = ContextMcpServer::server_info();
-    assert_eq!(info.name, "contextmcp");
+    let info = CogMcpServer::server_info();
+    assert_eq!(info.name, "cogmcp");
     assert!(!info.version.is_empty());
 }
 
 #[test]
 fn test_server_capabilities() {
-    let caps = ContextMcpServer::capabilities();
+    let caps = CogMcpServer::capabilities();
     // The server should have tool capabilities enabled
     assert!(
         caps.tools.is_some(),
@@ -244,7 +244,7 @@ mod e2e_tests {
         // Test get_info which is used during initialize handshake
         let info = server.get_info();
 
-        assert_eq!(info.server_info.name, "contextmcp");
+        assert_eq!(info.server_info.name, "cogmcp");
         assert!(!info.server_info.version.is_empty());
         assert!(info.capabilities.tools.is_some());
         assert!(info.instructions.is_some());
@@ -277,7 +277,7 @@ mod e2e_tests {
         assert!(result.is_ok(), "call_tool should succeed");
         let output = result.unwrap();
         assert!(
-            output.contains("ContextMCP server is running"),
+            output.contains("CogMCP server is running"),
             "Should contain server status"
         );
     }

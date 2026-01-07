@@ -2,10 +2,10 @@
 //!
 //! This module provides a `ServerRunner` that combines all components
 //! (server, transport, protocol) into a unified abstraction for running
-//! the ContextMCP server.
+//! the CogMCP server.
 
-use crate::ContextMcpServer;
-use contextmcp_core::Result;
+use crate::CogMcpServer;
+use cogmcp_core::Result;
 use rmcp::ServiceExt;
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -56,16 +56,16 @@ impl RunnerConfig {
 /// Server runner combining all MCP components
 pub struct ServerRunner {
     config: RunnerConfig,
-    server: ContextMcpServer,
+    server: CogMcpServer,
 }
 
 impl ServerRunner {
     /// Create a new server runner with the given configuration
     pub fn new(config: RunnerConfig) -> Result<Self> {
         let server = if config.in_memory {
-            ContextMcpServer::in_memory(config.root.clone())?
+            CogMcpServer::in_memory(config.root.clone())?
         } else {
-            ContextMcpServer::new(config.root.clone())?
+            CogMcpServer::new(config.root.clone())?
         };
 
         Ok(Self { config, server })
@@ -77,7 +77,7 @@ impl ServerRunner {
     }
 
     /// Get a reference to the underlying server
-    pub fn server(&self) -> &ContextMcpServer {
+    pub fn server(&self) -> &CogMcpServer {
         &self.server
     }
 
@@ -104,7 +104,7 @@ impl ServerRunner {
     /// 4. Returns when the service completes
     pub async fn run(self) -> std::result::Result<(), anyhow::Error> {
         info!(
-            "ContextMCP server starting (root: {})",
+            "CogMCP server starting (root: {})",
             self.config.root.display()
         );
 
@@ -135,7 +135,7 @@ impl ServerRunner {
             return Err(e.into());
         }
 
-        info!("ContextMCP server shutdown complete.");
+        info!("CogMCP server shutdown complete.");
         Ok(())
     }
 

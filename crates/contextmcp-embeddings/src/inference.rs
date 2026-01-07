@@ -1,6 +1,6 @@
 //! Embedding inference using ONNX Runtime
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 
 use crate::model::ModelConfig;
 

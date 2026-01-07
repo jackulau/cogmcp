@@ -1,6 +1,6 @@
 //! Tantivy full-text search index
 
-use contextmcp_core::{Error, Result};
+use cogmcp_core::{Error, Result};
 use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;

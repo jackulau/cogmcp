@@ -1,12 +1,12 @@
 [package]
-name = "contextmcp-search"
+name = "cogmcp-search"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-contextmcp-core = { workspace = true }
-contextmcp-storage = { workspace = true }
+cogmcp-core = { workspace = true }
+cogmcp-storage = { workspace = true }
 tantivy = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

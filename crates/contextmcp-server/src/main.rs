@@ -1,9 +1,9 @@
-//! ContextMCP - Local-first context MCP server
+//! CogMCP - Local-first context MCP server
 //!
 //! A high-performance, privacy-preserving context management MCP server
 //! that runs entirely on your local machine.
 
-use contextmcp_server::runner::{RunnerConfig, ServerRunner};
+use cogmcp_server::runner::{RunnerConfig, ServerRunner};
 use std::env;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -18,10 +18,10 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("Starting ContextMCP server v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Starting CogMCP server v{}", env!("CARGO_PKG_VERSION"));
 
     // Determine root directory from environment or current directory
-    let root = env::var("CONTEXTMCP_ROOT")
+    let root = env::var("COGMCP_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
