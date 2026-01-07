@@ -29,7 +29,7 @@ pub enum SymbolVisibility {
 
 impl SymbolVisibility {
     /// Parse visibility from a string
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "public" | "pub" => Self::Public,
             "private" | "priv" => Self::Private,
@@ -50,6 +50,14 @@ impl SymbolVisibility {
             Self::Crate => "crate",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+impl std::str::FromStr for SymbolVisibility {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self::parse(s))
     }
 }
 

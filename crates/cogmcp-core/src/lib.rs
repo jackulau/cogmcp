@@ -5,7 +5,9 @@
 
 pub mod config;
 pub mod error;
+pub mod streaming;
 pub mod types;
 
 pub use config::{Config, SearchConfig};
 pub use error::{Error, Result};
+pub use streaming::{ResultStream, StreamChunk, StreamingConfig, StreamingResult};
