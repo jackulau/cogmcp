@@ -4,8 +4,8 @@
 //! It extracts rich metadata including visibility modifiers, generics, parameters,
 //! return types, and decorators for supported languages.
 
-use contextmcp_core::types::{Language, SymbolKind};
-use contextmcp_core::{Error, Result};
+use cogmcp_core::types::{Language, SymbolKind};
+use cogmcp_core::{Error, Result};
 
 /// Visibility modifier for symbols
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -717,6 +717,8 @@ impl CodeParser {
 
         let doc_comment = self.find_doc_comment(node, content);
 
+        let decorators = self.extract_rust_attributes(node, content);
+
         Some(ExtractedSymbol {
             name,
             kind,
@@ -728,7 +730,7 @@ impl CodeParser {
             type_params,
             parameters,
             return_type,
-            decorators: Vec::new(), // Rust uses attributes, not decorators
+            decorators,
             parent_symbol: parent.map(|s| s.to_string()),
             is_async,
             is_static: false,
@@ -780,6 +782,7 @@ impl CodeParser {
 
         let visibility = self.extract_visibility(node, content);
         let type_params = self.extract_type_params(node, content);
+        let decorators = self.extract_rust_attributes(node, content);
 
         let signature = self.generate_signature(
             &name,
@@ -803,7 +806,7 @@ impl CodeParser {
             type_params,
             parameters: Vec::new(),
             return_type: None,
-            decorators: Vec::new(),
+            decorators,
             parent_symbol: None,
             is_async: false,
             is_static: false,
@@ -859,6 +862,7 @@ impl CodeParser {
 
         let visibility = self.extract_visibility(node, content);
         let type_params = self.extract_type_params(node, content);
+        let decorators = self.extract_rust_attributes(node, content);
 
         let signature = self.generate_signature(
             &name,
@@ -882,7 +886,7 @@ impl CodeParser {
             type_params,
             parameters: Vec::new(),
             return_type: None,
-            decorators: Vec::new(),
+            decorators,
             parent_symbol: None,
             is_async: false,
             is_static: false,
@@ -899,6 +903,7 @@ impl CodeParser {
 
         let visibility = self.extract_visibility(node, content);
         let type_params = self.extract_type_params(node, content);
+        let decorators = self.extract_rust_attributes(node, content);
 
         let signature = self.generate_signature(
             &name,
@@ -922,7 +927,7 @@ impl CodeParser {
             type_params,
             parameters: Vec::new(),
             return_type: None,
-            decorators: Vec::new(),
+            decorators,
             parent_symbol: None,
             is_async: false,
             is_static: false,
@@ -1623,6 +1628,47 @@ impl CodeParser {
         }
     }
 
+    /// Extract Rust attributes from a node (e.g., #[derive(...)], #[cfg(...)])
+    fn extract_rust_attributes(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+    ) -> Vec<Decorator> {
+        let mut attributes = Vec::new();
+
+        // Look at previous siblings for attributes
+        let mut current = node.prev_sibling();
+        while let Some(sibling) = current {
+            if sibling.kind() == "attribute_item" || sibling.kind() == "inner_attribute_item" {
+                let attr_text = sibling.utf8_text(content.as_bytes()).unwrap_or("");
+                // Parse #[name] or #[name(...)]
+                let clean_text = attr_text
+                    .trim_start_matches("#[")
+                    .trim_start_matches("#![")
+                    .trim_end_matches(']');
+
+                let (name, arguments) = if clean_text.contains('(') {
+                    let parts: Vec<&str> = clean_text.splitn(2, '(').collect();
+                    let name = parts[0].to_string();
+                    let args = parts
+                        .get(1)
+                        .map(|s| s.trim_end_matches(')').to_string());
+                    (name, args)
+                } else {
+                    (clean_text.to_string(), None)
+                };
+
+                attributes.push(Decorator { name, arguments });
+            } else if sibling.kind() != "line_comment" && sibling.kind() != "block_comment" {
+                break;
+            }
+            current = sibling.prev_sibling();
+        }
+
+        attributes.reverse();
+        attributes
+    }
+
     fn extract_ts_decorators(
         &self,
         node: &tree_sitter::Node,
@@ -2258,6 +2304,72 @@ static mut COUNTER: i32 = 0;
         let counter = symbols.iter().find(|s| s.name == "COUNTER").unwrap();
         assert_eq!(counter.kind, SymbolKind::Variable);
         assert!(counter.is_static);
+    }
+
+    #[test]
+    fn test_rust_attributes_extraction() {
+        let parser = CodeParser::new();
+        let code = r#"
+#[derive(Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Config {
+    pub name: String,
+}
+
+#[inline]
+#[must_use]
+pub fn fast_func() -> i32 {
+    42
+}
+
+#[derive(Debug)]
+pub enum Status {
+    Active,
+    Inactive,
+}
+"#;
+
+        let symbols = parser.parse(code, Language::Rust).unwrap();
+
+        // Check struct attributes
+        let config = symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert!(config.decorators.iter().any(|d| d.name == "derive"));
+        assert!(config.decorators.iter().any(|d| d.name == "serde"));
+
+        // Check function attributes
+        let fast_func = symbols.iter().find(|s| s.name == "fast_func").unwrap();
+        assert!(fast_func.decorators.iter().any(|d| d.name == "inline"));
+        assert!(fast_func.decorators.iter().any(|d| d.name == "must_use"));
+
+        // Check enum attributes
+        let status = symbols.iter().find(|s| s.name == "Status").unwrap();
+        assert!(status.decorators.iter().any(|d| d.name == "derive"));
+    }
+
+    #[test]
+    fn test_rust_trait_impl() {
+        let parser = CodeParser::new();
+        let code = r#"
+impl Display for MyStruct {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{}", self.name)
+    }
+}
+"#;
+
+        let symbols = parser.parse(code, Language::Rust).unwrap();
+
+        // Check impl block includes trait
+        let impl_block = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(impl_block.signature.as_ref().unwrap().contains("impl Display for MyStruct"));
+
+        // Check method is associated with impl
+        let fmt_method = symbols.iter().find(|s| s.name == "fmt").unwrap();
+        assert_eq!(fmt_method.kind, SymbolKind::Method);
+        assert_eq!(fmt_method.parent_symbol, Some("MyStruct".to_string()));
     }
 
     // ==================== TypeScript Tests ====================

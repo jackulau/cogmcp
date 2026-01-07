@@ -1,4 +1,4 @@
-//! ContextMCP Index - Code parsing and indexing
+//! CogMCP Index - Code parsing and indexing
 //!
 //! This crate provides file indexing, code parsing with tree-sitter,
 //! symbol extraction, and git integration.
