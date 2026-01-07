@@ -15,8 +15,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["ContextMCP Contributors"]
-repository = "https://github.com/contextmcp/contextmcp"
+authors = ["CogMCP Contributors"]
+repository = "https://github.com/cogmcp/cogmcp"
 
 [workspace.dependencies]
 # MCP Protocol

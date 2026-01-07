@@ -1,9 +1,9 @@
-//! ContextMCP - Local-first context MCP server
+//! CogMCP - Local-first context MCP server
 //!
 //! A high-performance, privacy-preserving context management MCP server
 //! that runs entirely on your local machine.
 
-use contextmcp_server::ContextMcpServer;
+use contextmcp_server::CogMcpServer;
 use rmcp::ServiceExt;
 use std::env;
 use std::path::PathBuf;
@@ -19,17 +19,17 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("Starting ContextMCP server v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Starting CogMCP server v{}", env!("CARGO_PKG_VERSION"));
 
     // Determine root directory
-    let root = env::var("CONTEXTMCP_ROOT")
+    let root = env::var("COGMCP_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     tracing::info!("Root directory: {}", root.display());
 
     // Create server
-    let server = ContextMcpServer::new(root.clone())
+    let server = CogMcpServer::new(root.clone())
         .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
 
     // Initial indexing
@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("  - {}: {}", tool.name, tool.description.unwrap_or_default());
     }
 
-    tracing::info!("ContextMCP server ready, starting MCP protocol...");
+    tracing::info!("CogMCP server ready, starting MCP protocol...");
 
     // Start MCP server with stdio transport
     let transport = rmcp::transport::stdio();
@@ -60,6 +60,6 @@ async fn main() -> anyhow::Result<()> {
     // Wait for the service to complete
     service.waiting().await?;
 
-    tracing::info!("ContextMCP server shutdown complete.");
+    tracing::info!("CogMCP server shutdown complete.");
     Ok(())
 }
