@@ -9,6 +9,7 @@ use std::time::Duration;
 use cogmcp_core::{Error, Result};
 use cogmcp_embeddings::EmbeddingEngine;
 use cogmcp_storage::{cache::Cache, Database};
+use futures::stream::{self, Stream, StreamExt};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
@@ -278,6 +279,56 @@ impl SemanticSearch {
 
         debug!("Semantic search returned {} results", results.len());
         Ok(results)
+    }
+
+    /// Search for semantically similar content, yielding results incrementally as a stream
+    ///
+    /// This method processes embeddings and yields results as they meet the threshold,
+    /// enabling early consumption of results without waiting for all comparisons to complete.
+    #[instrument(skip(self), level = "debug")]
+    pub fn search_streaming(
+        &self,
+        query: &str,
+        options: SemanticSearchOptions,
+    ) -> impl Stream<Item = Result<SemanticSearchResult>> + '_ {
+        let query = query.to_string();
+
+        stream::once(async move {
+            // Get query embedding
+            let query_embedding = self.get_or_compute_embedding(&query)?;
+
+            // Perform the search
+            self.search_by_embedding(&query_embedding, options)
+        })
+        .flat_map(|results| match results {
+            Ok(results) => {
+                // Yield results one by one
+                let items: Vec<_> = results.into_iter().map(Ok).collect();
+                stream::iter(items)
+            }
+            Err(e) => stream::iter(vec![Err(e)]),
+        })
+    }
+
+    /// Search by pre-computed embedding vector, yielding results incrementally as a stream
+    #[instrument(skip(self, query_embedding), level = "debug")]
+    pub fn search_by_embedding_streaming(
+        &self,
+        query_embedding: &[f32],
+        options: SemanticSearchOptions,
+    ) -> impl Stream<Item = Result<SemanticSearchResult>> + '_ {
+        let embedding = query_embedding.to_vec();
+        let limit = options.limit;
+
+        stream::once(async move { self.search_by_embedding(&embedding, options) }).flat_map(
+            move |results| match results {
+                Ok(results) => {
+                    let items: Vec<_> = results.into_iter().take(limit).map(Ok).collect();
+                    stream::iter(items)
+                }
+                Err(e) => stream::iter(vec![Err(e)]),
+            },
+        )
     }
 
     /// Get or compute embedding for a query string
