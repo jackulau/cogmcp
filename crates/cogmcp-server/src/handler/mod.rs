@@ -8,8 +8,11 @@ pub mod methods;
 use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpMethod, RpcError,
 };
+use crate::response_builder::{StreamingResponseBuilder, StreamingThreshold};
 use crate::server::CogMcpServer;
+use crate::streaming::{FormattedResult, StreamingConfig, StreamingFormatter};
 use serde_json::Value;
+use std::fmt::Display;
 use std::sync::Arc;
 
 pub use methods::*;
@@ -153,6 +156,127 @@ impl RequestHandler {
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
+}
+
+// ============================================================================
+// Streaming Helper Functions
+// ============================================================================
+
+/// Create a streaming response for a collection of results
+///
+/// This helper formats results into chunks suitable for streaming MCP responses.
+/// It uses the default streaming configuration.
+pub fn format_streaming_response<T: Display>(
+    results: &[T],
+    threshold: Option<StreamingThreshold>,
+) -> Value {
+    let threshold = threshold.unwrap_or_default();
+    let total_size: usize = results.iter().map(|r| r.to_string().len()).sum();
+
+    // Check if we should use streaming
+    if !threshold.should_stream(results.len(), total_size) {
+        // Use simple single-chunk response
+        let content: String = results
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        return serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": content
+            }],
+            "isError": false
+        });
+    }
+
+    // Use streaming formatter for larger result sets
+    let mut formatter = StreamingFormatter::new();
+    let chunks = formatter.format_all(results);
+
+    let mut builder = StreamingResponseBuilder::new()
+        .with_total_items(results.len());
+
+    builder.add_chunks(chunks);
+    builder.build_combined()
+}
+
+/// Create a streaming response builder with custom configuration
+///
+/// Use this when you need more control over the streaming behavior.
+pub fn create_streaming_builder(
+    config: StreamingConfig,
+    total_items: Option<usize>,
+) -> (StreamingFormatter, StreamingResponseBuilder) {
+    let formatter = StreamingFormatter::with_config(config);
+    let mut builder = StreamingResponseBuilder::new();
+
+    if let Some(total) = total_items {
+        builder = builder.with_total_items(total);
+    }
+
+    (formatter, builder)
+}
+
+/// Format search results into a streaming-ready response
+///
+/// This is a convenience function specifically for search results.
+pub fn format_search_results(
+    results: Vec<FormattedResult>,
+    query: &str,
+) -> Value {
+    if results.is_empty() {
+        return serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": format!("No results found for: {}", query)
+            }],
+            "isError": false
+        });
+    }
+
+    let header = format!("## Search results for: {}\n\n", query);
+    let threshold = StreamingThreshold::default();
+
+    // Format each result
+    let formatted: Vec<String> = results
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+
+    let total_size: usize = formatted.iter().map(|s| s.len()).sum();
+
+    if !threshold.should_stream(results.len(), total_size) {
+        // Simple response
+        let content = format!("{}{}", header, formatted.join("\n\n"));
+        return serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": content
+            }],
+            "isError": false
+        });
+    }
+
+    // Streaming response
+    let mut builder = StreamingResponseBuilder::new()
+        .with_total_items(results.len());
+
+    builder.add_chunk(header);
+    builder.add_chunks(formatted);
+
+    builder.build_combined()
+}
+
+/// Check if streaming should be used for a given result set
+pub fn should_use_streaming<T: Display>(
+    results: &[T],
+    threshold: Option<StreamingThreshold>,
+) -> bool {
+    let threshold = threshold.unwrap_or_default();
+    let total_size: usize = results.iter().map(|r| r.to_string().len()).sum();
+    threshold.should_stream(results.len(), total_size)
 }
 
 #[cfg(test)]
@@ -395,5 +519,106 @@ mod tests {
 
         // Handler should still be in valid state
         assert!(handler.is_initialized());
+    }
+
+    // ========================================================================
+    // Streaming Helper Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_streaming_response_small() {
+        let results = vec!["Result 1", "Result 2", "Result 3"];
+        let response = format_streaming_response(&results, None);
+
+        assert_eq!(response["isError"], false);
+        assert!(response["content"].is_array());
+        assert_eq!(response["content"].as_array().unwrap().len(), 1);
+
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Result 1"));
+        assert!(text.contains("Result 2"));
+        assert!(text.contains("Result 3"));
+    }
+
+    #[test]
+    fn test_format_streaming_response_large() {
+        // Create enough results to trigger streaming
+        let results: Vec<String> = (0..20)
+            .map(|i| format!("Result {} with some additional content to increase size", i))
+            .collect();
+
+        let threshold = StreamingThreshold::new(10, 100);
+        let response = format_streaming_response(&results, Some(threshold));
+
+        assert_eq!(response["isError"], false);
+        assert!(response["content"].is_array());
+
+        // Content should be present
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Result 0"));
+        assert!(text.contains("Result 19"));
+    }
+
+    #[test]
+    fn test_should_use_streaming_by_count() {
+        let results: Vec<&str> = (0..15).map(|_| "item").collect();
+        let threshold = StreamingThreshold::new(10, 10000);
+
+        assert!(should_use_streaming(&results, Some(threshold)));
+    }
+
+    #[test]
+    fn test_should_use_streaming_by_size() {
+        let results = vec!["a".repeat(5000), "b".repeat(5000)];
+        let threshold = StreamingThreshold::new(100, 8000);
+
+        assert!(should_use_streaming(&results, Some(threshold)));
+    }
+
+    #[test]
+    fn test_should_not_use_streaming() {
+        let results = vec!["small", "results"];
+        let threshold = StreamingThreshold::new(10, 10000);
+
+        assert!(!should_use_streaming(&results, Some(threshold)));
+    }
+
+    #[test]
+    fn test_format_search_results_empty() {
+        let results: Vec<FormattedResult> = vec![];
+        let response = format_search_results(results, "test query");
+
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("No results found"));
+        assert!(text.contains("test query"));
+    }
+
+    #[test]
+    fn test_format_search_results_with_results() {
+        let results = vec![
+            FormattedResult::new("src/main.rs", "fn main() {}")
+                .with_line(1)
+                .with_score(0.95),
+            FormattedResult::new("src/lib.rs", "pub mod test;")
+                .with_line(5)
+                .with_score(0.85),
+        ];
+
+        let response = format_search_results(results, "function definition");
+
+        assert_eq!(response["isError"], false);
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Search results for: function definition"));
+        assert!(text.contains("src/main.rs:1"));
+        assert!(text.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_create_streaming_builder() {
+        let config = StreamingConfig::default().with_chunk_size(2048);
+        let (formatter, builder) = create_streaming_builder(config, Some(100));
+
+        assert_eq!(formatter.total_items(), 0); // Not set until format_all or set_total
+        assert_eq!(builder.items_processed(), 0);
     }
 }
