@@ -1,4 +1,4 @@
-//! ContextMCP Context - Context management and compression
+//! CogMCP Context - Context management and compression
 //!
 //! This crate provides intelligent context selection, compression,
 //! and prioritization for efficient token usage.

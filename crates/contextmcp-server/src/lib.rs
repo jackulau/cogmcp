@@ -1,4 +1,4 @@
-//! ContextMCP Server - MCP server implementation
+//! CogMCP Server - MCP server implementation
 //!
 //! This crate implements the MCP server with all context tools.
 
@@ -10,4 +10,4 @@ pub use protocol::{
     ErrorCode, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError, McpMethod,
     RequestId, RpcError, MCP_VERSION,
 };
-pub use server::ContextMcpServer;
+pub use server::CogMcpServer;

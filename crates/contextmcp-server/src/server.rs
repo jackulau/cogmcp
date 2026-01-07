@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 /// MCP server for context management
 #[derive(Clone)]
-pub struct ContextMcpServer {
+pub struct CogMcpServer {
     pub root: PathBuf,
     pub config: Config,
     pub db: Arc<Database>,
@@ -22,7 +22,7 @@ pub struct ContextMcpServer {
     pub parser: Arc<CodeParser>,
 }
 
-impl ContextMcpServer {
+impl CogMcpServer {
     /// Create a new server instance
     pub fn new(root: PathBuf) -> Result<Self> {
         let config = Config::load()?;
@@ -65,7 +65,7 @@ impl ContextMcpServer {
     /// Get server info for MCP
     pub fn server_info() -> Implementation {
         Implementation {
-            name: "contextmcp".to_string(),
+            name: "cogmcp".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             title: None,
             icons: None,
@@ -98,7 +98,7 @@ impl ContextMcpServer {
         vec![
             make_tool(
                 "ping",
-                "Check if the ContextMCP server is running",
+                "Check if the CogMCP server is running",
                 json!({ "type": "object", "properties": {} }),
             ),
             make_tool(
@@ -219,7 +219,7 @@ impl ContextMcpServer {
 
     fn ping(&self) -> String {
         format!(
-            "ContextMCP server is running.\nVersion: {}\nRoot: {}",
+            "CogMCP server is running.\nVersion: {}\nRoot: {}",
             env!("CARGO_PKG_VERSION"),
             self.root.display()
         )
@@ -390,14 +390,14 @@ impl ContextMcpServer {
 }
 
 /// MCP ServerHandler implementation
-impl ServerHandler for ContextMcpServer {
+impl ServerHandler for CogMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: Default::default(),
             capabilities: Self::capabilities(),
             server_info: Self::server_info(),
             instructions: Some(
-                "ContextMCP provides intelligent code context for AI assistants. \
+                "CogMCP provides intelligent code context for AI assistants. \
                  Use context_search for natural language queries, find_symbol for \
                  symbol lookups, and context_grep for pattern matching."
                     .to_string(),
