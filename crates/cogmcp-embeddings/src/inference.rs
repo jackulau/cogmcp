@@ -13,6 +13,9 @@ use cogmcp_core::{Error, Result};
 use crate::model::ModelConfig;
 use crate::tokenizer::Tokenizer;
 
+/// Default batch size for batch inference operations
+pub const DEFAULT_BATCH_SIZE: usize = 32;
+
 /// Embedding engine for generating text embeddings using ONNX Runtime
 #[derive(Debug)]
 pub struct EmbeddingEngine {
@@ -22,6 +25,8 @@ pub struct EmbeddingEngine {
     session: Option<Session>,
     /// Tokenizer for text preprocessing
     tokenizer: Option<Tokenizer>,
+    /// Batch size for batch inference operations
+    batch_size: usize,
 }
 
 impl EmbeddingEngine {
@@ -34,6 +39,7 @@ impl EmbeddingEngine {
                 config,
                 session: None,
                 tokenizer: None,
+                batch_size: DEFAULT_BATCH_SIZE,
             });
         }
 
@@ -82,7 +88,24 @@ impl EmbeddingEngine {
             config,
             session: Some(session),
             tokenizer: Some(tokenizer),
+            batch_size: DEFAULT_BATCH_SIZE,
         })
+    }
+
+    /// Create a new embedding engine with a custom batch size
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size.max(1);
+        self
+    }
+
+    /// Get the current batch size
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Set the batch size for batch inference operations
+    pub fn set_batch_size(&mut self, batch_size: usize) {
+        self.batch_size = batch_size.max(1);
     }
 
     /// Create an embedding engine without a model (for testing)
@@ -91,6 +114,7 @@ impl EmbeddingEngine {
             config: ModelConfig::default(),
             session: None,
             tokenizer: None,
+            batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 
@@ -187,17 +211,159 @@ impl EmbeddingEngine {
         Ok(normalized)
     }
 
-    /// Generate embeddings for multiple texts (batch processing)
+    /// Generate embeddings for multiple texts using true batch inference
     ///
-    /// More efficient than calling embed() multiple times for large batches
+    /// This processes all texts in a single ONNX forward pass, which is
+    /// significantly more efficient than calling embed() multiple times.
+    /// The embeddings are identical to sequential processing within floating
+    /// point tolerance.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        // Process sequentially for simplicity and to avoid complex batch handling
-        // True batch processing could be added for larger batches
-        texts.iter().map(|t| self.embed(t)).collect()
+        // For single text, use the simpler single-text path
+        if texts.len() == 1 {
+            return Ok(vec![self.embed(texts[0])?]);
+        }
+
+        // Tokenize all texts at once using batch encoding
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            Error::Embedding("Tokenizer not loaded".into())
+        })?;
+
+        let batch = tokenizer.encode_batch(texts)?;
+        let batch_size = batch.batch_size;
+        let seq_len = batch.seq_length;
+
+        if batch_size == 0 || seq_len == 0 {
+            return Ok(vec![]);
+        }
+
+        // Create input tensors with shape [batch_size, seq_len]
+        let input_ids: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), batch.input_ids).map_err(|e| {
+                Error::Embedding(format!("Failed to create input_ids tensor: {}", e))
+            })?;
+
+        let attention_mask: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), batch.attention_mask.clone())
+                .map_err(|e| {
+                    Error::Embedding(format!("Failed to create attention_mask tensor: {}", e))
+                })?;
+
+        let token_type_ids: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), batch.token_type_ids).map_err(|e| {
+                Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e))
+            })?;
+
+        // Create Tensor values for ort
+        let input_ids_tensor = Tensor::from_array(input_ids)
+            .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
+        let attention_mask_tensor = Tensor::from_array(attention_mask)
+            .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
+        let token_type_ids_tensor = Tensor::from_array(token_type_ids)
+            .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
+
+        // Run inference and extract data
+        let (hidden_dim, raw_data) = {
+            let session = self.session.as_mut().ok_or_else(|| {
+                Error::Embedding("Model not loaded. Call ensure_model_available() first.".into())
+            })?;
+
+            let outputs = session
+                .run(ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor])
+                .map_err(|e| Error::Embedding(format!("ONNX batch inference failed: {}", e)))?;
+
+            // Extract the embeddings from the output
+            let output_value = outputs.iter().next()
+                .ok_or_else(|| Error::Embedding("No output tensor found".into()))?;
+
+            let (shape, data) = output_value.1
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
+
+            // Get dimensions: should be [batch_size, seq_len, hidden_dim]
+            if shape.len() != 3 {
+                return Err(Error::Embedding(format!(
+                    "Expected 3D output tensor, got {}D with shape {:?}",
+                    shape.len(),
+                    &**shape
+                )));
+            }
+
+            let actual_batch_size = shape[0] as usize;
+            let actual_seq_len = shape[1] as usize;
+            let hidden_dim = shape[2] as usize;
+
+            if actual_batch_size != batch_size {
+                return Err(Error::Embedding(format!(
+                    "Batch size mismatch: expected {}, got {}",
+                    batch_size, actual_batch_size
+                )));
+            }
+
+            if actual_seq_len != seq_len {
+                return Err(Error::Embedding(format!(
+                    "Sequence length mismatch: expected {}, got {}",
+                    seq_len, actual_seq_len
+                )));
+            }
+
+            (hidden_dim, data.to_vec())
+        };
+
+        // Apply mean pooling and L2 normalization to each sequence in the batch
+        let mut embeddings = Vec::with_capacity(batch_size);
+        let sequence_elements = seq_len * hidden_dim;
+
+        for i in 0..batch_size {
+            // Extract this sequence's embeddings from the flattened data
+            let start_idx = i * sequence_elements;
+            let end_idx = start_idx + sequence_elements;
+            let sequence_data = &raw_data[start_idx..end_idx];
+
+            // Get this sequence's attention mask
+            let mask_start = i * seq_len;
+            let mask_end = mask_start + seq_len;
+            let sequence_mask = &batch.attention_mask[mask_start..mask_end];
+
+            // Apply mean pooling over the sequence dimension
+            let embedding = Self::mean_pooling_from_flat_static(
+                sequence_data,
+                sequence_mask,
+                seq_len,
+                hidden_dim,
+            )?;
+
+            // L2 normalize the embedding
+            let normalized = Self::l2_normalize_static(&embedding);
+            embeddings.push(normalized);
+        }
+
+        Ok(embeddings)
+    }
+
+    /// Generate embeddings for multiple texts with automatic chunking
+    ///
+    /// This method splits large inputs into optimal batch sizes and processes
+    /// them efficiently. Use this for very large batches where memory might
+    /// be a concern.
+    pub fn embed_batch_chunked(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let batch_size = self.batch_size;
+        let mut all_embeddings = Vec::with_capacity(texts.len());
+
+        // Process in chunks of batch_size
+        for chunk in texts.chunks(batch_size) {
+            let chunk_embeddings = self.embed_batch(chunk)?;
+            all_embeddings.extend(chunk_embeddings);
+        }
+
+        Ok(all_embeddings)
     }
 
     /// Apply mean pooling to get sentence embeddings from flattened output
