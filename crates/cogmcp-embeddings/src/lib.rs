@@ -28,8 +28,13 @@
 
 pub mod inference;
 pub mod model;
+pub mod quantize;
 pub mod tokenizer;
 
 pub use inference::EmbeddingEngine;
 pub use model::{ModelConfig, ModelManager};
+pub use quantize::{
+    dequantize_vector, quantization_error, quantize_batch, quantize_vector,
+    quantized_cosine_similarity, quantized_dot_product, QuantizedEmbedding,
+};
 pub use tokenizer::{BatchTokenizedInput, TokenizedInput, Tokenizer};
