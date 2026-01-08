@@ -15,6 +15,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub git: GitConfig,
     pub search: SearchConfig,
+    pub pool: PoolConfig,
 }
 
 impl Default for Config {
@@ -26,6 +27,7 @@ impl Default for Config {
             context: ContextConfig::default(),
             git: GitConfig::default(),
             search: SearchConfig::default(),
+            pool: PoolConfig::default(),
         }
     }
 }
@@ -239,6 +241,51 @@ impl Default for GitConfig {
     }
 }
 
+/// Connection pool configuration
+///
+/// Controls the behavior of database connection pooling for SQLite.
+/// These settings affect performance and resource usage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoolConfig {
+    /// Maximum number of connections in the pool
+    ///
+    /// Higher values allow more concurrent database access but use more resources.
+    /// Default: 10
+    pub max_connections: u32,
+
+    /// Minimum number of idle connections to maintain
+    ///
+    /// Keeping idle connections reduces latency for new requests.
+    /// Set to None to disable idle connection maintenance.
+    /// Default: Some(2)
+    pub min_idle: Option<u32>,
+
+    /// Connection timeout in seconds
+    ///
+    /// Maximum time to wait when acquiring a connection from the pool.
+    /// Default: 30
+    pub connection_timeout_secs: u64,
+
+    /// Idle timeout in seconds
+    ///
+    /// Connections idle longer than this will be closed.
+    /// Set to None to disable idle timeout (connections never expire).
+    /// Default: Some(600) (10 minutes)
+    pub idle_timeout_secs: Option<u64>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            min_idle: Some(2),
+            connection_timeout_secs: 30,
+            idle_timeout_secs: Some(600),
+        }
+    }
+}
+
 /// Search configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -293,5 +340,70 @@ mod tests {
         assert_eq!(config.semantic_weight, 0.5);
         assert_eq!(config.rrf_k, 60.0);
         assert_eq!(config.default_limit, 20);
+    }
+
+    #[test]
+    fn test_pool_config_defaults() {
+        let config = PoolConfig::default();
+        assert_eq!(config.max_connections, 10);
+        assert_eq!(config.min_idle, Some(2));
+        assert_eq!(config.connection_timeout_secs, 30);
+        assert_eq!(config.idle_timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn test_config_includes_pool() {
+        let config = Config::default();
+        assert_eq!(config.pool.max_connections, 10);
+        assert_eq!(config.pool.min_idle, Some(2));
+        assert_eq!(config.pool.connection_timeout_secs, 30);
+        assert_eq!(config.pool.idle_timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn test_pool_config_serializable() {
+        let config = PoolConfig::default();
+        let serialized = toml::to_string(&config).expect("Failed to serialize PoolConfig");
+        assert!(serialized.contains("max_connections = 10"));
+        assert!(serialized.contains("connection_timeout_secs = 30"));
+    }
+
+    #[test]
+    fn test_config_backwards_compatible() {
+        // Test that config without pool section still works
+        let toml_str = r#"
+[server]
+transport = "stdio"
+log_level = "debug"
+
+[indexing]
+max_file_size = 1000
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse config");
+        // Pool should have defaults
+        assert_eq!(config.pool.max_connections, 10);
+        assert_eq!(config.pool.min_idle, Some(2));
+        // Specified values should be loaded
+        assert_eq!(config.server.log_level, "debug");
+        assert_eq!(config.indexing.max_file_size, 1000);
+    }
+
+    #[test]
+    fn test_config_with_pool_section() {
+        let toml_str = r#"
+[server]
+transport = "stdio"
+
+[pool]
+max_connections = 20
+min_idle = 5
+connection_timeout_secs = 60
+idle_timeout_secs = 1200
+"#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to parse config with pool");
+        assert_eq!(config.pool.max_connections, 20);
+        assert_eq!(config.pool.min_idle, Some(5));
+        assert_eq!(config.pool.connection_timeout_secs, 60);
+        assert_eq!(config.pool.idle_timeout_secs, Some(1200));
     }
 }
