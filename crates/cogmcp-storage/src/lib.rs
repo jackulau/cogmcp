@@ -4,9 +4,11 @@
 //! symbols, embeddings, and full-text search.
 
 pub mod cache;
+pub mod pool;
 pub mod sqlite;
 pub mod tantivy_index;
 
+pub use pool::{ConnectionPool, PoolConfig, PoolState};
 pub use sqlite::{
     deserialize_parameters, deserialize_type_params, serialize_parameters, serialize_type_params,
     Database, EmbeddingInput, EmbeddingRow, ExtendedSymbolMetadata, FileRow, IndexStats,

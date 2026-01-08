@@ -4,7 +4,7 @@ use cogmcp_core::{Config, Result};
 use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
-use cogmcp_storage::{Database, FullTextIndex};
+use cogmcp_storage::{Database, FullTextIndex, PoolConfig};
 use parking_lot::Mutex;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -31,7 +31,17 @@ impl CogMcpServer {
     /// Create a new server instance
     pub fn new(root: PathBuf) -> Result<Self> {
         let config = Config::load()?;
-        let db = Arc::new(Database::open(&Config::database_path()?)?);
+
+        // Convert application pool config to storage pool config
+        let pool_config: PoolConfig = (&config.pool).into();
+        info!(
+            "Database pool configured: max_connections={}, min_idle={:?}, timeout={}s",
+            config.pool.max_connections,
+            config.pool.min_idle,
+            config.pool.connection_timeout_secs
+        );
+
+        let db = Arc::new(Database::open_with_config(&Config::database_path()?, pool_config)?);
         let text_index = Arc::new(FullTextIndex::open(&Config::tantivy_path()?)?);
         let parser = Arc::new(CodeParser::new());
 
