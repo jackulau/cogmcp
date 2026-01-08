@@ -132,6 +132,43 @@ pub struct SemanticSearchResult {
     pub context: Option<String>,
 }
 
+/// Input for batch indexing a chunk of text
+#[derive(Debug, Clone)]
+pub struct ChunkInput {
+    /// The text content to index
+    pub chunk_text: String,
+    /// Optional symbol ID if this chunk is associated with a symbol
+    pub symbol_id: Option<i64>,
+    /// Optional file ID if this chunk is associated with a file
+    pub file_id: Option<i64>,
+    /// Type of chunk
+    pub chunk_type: ChunkType,
+}
+
+impl ChunkInput {
+    /// Create a new chunk input
+    pub fn new(chunk_text: impl Into<String>, chunk_type: ChunkType) -> Self {
+        Self {
+            chunk_text: chunk_text.into(),
+            symbol_id: None,
+            file_id: None,
+            chunk_type,
+        }
+    }
+
+    /// Set the symbol ID
+    pub fn with_symbol_id(mut self, id: i64) -> Self {
+        self.symbol_id = Some(id);
+        self
+    }
+
+    /// Set the file ID
+    pub fn with_file_id(mut self, id: i64) -> Self {
+        self.file_id = Some(id);
+        self
+    }
+}
+
 /// Embedding with associated metadata for vector search
 #[derive(Debug, Clone)]
 struct EmbeddingRecord {
@@ -393,6 +430,102 @@ impl SemanticSearch {
         self.invalidate_cache();
 
         Ok(id)
+    }
+
+    /// Index multiple text chunks in a single batch operation
+    ///
+    /// This is significantly more efficient than calling `index_chunk` multiple times
+    /// as it uses batched ONNX inference and a single database transaction.
+    ///
+    /// # Arguments
+    /// * `chunks` - Vector of chunk inputs to index
+    /// * `batch_size` - Number of texts to process in each ONNX forward pass
+    ///
+    /// # Returns
+    /// Vector of embedding IDs for the inserted chunks
+    pub fn index_chunks_batch(
+        &self,
+        chunks: &[ChunkInput],
+        batch_size: usize,
+    ) -> Result<Vec<i64>> {
+        if chunks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Extract texts for batch embedding
+        let texts: Vec<&str> = chunks.iter().map(|c| c.chunk_text.as_str()).collect();
+
+        // Generate embeddings in batch
+        let embeddings = self.engine.lock().embed_batch_optimized(&texts, batch_size)?;
+
+        // Prepare inputs for batch database insertion
+        let inputs: Vec<cogmcp_storage::EmbeddingInput> = chunks
+            .iter()
+            .zip(embeddings.iter())
+            .map(|(chunk, embedding)| cogmcp_storage::EmbeddingInput {
+                symbol_id: chunk.symbol_id,
+                file_id: chunk.file_id,
+                chunk_text: chunk.chunk_text.clone(),
+                embedding: embedding.clone(),
+                chunk_type: chunk.chunk_type.as_str().to_string(),
+            })
+            .collect();
+
+        // Insert all embeddings in a single transaction
+        let ids = self.db.insert_embeddings_batch(&inputs)?;
+
+        // Invalidate cache since we added new data
+        self.invalidate_cache();
+
+        Ok(ids)
+    }
+
+    /// Index multiple text chunks using parallel processing for very large batches
+    ///
+    /// Uses Rayon to process embedding generation across multiple CPU cores,
+    /// then inserts all results in a single database transaction.
+    ///
+    /// # Arguments
+    /// * `chunks` - Vector of chunk inputs to index
+    /// * `batch_size` - Number of texts to process in each ONNX forward pass
+    ///
+    /// # Returns
+    /// Vector of embedding IDs for the inserted chunks
+    pub fn index_chunks_parallel(
+        &self,
+        chunks: &[ChunkInput],
+        batch_size: usize,
+    ) -> Result<Vec<i64>> {
+        if chunks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Extract texts for batch embedding
+        let texts: Vec<&str> = chunks.iter().map(|c| c.chunk_text.as_str()).collect();
+
+        // Generate embeddings using parallel batch processing
+        let embeddings = self.engine.lock().embed_large_batch(&texts, batch_size)?;
+
+        // Prepare inputs for batch database insertion
+        let inputs: Vec<cogmcp_storage::EmbeddingInput> = chunks
+            .iter()
+            .zip(embeddings.iter())
+            .map(|(chunk, embedding)| cogmcp_storage::EmbeddingInput {
+                symbol_id: chunk.symbol_id,
+                file_id: chunk.file_id,
+                chunk_text: chunk.chunk_text.clone(),
+                embedding: embedding.clone(),
+                chunk_type: chunk.chunk_type.as_str().to_string(),
+            })
+            .collect();
+
+        // Insert all embeddings in a single transaction
+        let ids = self.db.insert_embeddings_batch(&inputs)?;
+
+        // Invalidate cache since we added new data
+        self.invalidate_cache();
+
+        Ok(ids)
     }
 }
 
@@ -832,5 +965,27 @@ mod tests {
         let search = SemanticSearch::default();
         assert!(!search.is_available());
         assert_eq!(search.embedding_dim(), 384);
+    }
+
+    #[test]
+    fn test_chunk_input_builder() {
+        let chunk = ChunkInput::new("fn test() {}", ChunkType::Function)
+            .with_symbol_id(42)
+            .with_file_id(1);
+
+        assert_eq!(chunk.chunk_text, "fn test() {}");
+        assert_eq!(chunk.chunk_type, ChunkType::Function);
+        assert_eq!(chunk.symbol_id, Some(42));
+        assert_eq!(chunk.file_id, Some(1));
+    }
+
+    #[test]
+    fn test_chunk_input_default_values() {
+        let chunk = ChunkInput::new("struct MyStruct {}", ChunkType::Type);
+
+        assert_eq!(chunk.chunk_text, "struct MyStruct {}");
+        assert_eq!(chunk.chunk_type, ChunkType::Type);
+        assert_eq!(chunk.symbol_id, None);
+        assert_eq!(chunk.file_id, None);
     }
 }

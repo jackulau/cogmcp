@@ -133,6 +133,8 @@ pub struct IndexingConfig {
     pub enable_embeddings: bool,
     /// Path to embedding model
     pub embedding_model: Option<String>,
+    /// Number of texts to process in a single ONNX forward pass
+    pub embedding_batch_size: usize,
 }
 
 impl Default for IndexingConfig {
@@ -166,6 +168,7 @@ impl Default for IndexingConfig {
             ],
             enable_embeddings: true,
             embedding_model: None,
+            embedding_batch_size: 32,
         }
     }
 }

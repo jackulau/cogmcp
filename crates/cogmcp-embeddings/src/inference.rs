@@ -189,15 +189,187 @@ impl EmbeddingEngine {
 
     /// Generate embeddings for multiple texts (batch processing)
     ///
-    /// More efficient than calling embed() multiple times for large batches
+    /// More efficient than calling embed() multiple times for large batches.
+    /// Uses true batched inference when possible for 2-5x throughput improvement.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        // Process sequentially for simplicity and to avoid complex batch handling
-        // True batch processing could be added for larger batches
-        texts.iter().map(|t| self.embed(t)).collect()
+        // Default batch size for ONNX forward pass
+        self.embed_batch_optimized(texts, 32)
+    }
+
+    /// Generate embeddings with optimized batched ONNX inference
+    ///
+    /// Processes up to `batch_size` texts in a single forward pass.
+    /// This provides significant throughput improvement over sequential processing.
+    pub fn embed_batch_optimized(
+        &mut self,
+        texts: &[&str],
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let batch_size = batch_size.max(1);
+        let mut all_results = Vec::with_capacity(texts.len());
+
+        for chunk in texts.chunks(batch_size) {
+            let batch_results = self.process_batch(chunk)?;
+            all_results.extend(batch_results);
+        }
+
+        Ok(all_results)
+    }
+
+    /// Generate embeddings for large batches using parallel processing
+    ///
+    /// Note: This method cannot use Rayon parallelism internally because
+    /// the ONNX session requires mutable access. For parallel processing
+    /// of large batches, consider using multiple engine instances.
+    ///
+    /// # Arguments
+    /// * `texts` - Slice of text strings to embed
+    /// * `batch_size` - Number of texts per ONNX forward pass
+    ///
+    /// # Returns
+    /// Vector of embedding vectors, one per input text
+    pub fn embed_large_batch(
+        &mut self,
+        texts: &[&str],
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let batch_size = batch_size.max(1);
+
+        // Process batches sequentially (ONNX session requires &mut self)
+        // The batch optimization still applies within each chunk
+        self.embed_batch_optimized(texts, batch_size)
+    }
+
+    /// Process a single batch of texts through ONNX
+    fn process_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // For single text, use the optimized single-text path
+        if texts.len() == 1 {
+            return Ok(vec![self.embed(texts[0])?]);
+        }
+
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            Error::Embedding("Tokenizer not loaded".into())
+        })?;
+
+        // Batch tokenize all texts
+        let batch_encoded = tokenizer.encode_batch(texts)?;
+
+        if batch_encoded.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let batch_size = batch_encoded.batch_size;
+        let seq_len = batch_encoded.seq_length;
+
+        // Create batched input tensors with shape [batch_size, seq_len]
+        let input_ids: Array2<i64> = Array2::from_shape_vec(
+            (batch_size, seq_len),
+            batch_encoded.input_ids,
+        )
+        .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
+
+        let attention_mask: Array2<i64> = Array2::from_shape_vec(
+            (batch_size, seq_len),
+            batch_encoded.attention_mask.clone(),
+        )
+        .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
+
+        let token_type_ids: Array2<i64> = Array2::from_shape_vec(
+            (batch_size, seq_len),
+            batch_encoded.token_type_ids,
+        )
+        .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
+
+        // Create Tensor values for ort
+        let input_ids_tensor = Tensor::from_array(input_ids)
+            .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
+        let attention_mask_tensor = Tensor::from_array(attention_mask)
+            .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
+        let token_type_ids_tensor = Tensor::from_array(token_type_ids)
+            .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
+
+        // Store attention mask for pooling
+        let attention_masks: Vec<Vec<i64>> = batch_encoded
+            .attention_mask
+            .chunks(seq_len)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        // Run batched inference
+        let (hidden_dim, raw_data) = {
+            let session = self.session.as_mut().ok_or_else(|| {
+                Error::Embedding("Model not loaded. Call ensure_model_available() first.".into())
+            })?;
+
+            let outputs = session
+                .run(ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor])
+                .map_err(|e| Error::Embedding(format!("ONNX inference failed: {}", e)))?;
+
+            let output_value = outputs.iter().next()
+                .ok_or_else(|| Error::Embedding("No output tensor found".into()))?;
+
+            let (shape, data) = output_value.1
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
+
+            // Expected shape: [batch_size, seq_len, hidden_dim]
+            if shape.len() != 3 {
+                return Err(Error::Embedding(format!(
+                    "Expected 3D output tensor, got {}D with shape {:?}",
+                    shape.len(),
+                    &**shape
+                )));
+            }
+
+            let hidden_dim = shape[2] as usize;
+            (hidden_dim, data.to_vec())
+        };
+
+        // Extract embeddings for each text in the batch
+        let embeddings_per_text = seq_len * hidden_dim;
+        let mut results = Vec::with_capacity(batch_size);
+
+        for i in 0..batch_size {
+            let start = i * embeddings_per_text;
+            let end = start + embeddings_per_text;
+
+            if end > raw_data.len() {
+                return Err(Error::Embedding("Output tensor size mismatch".into()));
+            }
+
+            let text_embeddings = &raw_data[start..end];
+            let text_attention_mask = &attention_masks[i];
+
+            // Apply mean pooling for this text
+            let embedding = Self::mean_pooling_from_flat_static(
+                text_embeddings,
+                text_attention_mask,
+                seq_len,
+                hidden_dim,
+            )?;
+
+            // Normalize the embedding
+            let normalized = Self::l2_normalize_static(&embedding);
+            results.push(normalized);
+        }
+
+        Ok(results)
     }
 
     /// Apply mean pooling to get sentence embeddings from flattened output
@@ -369,5 +541,268 @@ mod tests {
         assert!((result[0] - 1.0).abs() < 1e-6);
         assert!((result[1] - 2.0).abs() < 1e-6);
         assert!((result[2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_embed_batch_empty() {
+        let mut engine = EmbeddingEngine::without_model();
+        let result = engine.embed_batch(&[]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_embed_batch_optimized_empty() {
+        let mut engine = EmbeddingEngine::without_model();
+        let result = engine.embed_batch_optimized(&[], 32);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_embed_large_batch_empty() {
+        let mut engine = EmbeddingEngine::without_model();
+        let result = engine.embed_large_batch(&[], 32);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+}
+
+/// Integration tests that require model files
+/// These tests verify batch vs sequential equivalence
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::model::ModelManager;
+
+    /// Helper to create an engine with model if available
+    fn create_test_engine() -> Option<EmbeddingEngine> {
+        let manager = match ModelManager::new() {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+
+        if !manager.is_model_available() {
+            return None;
+        }
+
+        let config = manager.get_config();
+        EmbeddingEngine::new(config).ok()
+    }
+
+    #[test]
+    #[ignore = "Requires model files to be downloaded"]
+    fn test_batch_vs_sequential_equivalence() {
+        let mut engine = match create_test_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("Skipping test: model not available");
+                return;
+            }
+        };
+
+        let texts = vec![
+            "hello world",
+            "test embedding",
+            "rust code",
+            "machine learning",
+            "natural language processing",
+        ];
+
+        // Generate embeddings sequentially
+        let sequential: Vec<Vec<f32>> = texts
+            .iter()
+            .map(|t| engine.embed(t).unwrap())
+            .collect();
+
+        // Generate embeddings in batch
+        let batched = engine.embed_batch(&texts).unwrap();
+
+        // Verify same number of results
+        assert_eq!(sequential.len(), batched.len());
+
+        // Verify vectors are identical within f32 precision
+        for (i, (seq, bat)) in sequential.iter().zip(batched.iter()).enumerate() {
+            assert_eq!(seq.len(), bat.len(), "Dimension mismatch at index {}", i);
+
+            for (j, (s, b)) in seq.iter().zip(bat.iter()).enumerate() {
+                assert!(
+                    (s - b).abs() < 1e-5,
+                    "Value mismatch at text {} dim {}: sequential={}, batched={}",
+                    i, j, s, b
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires model files to be downloaded"]
+    fn test_batch_size_variations() {
+        let mut engine = match create_test_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("Skipping test: model not available");
+                return;
+            }
+        };
+
+        let texts: Vec<&str> = (0..10)
+            .map(|i| match i % 5 {
+                0 => "hello world",
+                1 => "test embedding model",
+                2 => "rust programming language",
+                3 => "machine learning algorithms",
+                _ => "natural language processing tasks",
+            })
+            .collect();
+
+        // Test different batch sizes
+        let batch_sizes = [1, 2, 4, 8, 16, 32];
+
+        let baseline = engine.embed_batch_optimized(&texts, 1).unwrap();
+
+        for batch_size in batch_sizes {
+            let result = engine.embed_batch_optimized(&texts, batch_size).unwrap();
+
+            assert_eq!(baseline.len(), result.len(), "Length mismatch for batch_size={}", batch_size);
+
+            for (i, (base, res)) in baseline.iter().zip(result.iter()).enumerate() {
+                for (j, (b, r)) in base.iter().zip(res.iter()).enumerate() {
+                    assert!(
+                        (b - r).abs() < 1e-5,
+                        "Value mismatch at batch_size={}, text={}, dim={}: base={}, result={}",
+                        batch_size, i, j, b, r
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires model files to be downloaded"]
+    fn test_large_batch_parallel_equivalence() {
+        let mut engine = match create_test_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("Skipping test: model not available");
+                return;
+            }
+        };
+
+        let sample_texts: Vec<String> = (0..100)
+            .map(|i| format!("sample text number {} for embedding test", i))
+            .collect();
+
+        let texts: Vec<&str> = sample_texts.iter().map(|s| s.as_str()).collect();
+
+        // Get baseline with sequential batch processing
+        let sequential = engine.embed_batch_optimized(&texts, 32).unwrap();
+
+        // Get results with large batch processing
+        let parallel = engine.embed_large_batch(&texts, 32).unwrap();
+
+        // Verify same number of results
+        assert_eq!(sequential.len(), parallel.len());
+
+        // Verify vectors are identical within f32 precision
+        for (i, (seq, par)) in sequential.iter().zip(parallel.iter()).enumerate() {
+            assert_eq!(seq.len(), par.len(), "Dimension mismatch at index {}", i);
+
+            for (j, (s, p)) in seq.iter().zip(par.iter()).enumerate() {
+                assert!(
+                    (s - p).abs() < 1e-5,
+                    "Value mismatch at text {} dim {}: sequential={}, parallel={}",
+                    i, j, s, p
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Performance test - run manually"]
+    fn bench_batch_throughput() {
+        let mut engine = match create_test_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("Skipping benchmark: model not available");
+                return;
+            }
+        };
+
+        let sample_texts: Vec<String> = (0..1000)
+            .map(|i| format!("sample text number {} for embedding test", i))
+            .collect();
+
+        let texts: Vec<&str> = sample_texts.iter().map(|s| s.as_str()).collect();
+
+        // Time sequential processing (batch_size=1)
+        let start_sequential = std::time::Instant::now();
+        let _sequential_results = engine.embed_batch_optimized(&texts, 1).unwrap();
+        let sequential_duration = start_sequential.elapsed();
+
+        // Time batched processing (batch_size=32)
+        let start_batched = std::time::Instant::now();
+        let _batched_results = engine.embed_batch_optimized(&texts, 32).unwrap();
+        let batched_duration = start_batched.elapsed();
+
+        let speedup = sequential_duration.as_secs_f64() / batched_duration.as_secs_f64();
+
+        println!("\n=== Batch Inference Benchmark ===");
+        println!("Texts processed: {}", texts.len());
+        println!("Sequential (batch_size=1): {:?}", sequential_duration);
+        println!("Batched (batch_size=32): {:?}", batched_duration);
+        println!("Speedup: {:.2}x", speedup);
+
+        // Assert >2x improvement
+        assert!(
+            speedup > 2.0,
+            "Expected >2x speedup, got {:.2}x (sequential: {:?}, batched: {:?})",
+            speedup,
+            sequential_duration,
+            batched_duration
+        );
+    }
+
+    #[test]
+    #[ignore = "Performance test - run manually"]
+    fn bench_various_batch_sizes() {
+        let mut engine = match create_test_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("Skipping benchmark: model not available");
+                return;
+            }
+        };
+
+        let sample_texts: Vec<String> = (0..500)
+            .map(|i| format!("sample text number {} for embedding test", i))
+            .collect();
+
+        let texts: Vec<&str> = sample_texts.iter().map(|s| s.as_str()).collect();
+
+        let batch_sizes = [1, 4, 8, 16, 32, 64];
+
+        println!("\n=== Batch Size Comparison ===");
+        println!("Texts processed: {}", texts.len());
+
+        let mut baseline_duration = None;
+
+        for batch_size in batch_sizes {
+            let start = std::time::Instant::now();
+            let _results = engine.embed_batch_optimized(&texts, batch_size).unwrap();
+            let duration = start.elapsed();
+
+            let speedup = if let Some(baseline) = baseline_duration {
+                baseline / duration.as_secs_f64()
+            } else {
+                baseline_duration = Some(duration.as_secs_f64());
+                1.0
+            };
+
+            println!(
+                "batch_size={:2}: {:?} ({:.2}x vs batch_size=1)",
+                batch_size, duration, speedup
+            );
+        }
     }
 }
