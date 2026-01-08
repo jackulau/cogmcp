@@ -7,6 +7,8 @@ pub mod codebase;
 pub mod parser;
 pub mod git;
 pub mod dependencies;
+pub mod parallel_indexer;
 
 pub use codebase::{CodebaseIndexer, IndexResult};
 pub use parser::{CodeParser, ExtractedSymbol};
+pub use parallel_indexer::{ParallelIndexer, ParallelIndexConfig, ParallelIndexResult, ProgressCallback, ProgressReport, IndexPhase};
