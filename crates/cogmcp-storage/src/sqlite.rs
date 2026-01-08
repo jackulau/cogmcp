@@ -1303,3 +1303,607 @@ mod tests {
         assert_eq!(stats.symbols_with_parent, 1);
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Create a shared in-memory database for concurrent testing
+    fn create_shared_db() -> Arc<Database> {
+        Arc::new(Database::in_memory().unwrap())
+    }
+
+    // ========================================================================
+    // Concurrent Read Tests
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_reads_same_data() {
+        let db = create_shared_db();
+
+        // Setup: Insert some test data
+        let file_id = db
+            .upsert_file("test.rs", "hash123", 1234567890, 1024, "rust")
+            .unwrap();
+        db.insert_symbol(file_id, "test_fn", "function", 1, 10, None, None)
+            .unwrap();
+
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn multiple threads reading the same data
+        for _ in 0..10 {
+            let db = Arc::clone(&db);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..20 {
+                    // Multiple types of reads
+                    let stats = db.get_stats().unwrap();
+                    assert_eq!(stats.file_count, 1);
+                    assert_eq!(stats.symbol_count, 1);
+
+                    let file = db.get_file_by_path("test.rs").unwrap();
+                    assert!(file.is_some());
+
+                    let symbols = db.find_symbols_by_name("test_fn", false).unwrap();
+                    assert_eq!(symbols.len(), 1);
+
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 200);
+    }
+
+    #[test]
+    fn test_concurrent_reads_different_queries() {
+        let db = create_shared_db();
+
+        // Setup: Insert multiple files and symbols
+        for i in 0..5 {
+            let file_id = db
+                .upsert_file(
+                    &format!("file{}.rs", i),
+                    &format!("hash{}", i),
+                    1234567890 + i,
+                    1024,
+                    "rust",
+                )
+                .unwrap();
+            db.insert_symbol(
+                file_id,
+                &format!("function_{}", i),
+                "function",
+                1,
+                10,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn threads doing different types of reads
+        for i in 0..5 {
+            let db = Arc::clone(&db);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    // Each thread reads different data
+                    let path = format!("file{}.rs", i);
+                    let file = db.get_file_by_path(&path).unwrap();
+                    assert!(file.is_some(), "File {} should exist", path);
+
+                    let name = format!("function_{}", i);
+                    let symbols = db.find_symbols_by_name(&name, false).unwrap();
+                    assert_eq!(symbols.len(), 1);
+
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+    }
+
+    // ========================================================================
+    // Concurrent Write Tests
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_writes_different_files() {
+        let db = create_shared_db();
+
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn threads writing different files
+        for i in 0..10 {
+            let db = Arc::clone(&db);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..5 {
+                    let path = format!("thread{}_file{}.rs", i, j);
+                    let hash = format!("hash_{}_{}", i, j);
+
+                    let file_id = db
+                        .upsert_file(&path, &hash, 1234567890, 1024, "rust")
+                        .unwrap();
+
+                    db.insert_symbol(
+                        file_id,
+                        &format!("fn_{}_{}", i, j),
+                        "function",
+                        1,
+                        10,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+
+        // Verify all files were written
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.file_count, 50);
+        assert_eq!(stats.symbol_count, 50);
+    }
+
+    #[test]
+    fn test_concurrent_updates_same_file() {
+        let db = create_shared_db();
+
+        // First, create the file
+        db.upsert_file("shared.rs", "initial_hash", 1234567890, 1024, "rust")
+            .unwrap();
+
+        let update_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Multiple threads updating the same file
+        for i in 0..5 {
+            let db = Arc::clone(&db);
+            let update_count = Arc::clone(&update_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let hash = format!("hash_{}_{}", i, j);
+                    db.upsert_file("shared.rs", &hash, 1234567890 + j as i64, 1024, "rust")
+                        .unwrap();
+                    update_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(update_count.load(Ordering::SeqCst), 50);
+
+        // Should still only have one file (upserts, not inserts)
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.file_count, 1);
+    }
+
+    // ========================================================================
+    // Mixed Read/Write Workload Tests
+    // ========================================================================
+
+    #[test]
+    fn test_mixed_read_write_workload() {
+        let db = create_shared_db();
+
+        // Setup: Insert initial data
+        let file_id = db
+            .upsert_file("initial.rs", "hash", 1234567890, 1024, "rust")
+            .unwrap();
+        db.insert_symbol(file_id, "initial_fn", "function", 1, 10, None, None)
+            .unwrap();
+
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let write_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Reader threads
+        for i in 0..5 {
+            let db = Arc::clone(&db);
+            let read_count = Arc::clone(&read_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..20 {
+                    let stats = db.get_stats().unwrap();
+                    assert!(stats.file_count >= 1);
+
+                    let file = db.get_file_by_path("initial.rs").unwrap();
+                    assert!(file.is_some());
+
+                    // Try to read a file that may or may not exist yet
+                    let _ = db.get_file_by_path(&format!("writer{}.rs", i));
+
+                    read_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_micros(100));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Writer threads
+        for i in 0..5 {
+            let db = Arc::clone(&db);
+            let write_count = Arc::clone(&write_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let path = format!("writer{}_{}.rs", i, j);
+                    let file_id = db
+                        .upsert_file(&path, "hash", 1234567890, 1024, "rust")
+                        .unwrap();
+
+                    db.insert_symbol(
+                        file_id,
+                        &format!("fn_{}_{}", i, j),
+                        "function",
+                        1,
+                        10,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+
+                    write_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_micros(100));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(read_count.load(Ordering::SeqCst), 100);
+        assert_eq!(write_count.load(Ordering::SeqCst), 50);
+
+        // Verify final state
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.file_count, 51); // 1 initial + 50 written
+        assert_eq!(stats.symbol_count, 51);
+    }
+
+    #[test]
+    fn test_concurrent_symbol_search_while_inserting() {
+        let db = create_shared_db();
+
+        let search_count = Arc::new(AtomicUsize::new(0));
+        let insert_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Searcher threads
+        for _ in 0..3 {
+            let db = Arc::clone(&db);
+            let search_count = Arc::clone(&search_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..30 {
+                    // Fuzzy search should work even with concurrent inserts
+                    let _results = db.find_symbols_by_name("func", true).unwrap();
+                    search_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_micros(50));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Inserter threads
+        for i in 0..3 {
+            let db = Arc::clone(&db);
+            let insert_count = Arc::clone(&insert_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..20 {
+                    let path = format!("search_test_{}_{}.rs", i, j);
+                    let file_id = db
+                        .upsert_file(&path, "hash", 1234567890, 1024, "rust")
+                        .unwrap();
+
+                    db.insert_symbol(
+                        file_id,
+                        &format!("func_{}_{}", i, j),
+                        "function",
+                        1,
+                        10,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+
+                    insert_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_micros(50));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(search_count.load(Ordering::SeqCst), 90);
+        assert_eq!(insert_count.load(Ordering::SeqCst), 60);
+    }
+
+    // ========================================================================
+    // Embedding Operations Under Concurrency
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_embedding_operations() {
+        let db = create_shared_db();
+
+        // Setup: Create a file for embeddings
+        let file_id = db
+            .upsert_file("embedding_test.rs", "hash", 1234567890, 1024, "rust")
+            .unwrap();
+
+        let op_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Writer threads
+        for i in 0..5 {
+            let db = Arc::clone(&db);
+            let op_count = Arc::clone(&op_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let embedding: Vec<f32> = (0..128).map(|k| (i * j + k) as f32 / 1000.0).collect();
+                    db.insert_embedding(
+                        None,
+                        Some(file_id),
+                        &format!("chunk_{}_{}", i, j),
+                        &embedding,
+                        "code",
+                    )
+                    .unwrap();
+
+                    op_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Reader threads
+        for _ in 0..3 {
+            let db = Arc::clone(&db);
+            let op_count = Arc::clone(&op_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..15 {
+                    let _ = db.get_embeddings_for_file(file_id).unwrap();
+                    let _ = db.get_embedding_count().unwrap();
+                    op_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_micros(100));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // Verify all embeddings were inserted
+        let count = db.get_embedding_count().unwrap();
+        assert_eq!(count, 50);
+    }
+
+    #[test]
+    fn test_concurrent_batch_embedding_insert() {
+        let db = create_shared_db();
+
+        let file_id = db
+            .upsert_file("batch_test.rs", "hash", 1234567890, 1024, "rust")
+            .unwrap();
+
+        let op_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Multiple threads doing batch inserts
+        for i in 0..4 {
+            let db = Arc::clone(&db);
+            let op_count = Arc::clone(&op_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..5 {
+                    let batch: Vec<EmbeddingInput> = (0..10)
+                        .map(|k| EmbeddingInput {
+                            symbol_id: None,
+                            file_id: Some(file_id),
+                            chunk_text: format!("batch_{}_{}_{}", i, j, k),
+                            embedding: vec![0.1; 128],
+                            chunk_type: "code".to_string(),
+                        })
+                        .collect();
+
+                    db.insert_embeddings_batch(&batch).unwrap();
+                    op_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(op_count.load(Ordering::SeqCst), 20);
+
+        // Verify all embeddings
+        let count = db.get_embedding_count().unwrap();
+        assert_eq!(count, 200); // 4 threads * 5 batches * 10 embeddings
+    }
+
+    // ========================================================================
+    // Deadlock Prevention Tests
+    // ========================================================================
+
+    #[test]
+    fn test_no_deadlock_under_heavy_load() {
+        let db = create_shared_db();
+
+        // Pre-populate some data
+        for i in 0..10 {
+            let file_id = db
+                .upsert_file(
+                    &format!("deadlock_test_{}.rs", i),
+                    &format!("hash{}", i),
+                    1234567890,
+                    1024,
+                    "rust",
+                )
+                .unwrap();
+            db.insert_symbol(file_id, &format!("fn_{}", i), "function", 1, 10, None, None)
+                .unwrap();
+        }
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Mix of all operation types
+        for i in 0..20 {
+            let db = Arc::clone(&db);
+            let completed = Arc::clone(&completed);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    match (i + j) % 5 {
+                        0 => {
+                            // Read stats
+                            let _ = db.get_stats().unwrap();
+                        }
+                        1 => {
+                            // Read file
+                            let _ = db.get_file_by_path("deadlock_test_0.rs").unwrap();
+                        }
+                        2 => {
+                            // Search symbols
+                            let _ = db.find_symbols_by_name("fn_", true).unwrap();
+                        }
+                        3 => {
+                            // Write file
+                            let _ = db
+                                .upsert_file(
+                                    &format!("new_{}_{}.rs", i, j),
+                                    "hash",
+                                    1234567890,
+                                    1024,
+                                    "rust",
+                                )
+                                .unwrap();
+                        }
+                        4 => {
+                            // Get all files
+                            let _ = db.get_all_files().unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Use a timeout to detect deadlocks
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+
+        for handle in handles {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                panic!("Deadlock detected: test timed out");
+            }
+
+            // Can't actually timeout join, but the test will fail if it hangs
+            handle.join().expect("Thread should complete without deadlock");
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), 200);
+    }
+
+    // ========================================================================
+    // Database Clone/Shared Access Tests
+    // ========================================================================
+
+    #[test]
+    fn test_database_arc_sharing() {
+        let db = create_shared_db();
+        let db2 = Arc::clone(&db);
+        let db3 = Arc::clone(&db);
+
+        // Write from db1
+        let file_id = db
+            .upsert_file("shared_arc.rs", "hash", 1234567890, 1024, "rust")
+            .unwrap();
+        db.insert_symbol(file_id, "shared_fn", "function", 1, 10, None, None)
+            .unwrap();
+
+        // Read from db2
+        let file = db2.get_file_by_path("shared_arc.rs").unwrap();
+        assert!(file.is_some());
+
+        // Read from db3
+        let symbols = db3.find_symbols_by_name("shared_fn", false).unwrap();
+        assert_eq!(symbols.len(), 1);
+
+        // All should see the same stats
+        let stats1 = db.get_stats().unwrap();
+        let stats2 = db2.get_stats().unwrap();
+        let stats3 = db3.get_stats().unwrap();
+
+        assert_eq!(stats1.file_count, stats2.file_count);
+        assert_eq!(stats2.file_count, stats3.file_count);
+    }
+}

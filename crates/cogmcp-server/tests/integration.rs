@@ -508,3 +508,560 @@ mod e2e_tests {
         }
     }
 }
+
+// ============================================================================
+// Concurrent Server Tests
+// ============================================================================
+//
+// These tests verify the server handles concurrent tool calls correctly,
+// simulating real-world usage where multiple MCP clients or parallel
+// requests may access the server simultaneously.
+
+mod concurrent_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Create a shared test server wrapped in Arc for concurrent access
+    fn create_shared_server() -> Arc<CogMcpServer> {
+        let temp_dir = std::env::temp_dir().join("cogmcp-concurrent-test");
+        std::fs::create_dir_all(&temp_dir).ok();
+
+        Arc::new(CogMcpServer::in_memory(temp_dir).expect("Failed to create test server"))
+    }
+
+    // ========================================================================
+    // Concurrent Read Operations
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_ping_calls() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn multiple threads making ping calls
+        for _ in 0..10 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..20 {
+                    let result = server.call_tool("ping", json!({}));
+                    assert!(result.is_ok(), "Ping should succeed");
+                    let output = result.unwrap();
+                    assert!(
+                        output.contains("CogMCP server is running"),
+                        "Should contain server status"
+                    );
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 200);
+    }
+
+    #[test]
+    fn test_concurrent_index_status_calls() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..15 {
+                    let result = server.call_tool("index_status", json!({}));
+                    assert!(result.is_ok(), "index_status should succeed");
+                    let output = result.unwrap();
+                    assert!(
+                        output.contains("Index Status"),
+                        "Should contain status header"
+                    );
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 120);
+    }
+
+    #[test]
+    fn test_concurrent_list_tools() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    let tools = server.list_tools();
+                    assert_eq!(tools.len(), 8, "Should have 8 tools");
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 100);
+    }
+
+    // ========================================================================
+    // Concurrent Search Operations
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_grep_searches() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        let patterns = vec!["test", "fn", "struct", "impl", "use"];
+
+        for (i, pattern) in patterns.iter().enumerate() {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+            let pattern = pattern.to_string();
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let result = server.call_tool(
+                        "context_grep",
+                        json!({
+                            "pattern": pattern,
+                            "limit": (i + j) % 10 + 1
+                        }),
+                    );
+                    assert!(result.is_ok(), "context_grep should succeed for pattern '{}'", pattern);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+    }
+
+    #[test]
+    fn test_concurrent_symbol_searches() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        let symbol_names = vec!["main", "new", "test", "Config", "Server"];
+
+        for symbol in symbol_names {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+            let symbol = symbol.to_string();
+
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    let result = server.call_tool(
+                        "find_symbol",
+                        json!({
+                            "name": symbol,
+                            "fuzzy": true
+                        }),
+                    );
+                    assert!(result.is_ok(), "find_symbol should succeed for '{}'", symbol);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+    }
+
+    #[test]
+    fn test_concurrent_context_search_modes() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        let modes = vec!["keyword", "semantic", "hybrid"];
+
+        for mode in modes {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+            let mode = mode.to_string();
+
+            let handle = thread::spawn(move || {
+                for i in 0..10 {
+                    let result = server.call_tool(
+                        "context_search",
+                        json!({
+                            "query": format!("search query {}", i),
+                            "mode": mode,
+                            "limit": 10
+                        }),
+                    );
+                    assert!(result.is_ok(), "context_search should succeed for mode '{}'", mode);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 30);
+    }
+
+    // ========================================================================
+    // Mixed Tool Call Workload
+    // ========================================================================
+
+    #[test]
+    fn test_mixed_concurrent_tool_calls() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Different threads calling different tools
+        for i in 0..12 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let result = match (i + j) % 6 {
+                        0 => server.call_tool("ping", json!({})),
+                        1 => server.call_tool("index_status", json!({})),
+                        2 => server.call_tool(
+                            "context_grep",
+                            json!({"pattern": "test", "limit": 5}),
+                        ),
+                        3 => server.call_tool(
+                            "find_symbol",
+                            json!({"name": "main", "fuzzy": true}),
+                        ),
+                        4 => server.call_tool(
+                            "context_search",
+                            json!({"query": "function", "mode": "keyword"}),
+                        ),
+                        5 => {
+                            // list_tools doesn't return Result
+                            let _tools = server.list_tools();
+                            Ok("tools listed".to_string())
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    assert!(result.is_ok(), "Tool call {} should succeed", (i + j) % 6);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 120);
+    }
+
+    // ========================================================================
+    // Reindex Under Concurrent Load
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_reindex_with_reads() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Reindex thread
+        {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..3 {
+                    let result = server.call_tool("reindex", json!({}));
+                    assert!(result.is_ok(), "Reindex should succeed");
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Reader threads
+        for _ in 0..5 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..15 {
+                    // Mix of read operations
+                    let _ = server.call_tool("index_status", json!({})).unwrap();
+                    let _ = server.call_tool("ping", json!({})).unwrap();
+                    success_count.fetch_add(2, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // 3 reindex + (5 threads * 15 iterations * 2 calls)
+        assert_eq!(success_count.load(Ordering::SeqCst), 153);
+    }
+
+    // ========================================================================
+    // Server Info Concurrent Access
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_server_info_access() {
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..20 {
+                    let info = CogMcpServer::server_info();
+                    assert_eq!(info.name, "cogmcp");
+                    assert!(!info.version.is_empty());
+
+                    let caps = CogMcpServer::capabilities();
+                    assert!(caps.tools.is_some());
+
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 200);
+    }
+
+    // ========================================================================
+    // No Deadlock Under Heavy Load
+    // ========================================================================
+
+    #[test]
+    fn test_no_deadlock_heavy_concurrent_load() {
+        let server = create_shared_server();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn many threads doing various operations
+        for i in 0..20 {
+            let server = Arc::clone(&server);
+            let completed = Arc::clone(&completed);
+
+            let handle = thread::spawn(move || {
+                for j in 0..15 {
+                    match (i + j) % 8 {
+                        0 => {
+                            let _ = server.call_tool("ping", json!({}));
+                        }
+                        1 => {
+                            let _ = server.call_tool("index_status", json!({}));
+                        }
+                        2 => {
+                            let _ = server.call_tool(
+                                "context_grep",
+                                json!({"pattern": "test", "limit": 10}),
+                            );
+                        }
+                        3 => {
+                            let _ = server.call_tool(
+                                "find_symbol",
+                                json!({"name": "test", "fuzzy": true}),
+                            );
+                        }
+                        4 => {
+                            let _ = server.call_tool(
+                                "context_search",
+                                json!({"query": "test", "mode": "keyword"}),
+                            );
+                        }
+                        5 => {
+                            let _ = server.list_tools();
+                        }
+                        6 => {
+                            let _ = CogMcpServer::server_info();
+                        }
+                        7 => {
+                            let _ = CogMcpServer::capabilities();
+                        }
+                        _ => unreachable!(),
+                    }
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Set a timeout to detect potential deadlocks
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(60);
+
+        for handle in handles {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                panic!("Deadlock detected: test timed out");
+            }
+            handle.join().expect("Thread should complete without deadlock");
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), 300);
+    }
+
+    // ========================================================================
+    // Error Handling Under Concurrency
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_error_handling() {
+        let server = create_shared_server();
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Some threads making valid calls, some making invalid calls
+        for i in 0..10 {
+            let server = Arc::clone(&server);
+            let error_count = Arc::clone(&error_count);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    if (i + j) % 3 == 0 {
+                        // Invalid call - missing required parameter
+                        let result = server.call_tool("context_grep", json!({}));
+                        if result.is_err() {
+                            error_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else if (i + j) % 3 == 1 {
+                        // Invalid call - unknown tool
+                        let result = server.call_tool("nonexistent_tool", json!({}));
+                        if result.is_err() {
+                            error_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else {
+                        // Valid call
+                        let result = server.call_tool("ping", json!({}));
+                        if result.is_ok() {
+                            success_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // Verify both errors and successes were properly handled
+        let errors = error_count.load(Ordering::SeqCst);
+        let successes = success_count.load(Ordering::SeqCst);
+
+        assert!(errors > 0, "Should have handled some errors");
+        assert!(successes > 0, "Should have some successes");
+        // Total should be 100
+        assert!(
+            errors + successes <= 100,
+            "Total should not exceed iterations"
+        );
+    }
+
+    // ========================================================================
+    // Consistent Results Under Concurrency
+    // ========================================================================
+
+    #[test]
+    fn test_consistent_tool_list_under_concurrency() {
+        let server = create_shared_server();
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let server = Arc::clone(&server);
+            let results = Arc::clone(&results);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    let tools = server.list_tools();
+                    let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+                    results.lock().push(names);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // Verify all results are identical
+        let all_results = results.lock();
+        assert_eq!(all_results.len(), 100);
+
+        let first = &all_results[0];
+        for result in all_results.iter() {
+            assert_eq!(result, first, "All tool lists should be identical");
+        }
+    }
+}

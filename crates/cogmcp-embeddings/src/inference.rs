@@ -147,30 +147,35 @@ impl EmbeddingEngine {
                 Error::Embedding("Model not loaded. Call ensure_model_available() first.".into())
             })?;
 
+            let inputs = ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor]
+                .map_err(|e| Error::Embedding(format!("Failed to create inputs: {}", e)))?;
+
             let outputs = session
-                .run(ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor])
+                .run(inputs)
                 .map_err(|e| Error::Embedding(format!("ONNX inference failed: {}", e)))?;
 
             // Extract the sentence embedding from the output
             let output_value = outputs.iter().next()
                 .ok_or_else(|| Error::Embedding("No output tensor found".into()))?;
 
-            let (shape, data) = output_value.1
+            let tensor_view = output_value.1
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
+            let shape = tensor_view.shape().to_vec();
 
             // Get dimensions: should be [1, seq_len, hidden_dim]
             if shape.len() != 3 {
                 return Err(Error::Embedding(format!(
                     "Expected 3D output tensor, got {}D with shape {:?}",
                     shape.len(),
-                    &**shape
+                    shape
                 )));
             }
 
-            let hidden_dim = shape[2] as usize;
+            let hidden_dim = shape[2];
             // Copy the data to owned Vec before dropping outputs
-            (hidden_dim, data.to_vec())
+            let raw_data: Vec<f32> = tensor_view.iter().cloned().collect();
+            (hidden_dim, raw_data)
         };
 
         // Apply mean pooling over the sequence dimension
