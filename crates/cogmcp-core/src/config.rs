@@ -133,6 +133,12 @@ pub struct IndexingConfig {
     pub enable_embeddings: bool,
     /// Path to embedding model
     pub embedding_model: Option<String>,
+    /// Enable parallel file processing during indexing
+    pub enable_parallel_indexing: bool,
+    /// Number of parallel workers for file processing (0 = auto-detect based on CPU cores)
+    pub parallel_workers: usize,
+    /// Number of chunks to accumulate before generating embeddings in batch
+    pub embedding_batch_size: usize,
 }
 
 impl Default for IndexingConfig {
@@ -166,6 +172,9 @@ impl Default for IndexingConfig {
             ],
             enable_embeddings: true,
             embedding_model: None,
+            enable_parallel_indexing: true,
+            parallel_workers: 0, // 0 = auto-detect based on CPU cores
+            embedding_batch_size: 64,
         }
     }
 }

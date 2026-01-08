@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use ndarray::Array2;
+use ndarray_017::Array2;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tracing::{debug, info};
