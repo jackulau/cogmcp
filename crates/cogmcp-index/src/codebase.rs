@@ -3,7 +3,7 @@
 use crate::parser::{CodeParser, ExtractedSymbol};
 use cogmcp_core::types::Language;
 use cogmcp_core::{Config, Error, Result};
-use cogmcp_embeddings::EmbeddingEngine;
+use cogmcp_embeddings::{EmbeddingEngine, MetricsSnapshot};
 use cogmcp_storage::{Database, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use parking_lot::Mutex;
@@ -11,8 +11,46 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+use tracing::info;
 use walkdir::WalkDir;
+
+/// Progress information for indexing operations
+#[derive(Debug, Clone)]
+pub struct IndexProgress {
+    /// Total number of files to process
+    pub total_files: usize,
+    /// Number of files processed so far
+    pub processed_files: usize,
+    /// Current file being processed
+    pub current_file: Option<String>,
+    /// Time elapsed since start
+    pub elapsed_time: Duration,
+    /// Processing rate in files per second
+    pub files_per_second: f64,
+}
+
+impl IndexProgress {
+    /// Get completion percentage
+    pub fn percentage(&self) -> f64 {
+        if self.total_files > 0 {
+            (self.processed_files as f64 / self.total_files as f64) * 100.0
+        } else {
+            100.0
+        }
+    }
+
+    /// Get estimated time remaining
+    pub fn estimated_remaining(&self) -> Option<Duration> {
+        if self.files_per_second > 0.0 && self.processed_files < self.total_files {
+            let remaining_files = self.total_files - self.processed_files;
+            let remaining_secs = remaining_files as f64 / self.files_per_second;
+            Some(Duration::from_secs_f64(remaining_secs))
+        } else {
+            None
+        }
+    }
+}
 
 /// Indexes files in a codebase
 pub struct CodebaseIndexer {
@@ -84,56 +122,80 @@ impl CodebaseIndexer {
 
     /// Index all files in the codebase
     pub fn index_all(&self, db: &Database, text_index: &FullTextIndex) -> Result<IndexResult> {
+        self.index_all_with_progress(db, text_index, |_| {})
+    }
+
+    /// Index all files in the codebase with progress callback
+    ///
+    /// The callback receives an `IndexProgress` after each file is processed,
+    /// allowing for progress reporting during long-running operations.
+    ///
+    /// # Arguments
+    /// * `db` - The database to store file and symbol information
+    /// * `text_index` - The full-text index for content search
+    /// * `on_progress` - Callback function invoked after each file
+    ///
+    /// # Example
+    /// ```ignore
+    /// indexer.index_all_with_progress(&db, &text_index, |progress| {
+    ///     info!("{:.1}% complete ({}/{} files)",
+    ///         progress.percentage(),
+    ///         progress.processed_files,
+    ///         progress.total_files);
+    /// })?;
+    /// ```
+    pub fn index_all_with_progress<F>(
+        &self,
+        db: &Database,
+        text_index: &FullTextIndex,
+        mut on_progress: F,
+    ) -> Result<IndexResult>
+    where
+        F: FnMut(IndexProgress),
+    {
+        let start_time = Instant::now();
         let mut result = IndexResult::default();
         let gitignore = self.load_gitignore()?;
 
-        for entry in WalkDir::new(&self.root)
+        // First pass: collect all files to process for accurate progress tracking
+        let files_to_process: Vec<_> = WalkDir::new(&self.root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| !self.should_ignore(e.path(), &gitignore))
-        {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!("Failed to read directory entry: {}", e);
-                    result.errors += 1;
-                    continue;
-                }
-            };
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| {
+                let ext = entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                self.include_extensions.contains(&ext)
+            })
+            .filter(|entry| {
+                fs::metadata(entry.path())
+                    .map(|m| m.len() / 1024 <= self.config.indexing.max_file_size)
+                    .unwrap_or(false)
+            })
+            .collect();
 
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        let total_files = files_to_process.len();
+        info!("Indexing {} files in {}", total_files, self.root.display());
 
+        // Reset embedding metrics if available
+        if let Some(ref engine) = self.embedding_engine {
+            engine.lock().reset_metrics();
+        }
+
+        // Second pass: process files with progress tracking
+        for (idx, entry) in files_to_process.iter().enumerate() {
             let path = entry.path();
-
-            // Check file extension
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-
-            if !self.include_extensions.contains(&ext) {
-                result.skipped += 1;
-                continue;
-            }
-
-            // Check file size
-            let metadata = match fs::metadata(path) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("Failed to get metadata for {:?}: {}", path, e);
-                    result.errors += 1;
-                    continue;
-                }
-            };
-
-            let size_kb = metadata.len() / 1024;
-            if size_kb > self.config.indexing.max_file_size {
-                result.skipped += 1;
-                continue;
-            }
+            let relative_path = path
+                .strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
 
             // Index the file and track symbol statistics
             match self.index_file_with_stats(path, db, text_index, &mut result) {
@@ -143,10 +205,53 @@ impl CodebaseIndexer {
                     result.errors += 1;
                 }
             }
+
+            // Report progress
+            let elapsed = start_time.elapsed();
+            let processed = idx + 1;
+            let files_per_second = if elapsed.as_secs_f64() > 0.0 {
+                processed as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+
+            let progress = IndexProgress {
+                total_files,
+                processed_files: processed,
+                current_file: Some(relative_path),
+                elapsed_time: elapsed,
+                files_per_second,
+            };
+            on_progress(progress);
         }
 
         // Commit the text index
         text_index.commit()?;
+
+        // Record final timing and metrics
+        result.indexing_time = start_time.elapsed();
+
+        // Capture embedding metrics if available
+        if let Some(ref engine) = self.embedding_engine {
+            result.embedding_metrics = Some(engine.lock().get_metrics());
+        }
+
+        // Log final summary
+        info!(
+            "Indexing complete: {} files in {:.2}s ({:.1} files/s)",
+            result.indexed,
+            result.indexing_time.as_secs_f64(),
+            result.indexed as f64 / result.indexing_time.as_secs_f64().max(0.001)
+        );
+
+        if let Some(ref metrics) = result.embedding_metrics {
+            info!(
+                "Embedding metrics: {} embeddings, {:.2}s inference, {:.1} emb/s",
+                metrics.total_embeddings_generated,
+                metrics.total_inference_time.as_secs_f64(),
+                metrics.throughput_per_second
+            );
+        }
 
         Ok(result)
     }
@@ -410,6 +515,10 @@ pub struct IndexResult {
     pub symbols_extracted: u64,
     pub symbols_by_kind: HashMap<String, u64>,
     pub symbols_with_visibility: u64,
+    /// Total indexing time
+    pub indexing_time: Duration,
+    /// Embedding performance metrics (if embeddings were enabled)
+    pub embedding_metrics: Option<MetricsSnapshot>,
 }
 
 #[cfg(test)]
@@ -688,5 +797,120 @@ async def async_function():
 
         // Verify visibility extraction coverage
         assert!(stats.symbols_with_visibility > 0);
+    }
+
+    #[test]
+    fn test_index_progress_percentage() {
+        let progress = IndexProgress {
+            total_files: 100,
+            processed_files: 25,
+            current_file: Some("test.rs".to_string()),
+            elapsed_time: Duration::from_secs(5),
+            files_per_second: 5.0,
+        };
+
+        assert!((progress.percentage() - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_index_progress_percentage_empty() {
+        let progress = IndexProgress {
+            total_files: 0,
+            processed_files: 0,
+            current_file: None,
+            elapsed_time: Duration::ZERO,
+            files_per_second: 0.0,
+        };
+
+        assert!((progress.percentage() - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_index_progress_estimated_remaining() {
+        let progress = IndexProgress {
+            total_files: 100,
+            processed_files: 50,
+            current_file: Some("test.rs".to_string()),
+            elapsed_time: Duration::from_secs(10),
+            files_per_second: 5.0,
+        };
+
+        // 50 remaining files / 5 files per second = 10 seconds
+        let remaining = progress.estimated_remaining().unwrap();
+        assert!((remaining.as_secs_f64() - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_index_progress_estimated_remaining_complete() {
+        let progress = IndexProgress {
+            total_files: 100,
+            processed_files: 100,
+            current_file: None,
+            elapsed_time: Duration::from_secs(20),
+            files_per_second: 5.0,
+        };
+
+        assert!(progress.estimated_remaining().is_none());
+    }
+
+    #[test]
+    fn test_index_all_with_progress_callback() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        let mut progress_updates = Vec::new();
+
+        let result = indexer
+            .index_all_with_progress(&db, &text_index, |progress| {
+                progress_updates.push((progress.processed_files, progress.total_files));
+            })
+            .unwrap();
+
+        // Should have received progress updates for each file
+        assert_eq!(progress_updates.len(), 3, "Should have 3 progress updates");
+
+        // Final progress should be complete
+        let (processed, total) = progress_updates.last().unwrap();
+        assert_eq!(*processed, *total);
+        assert_eq!(*total, 3);
+
+        // Result should have indexing time
+        assert!(result.indexing_time.as_millis() > 0);
+
+        // Verify files were indexed
+        assert_eq!(result.indexed, 3);
+    }
+
+    #[test]
+    fn test_index_result_includes_timing() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
+
+        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        let result = indexer.index_all(&db, &text_index).unwrap();
+
+        // Indexing time should be recorded
+        assert!(result.indexing_time > Duration::ZERO);
+    }
+
+    #[test]
+    fn test_index_result_default() {
+        let result = IndexResult::default();
+
+        assert_eq!(result.indexed, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.errors, 0);
+        assert_eq!(result.symbols_extracted, 0);
+        assert!(result.symbols_by_kind.is_empty());
+        assert_eq!(result.symbols_with_visibility, 0);
+        assert_eq!(result.indexing_time, Duration::ZERO);
+        assert!(result.embedding_metrics.is_none());
     }
 }

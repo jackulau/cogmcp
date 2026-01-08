@@ -33,6 +33,8 @@ pub struct ModelConfig {
     pub embedding_dim: usize,
     /// Maximum sequence length
     pub max_length: usize,
+    /// Batch size for processing multiple texts
+    pub batch_size: usize,
 }
 
 impl Default for ModelConfig {
@@ -42,6 +44,7 @@ impl Default for ModelConfig {
             tokenizer_path: String::new(),
             embedding_dim: 384,
             max_length: 512,
+            batch_size: 32,
         }
     }
 }
@@ -151,6 +154,7 @@ impl ModelManager {
             tokenizer_path: tokenizer_path.to_string_lossy().to_string(),
             embedding_dim: 384,
             max_length: 512,
+            batch_size: 32,
         })
     }
 
@@ -269,6 +273,7 @@ impl ModelManager {
             tokenizer_path: self.tokenizer_path().to_string_lossy().to_string(),
             embedding_dim: 384,
             max_length: 512,
+            batch_size: 32,
         }
     }
 }

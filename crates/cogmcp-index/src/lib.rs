@@ -8,5 +8,5 @@ pub mod parser;
 pub mod git;
 pub mod dependencies;
 
-pub use codebase::{CodebaseIndexer, IndexResult};
+pub use codebase::{CodebaseIndexer, IndexProgress, IndexResult};
 pub use parser::{CodeParser, ExtractedSymbol};
