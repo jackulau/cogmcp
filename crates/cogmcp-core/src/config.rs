@@ -15,6 +15,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub git: GitConfig,
     pub search: SearchConfig,
+    pub cache: CacheConfig,
 }
 
 impl Default for Config {
@@ -26,6 +27,7 @@ impl Default for Config {
             context: ContextConfig::default(),
             git: GitConfig::default(),
             search: SearchConfig::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -239,6 +241,28 @@ impl Default for GitConfig {
     }
 }
 
+/// Cache configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Whether caching is enabled
+    pub enabled: bool,
+    /// Maximum number of entries in the query embedding cache
+    pub query_cache_capacity: usize,
+    /// TTL for query cache in seconds
+    pub query_cache_ttl_seconds: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            query_cache_capacity: 1000,
+            query_cache_ttl_seconds: 300,
+        }
+    }
+}
+
 /// Search configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -282,6 +306,7 @@ mod tests {
         assert!(config.watching.enabled);
         assert_eq!(config.context.default_max_tokens, 8000);
         assert!(config.git.enabled);
+        assert!(config.cache.enabled);
     }
 
     #[test]
@@ -293,5 +318,13 @@ mod tests {
         assert_eq!(config.semantic_weight, 0.5);
         assert_eq!(config.rrf_k, 60.0);
         assert_eq!(config.default_limit, 20);
+    }
+
+    #[test]
+    fn test_cache_config_defaults() {
+        let config = CacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.query_cache_capacity, 1000);
+        assert_eq!(config.query_cache_ttl_seconds, 300);
     }
 }

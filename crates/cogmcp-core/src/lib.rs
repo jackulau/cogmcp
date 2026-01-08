@@ -7,5 +7,5 @@ pub mod config;
 pub mod error;
 pub mod types;
 
-pub use config::{Config, SearchConfig};
+pub use config::{CacheConfig, Config, SearchConfig};
 pub use error::{Error, Result};

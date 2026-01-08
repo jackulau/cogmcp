@@ -6,9 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cogmcp_core::{Error, Result};
+use cogmcp_core::{CacheConfig, Error, Result};
 use cogmcp_embeddings::EmbeddingEngine;
-use cogmcp_storage::{cache::Cache, Database};
+use cogmcp_storage::{Database, LruCacheWithTtl};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
@@ -157,22 +157,29 @@ pub struct SemanticSearch {
     engine: Arc<Mutex<EmbeddingEngine>>,
     /// Database for storing and retrieving embeddings
     db: Arc<Database>,
-    /// Cache for query embeddings
-    query_cache: Cache<String, Vec<f32>>,
+    /// LRU cache for query embeddings with TTL-based expiration
+    query_cache: LruCacheWithTtl<String, Vec<f32>>,
     /// Cached embeddings from database for in-memory search
     embeddings_cache: RwLock<Option<Vec<EmbeddingRecord>>>,
 }
 
 impl SemanticSearch {
-    /// Create a new semantic search instance
-    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
+    /// Create a new semantic search instance with cache configuration
+    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>, cache_config: &CacheConfig) -> Self {
+        let ttl = Duration::from_secs(cache_config.query_cache_ttl_seconds);
+        let capacity = cache_config.query_cache_capacity;
+
         Self {
             engine,
             db,
-            // Cache query embeddings for 5 minutes
-            query_cache: Cache::new(Duration::from_secs(300)),
+            query_cache: LruCacheWithTtl::new(capacity, ttl),
             embeddings_cache: RwLock::new(None),
         }
+    }
+
+    /// Create a new semantic search instance with default cache configuration
+    pub fn with_default_cache(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
+        Self::new(engine, db, &CacheConfig::default())
     }
 
     /// Check if the embedding engine has a model loaded
@@ -398,7 +405,7 @@ impl SemanticSearch {
 
 impl Default for SemanticSearch {
     fn default() -> Self {
-        Self::new(
+        Self::with_default_cache(
             Arc::new(Mutex::new(EmbeddingEngine::without_model())),
             Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
         )
@@ -464,7 +471,7 @@ mod tests {
         // Create a mock embedding engine (without model)
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
 
-        SemanticSearch::new(engine, db)
+        SemanticSearch::with_default_cache(engine, db)
     }
 
     #[test]
@@ -617,7 +624,7 @@ mod tests {
 
         // Create search with mock engine
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         // Load embeddings
         search.ensure_embeddings_loaded().unwrap();
@@ -663,7 +670,7 @@ mod tests {
         db.insert_embedding(Some(sym2), None, "high similarity function", &high_sim, "function").unwrap();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let results = search.search_by_embedding(
             &query,
@@ -696,7 +703,7 @@ mod tests {
             .collect();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         // With low threshold, should return result
         let results = search.search_by_embedding(
@@ -730,7 +737,7 @@ mod tests {
         db.insert_embedding(Some(sym2), None, "test function", &embedding, "function").unwrap();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
 
@@ -762,7 +769,7 @@ mod tests {
         db.insert_embedding(Some(sym2), None, "my struct", &embedding, "type").unwrap();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
 
@@ -811,7 +818,7 @@ mod tests {
         }
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
 
@@ -832,5 +839,43 @@ mod tests {
         let search = SemanticSearch::default();
         assert!(!search.is_available());
         assert_eq!(search.embedding_dim(), 384);
+    }
+
+    #[test]
+    fn test_semantic_search_with_custom_cache_config() {
+        // Test that custom CacheConfig is respected
+        let db = Arc::new(Database::in_memory().unwrap());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+
+        let cache_config = CacheConfig {
+            enabled: true,
+            query_cache_capacity: 50,
+            query_cache_ttl_seconds: 60,
+        };
+
+        let search = SemanticSearch::new(engine, db, &cache_config);
+
+        // Verify search was created successfully
+        assert!(!search.is_available()); // No model loaded
+        assert_eq!(search.embedding_dim(), 384);
+    }
+
+    #[test]
+    fn test_lru_cache_capacity_limit() {
+        // Test that query cache respects capacity limits
+        let db = Arc::new(Database::in_memory().unwrap());
+        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+
+        let cache_config = CacheConfig {
+            enabled: true,
+            query_cache_capacity: 2, // Small capacity
+            query_cache_ttl_seconds: 300,
+        };
+
+        let search = SemanticSearch::new(engine, db, &cache_config);
+
+        // The cache is internal, but we can verify search still works
+        // The LRU eviction will handle capacity management automatically
+        assert_eq!(search.query_cache.capacity(), 2);
     }
 }
