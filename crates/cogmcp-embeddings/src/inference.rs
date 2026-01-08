@@ -10,8 +10,8 @@ use tracing::{debug, info};
 
 use cogmcp_core::{Error, Result};
 
-use crate::model::ModelConfig;
-use crate::tokenizer::Tokenizer;
+use crate::model::{ModelConfig, MAX_BATCH_SIZE};
+use crate::tokenizer::{BatchTokenizedInput, Tokenizer};
 
 /// Embedding engine for generating text embeddings using ONNX Runtime
 #[derive(Debug)]
@@ -187,17 +187,152 @@ impl EmbeddingEngine {
         Ok(normalized)
     }
 
-    /// Generate embeddings for multiple texts (batch processing)
+    /// Generate embeddings for multiple texts using true ONNX batch inference
     ///
-    /// More efficient than calling embed() multiple times for large batches
+    /// This method uses ONNX Runtime's batch inference capabilities for better performance.
+    /// Large batches are automatically chunked based on the configured batch size.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        // Process sequentially for simplicity and to avoid complex batch handling
-        // True batch processing could be added for larger batches
-        texts.iter().map(|t| self.embed(t)).collect()
+        let batch_size = self.config.batch_size.min(MAX_BATCH_SIZE);
+
+        // If batch is small enough, process in one go
+        if texts.len() <= batch_size {
+            return self.embed_batch_chunk(texts);
+        }
+
+        // Process in chunks for large batches
+        let mut all_embeddings = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(batch_size) {
+            let chunk_embeddings = self.embed_batch_chunk(chunk)?;
+            all_embeddings.extend(chunk_embeddings);
+        }
+
+        Ok(all_embeddings)
+    }
+
+    /// Process a single batch chunk through ONNX inference
+    fn embed_batch_chunk(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // For single text, use the optimized single-item path
+        if texts.len() == 1 {
+            return Ok(vec![self.embed(texts[0])?]);
+        }
+
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            Error::Embedding("Tokenizer not loaded".into())
+        })?;
+
+        // Tokenize all texts with padding to same length
+        let batch_input = tokenizer.encode_batch(texts)?;
+
+        // Prepare batch tensors
+        let (input_ids_tensor, attention_mask_tensor, token_type_ids_tensor) =
+            self.prepare_batch_inputs(&batch_input)?;
+
+        // Run inference and extract data
+        let (hidden_dim, raw_data, batch_size, seq_len) = {
+            let session = self.session.as_mut().ok_or_else(|| {
+                Error::Embedding("Model not loaded. Call ensure_model_available() first.".into())
+            })?;
+
+            let outputs = session
+                .run(ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor])
+                .map_err(|e| Error::Embedding(format!("ONNX inference failed: {}", e)))?;
+
+            let output_value = outputs.iter().next()
+                .ok_or_else(|| Error::Embedding("No output tensor found".into()))?;
+
+            let (shape, data) = output_value.1
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
+
+            // Shape should be [batch_size, seq_len, hidden_dim]
+            if shape.len() != 3 {
+                return Err(Error::Embedding(format!(
+                    "Expected 3D output tensor, got {}D with shape {:?}",
+                    shape.len(),
+                    &**shape
+                )));
+            }
+
+            let batch_size = shape[0] as usize;
+            let seq_len = shape[1] as usize;
+            let hidden_dim = shape[2] as usize;
+
+            (hidden_dim, data.to_vec(), batch_size, seq_len)
+        };
+
+        // Extract and normalize embeddings for each item in the batch
+        let mut embeddings = Vec::with_capacity(batch_size);
+        let stride = seq_len * hidden_dim;
+
+        for i in 0..batch_size {
+            let start = i * stride;
+            let end = start + stride;
+            let item_data = &raw_data[start..end];
+
+            // Get attention mask for this item
+            let mask_start = i * batch_input.seq_length;
+            let mask_end = mask_start + batch_input.seq_length;
+            let attention_mask = &batch_input.attention_mask[mask_start..mask_end];
+
+            // Apply mean pooling
+            let embedding = Self::mean_pooling_from_flat_static(
+                item_data,
+                attention_mask,
+                seq_len,
+                hidden_dim,
+            )?;
+
+            // Normalize the embedding
+            let normalized = Self::l2_normalize_static(&embedding);
+            embeddings.push(normalized);
+        }
+
+        Ok(embeddings)
+    }
+
+    /// Prepare batch input tensors for ONNX inference
+    fn prepare_batch_inputs(
+        &self,
+        batch_input: &BatchTokenizedInput,
+    ) -> Result<(Tensor<i64>, Tensor<i64>, Tensor<i64>)> {
+        let batch_size = batch_input.batch_size;
+        let seq_len = batch_input.seq_length;
+
+        // Create 2D arrays with shape [batch_size, seq_len]
+        let input_ids: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), batch_input.input_ids.clone())
+                .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
+
+        let attention_mask: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), batch_input.attention_mask.clone())
+                .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
+
+        let token_type_ids: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), batch_input.token_type_ids.clone())
+                .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
+
+        // Create ONNX tensors
+        let input_ids_tensor = Tensor::from_array(input_ids)
+            .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
+        let attention_mask_tensor = Tensor::from_array(attention_mask)
+            .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
+        let token_type_ids_tensor = Tensor::from_array(token_type_ids)
+            .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
+
+        Ok((input_ids_tensor, attention_mask_tensor, token_type_ids_tensor))
+    }
+
+    /// Get the configured batch size
+    pub fn batch_size(&self) -> usize {
+        self.config.batch_size
     }
 
     /// Apply mean pooling to get sentence embeddings from flattened output
@@ -369,5 +504,48 @@ mod tests {
         assert!((result[0] - 1.0).abs() < 1e-6);
         assert!((result[1] - 2.0).abs() < 1e-6);
         assert!((result[2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_embed_batch_empty() {
+        let mut engine = EmbeddingEngine::without_model();
+        let result = engine.embed_batch(&[]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_embed_batch_without_model_returns_error() {
+        let mut engine = EmbeddingEngine::without_model();
+        let result = engine.embed_batch(&["test text"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_size_getter() {
+        let engine = EmbeddingEngine::without_model();
+        assert_eq!(engine.batch_size(), crate::model::DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn test_batch_size_respects_config() {
+        let config = ModelConfig::default().with_batch_size(16);
+        let engine = EmbeddingEngine {
+            config,
+            session: None,
+            tokenizer: None,
+        };
+        assert_eq!(engine.batch_size(), 16);
+    }
+
+    #[test]
+    fn test_batch_size_capped_at_max() {
+        let config = ModelConfig::default().with_batch_size(999);
+        let engine = EmbeddingEngine {
+            config,
+            session: None,
+            tokenizer: None,
+        };
+        assert_eq!(engine.batch_size(), MAX_BATCH_SIZE);
     }
 }

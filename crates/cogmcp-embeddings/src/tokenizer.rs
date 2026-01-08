@@ -209,4 +209,55 @@ mod tests {
         };
         assert!(batch.is_empty());
     }
+
+    #[test]
+    fn test_batch_tokenized_input_non_empty() {
+        let batch = BatchTokenizedInput {
+            input_ids: vec![1, 2, 3, 4],
+            attention_mask: vec![1, 1, 1, 1],
+            token_type_ids: vec![0, 0, 0, 0],
+            batch_size: 2,
+            seq_length: 2,
+        };
+        assert!(!batch.is_empty());
+        assert_eq!(batch.batch_size, 2);
+        assert_eq!(batch.seq_length, 2);
+    }
+
+    #[test]
+    fn test_tokenized_input_empty() {
+        let input = TokenizedInput {
+            input_ids: vec![],
+            attention_mask: vec![],
+            token_type_ids: vec![],
+        };
+        assert!(input.is_empty());
+        assert_eq!(input.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_flattened_structure() {
+        // Test that batch data is flattened correctly
+        // Simulating 2 sequences of length 3 each
+        let batch = BatchTokenizedInput {
+            input_ids: vec![1, 2, 3, 4, 5, 6],
+            attention_mask: vec![1, 1, 1, 1, 1, 0], // Second sequence padded
+            token_type_ids: vec![0, 0, 0, 0, 0, 0],
+            batch_size: 2,
+            seq_length: 3,
+        };
+
+        // Verify we can access elements correctly
+        assert_eq!(batch.input_ids.len(), batch.batch_size * batch.seq_length);
+        assert_eq!(batch.attention_mask.len(), batch.batch_size * batch.seq_length);
+        assert_eq!(batch.token_type_ids.len(), batch.batch_size * batch.seq_length);
+
+        // First sequence: [1, 2, 3], all attended
+        assert_eq!(&batch.input_ids[0..3], &[1, 2, 3]);
+        assert_eq!(&batch.attention_mask[0..3], &[1, 1, 1]);
+
+        // Second sequence: [4, 5, 6], last token padded (mask=0)
+        assert_eq!(&batch.input_ids[3..6], &[4, 5, 6]);
+        assert_eq!(&batch.attention_mask[3..6], &[1, 1, 0]);
+    }
 }

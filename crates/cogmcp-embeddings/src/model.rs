@@ -22,6 +22,12 @@ const TOKENIZER_URL: &str = "https://huggingface.co/sentence-transformers/all-Mi
 /// Note: This is the hash when the model was first integrated
 const MODEL_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// Default batch size for batch embedding operations
+pub const DEFAULT_BATCH_SIZE: usize = 32;
+
+/// Maximum batch size to prevent memory issues
+pub const MAX_BATCH_SIZE: usize = 128;
+
 /// Embedding model configuration
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -33,6 +39,8 @@ pub struct ModelConfig {
     pub embedding_dim: usize,
     /// Maximum sequence length
     pub max_length: usize,
+    /// Batch size for batch embedding operations
+    pub batch_size: usize,
 }
 
 impl Default for ModelConfig {
@@ -42,6 +50,7 @@ impl Default for ModelConfig {
             tokenizer_path: String::new(),
             embedding_dim: 384,
             max_length: 512,
+            batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 }
@@ -56,6 +65,14 @@ impl ModelConfig {
             tokenizer_path: tokenizer_path.to_string_lossy().to_string(),
             ..Default::default()
         }
+    }
+
+    /// Set the batch size for batch embedding operations
+    ///
+    /// The batch size is clamped to MAX_BATCH_SIZE to prevent memory issues.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size.min(MAX_BATCH_SIZE);
+        self
     }
 
     /// Check if the model file exists
@@ -151,6 +168,7 @@ impl ModelManager {
             tokenizer_path: tokenizer_path.to_string_lossy().to_string(),
             embedding_dim: 384,
             max_length: 512,
+            batch_size: DEFAULT_BATCH_SIZE,
         })
     }
 
@@ -269,6 +287,7 @@ impl ModelManager {
             tokenizer_path: self.tokenizer_path().to_string_lossy().to_string(),
             embedding_dim: 384,
             max_length: 512,
+            batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 }
