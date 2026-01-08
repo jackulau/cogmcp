@@ -76,6 +76,64 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+/// Input for batch file insert/update
+#[derive(Debug, Clone)]
+pub struct FileInsert {
+    pub path: String,
+    pub hash: String,
+    pub modified_at: i64,
+    pub size: i64,
+    pub language: String,
+}
+
+/// Input for batch symbol insert
+#[derive(Debug, Clone)]
+pub struct SymbolInsert {
+    pub file_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub signature: Option<String>,
+    pub doc_comment: Option<String>,
+    pub visibility: Option<String>,
+    pub is_async: bool,
+    pub is_static: bool,
+    pub is_abstract: bool,
+    pub is_exported: bool,
+    pub is_const: bool,
+    pub is_unsafe: bool,
+    pub parent_symbol_id: Option<i64>,
+    pub type_parameters: Option<String>,
+    pub parameters: Option<String>,
+    pub return_type: Option<String>,
+}
+
+impl Default for SymbolInsert {
+    fn default() -> Self {
+        Self {
+            file_id: 0,
+            name: String::new(),
+            kind: String::new(),
+            start_line: 0,
+            end_line: 0,
+            signature: None,
+            doc_comment: None,
+            visibility: None,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            is_exported: false,
+            is_const: false,
+            is_unsafe: false,
+            parent_symbol_id: None,
+            type_parameters: None,
+            parameters: None,
+            return_type: None,
+        }
+    }
+}
+
 /// Input for batch embedding insert
 #[derive(Debug, Clone)]
 pub struct EmbeddingInput {
@@ -368,6 +426,196 @@ impl Database {
         conn.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])
             .map_err(|e| Error::Storage(format!("Failed to delete symbols: {}", e)))?;
         Ok(())
+    }
+
+    /// Delete symbols for multiple files in a single transaction
+    pub fn delete_symbols_for_files_batch(&self, file_ids: &[i64]) -> Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock();
+
+        conn.execute("BEGIN TRANSACTION", [])
+            .map_err(|e| Error::Storage(format!("Failed to begin transaction: {}", e)))?;
+
+        let result = (|| {
+            // Process in chunks to avoid SQL query length limits
+            const CHUNK_SIZE: usize = 500;
+            for chunk in file_ids.chunks(CHUNK_SIZE) {
+                let placeholders: Vec<String> = chunk.iter().enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect();
+                let query = format!(
+                    "DELETE FROM symbols WHERE file_id IN ({})",
+                    placeholders.join(", ")
+                );
+
+                let params: Vec<&dyn rusqlite::ToSql> = chunk.iter()
+                    .map(|id| id as &dyn rusqlite::ToSql)
+                    .collect();
+
+                conn.execute(&query, params.as_slice())
+                    .map_err(|e| Error::Storage(format!("Failed to delete symbols: {}", e)))?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| Error::Storage(format!("Failed to commit transaction: {}", e)))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Insert or update multiple files in a single transaction
+    /// Returns vector of file IDs in the same order as input
+    pub fn upsert_files_batch(&self, files: &[FileInsert]) -> Result<Vec<i64>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        let mut ids = Vec::with_capacity(files.len());
+
+        conn.execute("BEGIN TRANSACTION", [])
+            .map_err(|e| Error::Storage(format!("Failed to begin transaction: {}", e)))?;
+
+        let result = (|| {
+            // Prepare statements once for reuse
+            let mut upsert_stmt = conn
+                .prepare(
+                    r#"
+                    INSERT INTO files (path, hash, modified_at, size, language, indexed_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))
+                    ON CONFLICT(path) DO UPDATE SET
+                        hash = excluded.hash,
+                        modified_at = excluded.modified_at,
+                        size = excluded.size,
+                        language = excluded.language,
+                        indexed_at = excluded.indexed_at
+                    "#,
+                )
+                .map_err(|e| Error::Storage(format!("Failed to prepare upsert statement: {}", e)))?;
+
+            let mut select_stmt = conn
+                .prepare("SELECT id FROM files WHERE path = ?1")
+                .map_err(|e| Error::Storage(format!("Failed to prepare select statement: {}", e)))?;
+
+            // Process in chunks to avoid lock timeouts
+            const CHUNK_SIZE: usize = 500;
+            for chunk in files.chunks(CHUNK_SIZE) {
+                for file in chunk {
+                    upsert_stmt
+                        .execute(params![
+                            file.path,
+                            file.hash,
+                            file.modified_at,
+                            file.size,
+                            file.language
+                        ])
+                        .map_err(|e| Error::Storage(format!("Failed to upsert file: {}", e)))?;
+
+                    let id: i64 = select_stmt
+                        .query_row(params![file.path], |row| row.get(0))
+                        .map_err(|e| Error::Storage(format!("Failed to get file id: {}", e)))?;
+                    ids.push(id);
+                }
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| Error::Storage(format!("Failed to commit transaction: {}", e)))?;
+                Ok(ids)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Insert multiple symbols in a single transaction
+    /// Returns vector of symbol IDs in the same order as input
+    pub fn insert_symbols_batch(&self, symbols: &[SymbolInsert]) -> Result<Vec<i64>> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock();
+        let mut ids = Vec::with_capacity(symbols.len());
+
+        conn.execute("BEGIN TRANSACTION", [])
+            .map_err(|e| Error::Storage(format!("Failed to begin transaction: {}", e)))?;
+
+        let result = (|| {
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    INSERT INTO symbols (
+                        file_id, name, kind, start_line, end_line, signature, doc_comment,
+                        visibility, is_async, is_static, is_abstract, is_exported, is_const, is_unsafe,
+                        parent_symbol_id, type_parameters, parameters, return_type
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                    "#,
+                )
+                .map_err(|e| Error::Storage(format!("Failed to prepare statement: {}", e)))?;
+
+            // Process in chunks to avoid lock timeouts
+            const CHUNK_SIZE: usize = 500;
+            for chunk in symbols.chunks(CHUNK_SIZE) {
+                for sym in chunk {
+                    stmt.execute(params![
+                        sym.file_id,
+                        sym.name,
+                        sym.kind,
+                        sym.start_line,
+                        sym.end_line,
+                        sym.signature,
+                        sym.doc_comment,
+                        sym.visibility,
+                        sym.is_async as i32,
+                        sym.is_static as i32,
+                        sym.is_abstract as i32,
+                        sym.is_exported as i32,
+                        sym.is_const as i32,
+                        sym.is_unsafe as i32,
+                        sym.parent_symbol_id,
+                        sym.type_parameters,
+                        sym.parameters,
+                        sym.return_type
+                    ])
+                    .map_err(|e| Error::Storage(format!("Failed to insert symbol: {}", e)))?;
+
+                    ids.push(conn.last_insert_rowid());
+                }
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| Error::Storage(format!("Failed to commit transaction: {}", e)))?;
+                Ok(ids)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
     }
 
     /// Update a symbol's parent reference
@@ -1301,5 +1549,240 @@ mod tests {
 
         // Check parent relationships (1 has parent)
         assert_eq!(stats.symbols_with_parent, 1);
+    }
+
+    #[test]
+    fn test_upsert_files_batch() {
+        let db = Database::in_memory().unwrap();
+
+        // Create batch of files to insert
+        let files = vec![
+            FileInsert {
+                path: "src/main.rs".to_string(),
+                hash: "hash1".to_string(),
+                modified_at: 1000000,
+                size: 1024,
+                language: "rust".to_string(),
+            },
+            FileInsert {
+                path: "src/lib.rs".to_string(),
+                hash: "hash2".to_string(),
+                modified_at: 1000001,
+                size: 2048,
+                language: "rust".to_string(),
+            },
+            FileInsert {
+                path: "src/utils.rs".to_string(),
+                hash: "hash3".to_string(),
+                modified_at: 1000002,
+                size: 512,
+                language: "rust".to_string(),
+            },
+        ];
+
+        // Insert batch
+        let ids = db.upsert_files_batch(&files).unwrap();
+        assert_eq!(ids.len(), 3);
+
+        // Verify all files were inserted
+        let all_files = db.get_all_files().unwrap();
+        assert_eq!(all_files.len(), 3);
+
+        // Verify specific file data
+        let main_file = db.get_file_by_path("src/main.rs").unwrap().unwrap();
+        assert_eq!(main_file.hash, "hash1");
+        assert_eq!(main_file.size, 1024);
+
+        // Test update (upsert) behavior
+        let updated_files = vec![
+            FileInsert {
+                path: "src/main.rs".to_string(),
+                hash: "hash1_updated".to_string(),
+                modified_at: 2000000,
+                size: 4096,
+                language: "rust".to_string(),
+            },
+        ];
+
+        let updated_ids = db.upsert_files_batch(&updated_files).unwrap();
+        assert_eq!(updated_ids.len(), 1);
+        assert_eq!(updated_ids[0], ids[0]); // Same ID
+
+        // Verify update
+        let updated_main = db.get_file_by_path("src/main.rs").unwrap().unwrap();
+        assert_eq!(updated_main.hash, "hash1_updated");
+        assert_eq!(updated_main.size, 4096);
+    }
+
+    #[test]
+    fn test_upsert_files_batch_empty() {
+        let db = Database::in_memory().unwrap();
+
+        // Empty batch should return empty vec
+        let ids = db.upsert_files_batch(&[]).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_insert_symbols_batch() {
+        let db = Database::in_memory().unwrap();
+
+        // First create a file
+        let file_id = db
+            .upsert_file("src/lib.rs", "hash123", 1234567890, 1024, "rust")
+            .unwrap();
+
+        // Create batch of symbols
+        let symbols = vec![
+            SymbolInsert {
+                file_id,
+                name: "function_one".to_string(),
+                kind: "function".to_string(),
+                start_line: 1,
+                end_line: 10,
+                visibility: Some("public".to_string()),
+                is_async: true,
+                ..Default::default()
+            },
+            SymbolInsert {
+                file_id,
+                name: "function_two".to_string(),
+                kind: "function".to_string(),
+                start_line: 12,
+                end_line: 20,
+                visibility: Some("private".to_string()),
+                ..Default::default()
+            },
+            SymbolInsert {
+                file_id,
+                name: "MyStruct".to_string(),
+                kind: "struct".to_string(),
+                start_line: 22,
+                end_line: 30,
+                visibility: Some("public".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        // Insert batch
+        let ids = db.insert_symbols_batch(&symbols).unwrap();
+        assert_eq!(ids.len(), 3);
+
+        // Verify all symbols were inserted
+        let file_symbols = db.get_file_symbols(file_id).unwrap();
+        assert_eq!(file_symbols.len(), 3);
+
+        // Verify specific symbol data
+        let func_one = db.find_symbols_by_name("function_one", false).unwrap();
+        assert_eq!(func_one.len(), 1);
+        assert!(func_one[0].is_async);
+        assert_eq!(func_one[0].visibility, Some("public".to_string()));
+
+        // Check stats
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.symbol_count, 3);
+    }
+
+    #[test]
+    fn test_insert_symbols_batch_empty() {
+        let db = Database::in_memory().unwrap();
+
+        // Empty batch should return empty vec
+        let ids = db.insert_symbols_batch(&[]).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_delete_symbols_for_files_batch() {
+        let db = Database::in_memory().unwrap();
+
+        // Create two files
+        let file1_id = db
+            .upsert_file("src/file1.rs", "hash1", 1234567890, 1024, "rust")
+            .unwrap();
+        let file2_id = db
+            .upsert_file("src/file2.rs", "hash2", 1234567890, 2048, "rust")
+            .unwrap();
+        let file3_id = db
+            .upsert_file("src/file3.rs", "hash3", 1234567890, 512, "rust")
+            .unwrap();
+
+        // Add symbols to each file
+        for (fid, name) in [(file1_id, "sym1"), (file2_id, "sym2"), (file3_id, "sym3")] {
+            db.insert_symbol(fid, name, "function", 1, 10, None, None)
+                .unwrap();
+        }
+
+        // Verify symbols exist
+        assert_eq!(db.get_stats().unwrap().symbol_count, 3);
+
+        // Delete symbols from file1 and file2
+        db.delete_symbols_for_files_batch(&[file1_id, file2_id]).unwrap();
+
+        // Verify only file3 symbols remain
+        assert_eq!(db.get_stats().unwrap().symbol_count, 1);
+        let remaining = db.get_file_symbols(file3_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "sym3");
+    }
+
+    #[test]
+    fn test_delete_symbols_for_files_batch_empty() {
+        let db = Database::in_memory().unwrap();
+
+        // Empty batch should succeed without error
+        db.delete_symbols_for_files_batch(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_batch_performance() {
+        let db = Database::in_memory().unwrap();
+
+        // Create 100 files
+        let files: Vec<FileInsert> = (0..100)
+            .map(|i| FileInsert {
+                path: format!("src/file{}.rs", i),
+                hash: format!("hash{}", i),
+                modified_at: 1000000 + i as i64,
+                size: 1024,
+                language: "rust".to_string(),
+            })
+            .collect();
+
+        // Batch insert should complete quickly
+        let start = std::time::Instant::now();
+        let file_ids = db.upsert_files_batch(&files).unwrap();
+        let batch_duration = start.elapsed();
+
+        assert_eq!(file_ids.len(), 100);
+
+        // Create 100 symbols (one per file)
+        let symbols: Vec<SymbolInsert> = file_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &fid)| SymbolInsert {
+                file_id: fid,
+                name: format!("function_{}", i),
+                kind: "function".to_string(),
+                start_line: 1,
+                end_line: 10,
+                ..Default::default()
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let symbol_ids = db.insert_symbols_batch(&symbols).unwrap();
+        let symbol_batch_duration = start.elapsed();
+
+        assert_eq!(symbol_ids.len(), 100);
+
+        // Verify counts
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.file_count, 100);
+        assert_eq!(stats.symbol_count, 100);
+
+        // Just verify batch completed reasonably fast (less than 1 second for 100 items)
+        assert!(batch_duration.as_secs() < 1, "File batch took too long: {:?}", batch_duration);
+        assert!(symbol_batch_duration.as_secs() < 1, "Symbol batch took too long: {:?}", symbol_batch_duration);
     }
 }
