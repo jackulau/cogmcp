@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 
 /// Main configuration for CogMCP
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -15,19 +15,6 @@ pub struct Config {
     pub context: ContextConfig,
     pub git: GitConfig,
     pub search: SearchConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            indexing: IndexingConfig::default(),
-            watching: WatchingConfig::default(),
-            context: ContextConfig::default(),
-            git: GitConfig::default(),
-            search: SearchConfig::default(),
-        }
-    }
 }
 
 impl Config {

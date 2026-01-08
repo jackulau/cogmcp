@@ -65,7 +65,7 @@ impl CodebaseIndexer {
     /// Check if embeddings are enabled and available
     pub fn embeddings_enabled(&self) -> bool {
         self.config.indexing.enable_embeddings
-            && self.embedding_engine.as_ref().map_or(false, |e| e.lock().is_loaded())
+            && self.embedding_engine.as_ref().is_some_and(|e| e.lock().is_loaded())
     }
 
     fn build_ignore_patterns(config: &Config) -> Result<GlobSet> {
@@ -372,10 +372,10 @@ impl CodebaseIndexer {
                 }
 
                 // Convert gitignore pattern to glob
-                let pattern = if line.starts_with('/') {
-                    line[1..].to_string()
-                } else if line.ends_with('/') {
-                    format!("**/{}", &line[..line.len() - 1])
+                let pattern = if let Some(stripped) = line.strip_prefix('/') {
+                    stripped.to_string()
+                } else if let Some(stripped) = line.strip_suffix('/') {
+                    format!("**/{}", stripped)
                 } else {
                     format!("**/{}", line)
                 };

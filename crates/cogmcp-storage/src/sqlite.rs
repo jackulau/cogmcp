@@ -289,6 +289,7 @@ impl Database {
     }
 
     /// Insert a symbol with basic metadata (backward compatible)
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_symbol(
         &self,
         file_id: i64,
@@ -405,11 +406,11 @@ impl Database {
         };
 
         let mut stmt = conn
-            .prepare(&query)
+            .prepare(query)
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
-            .query_map(params![pattern], |row| row_to_symbol_row(row))
+            .query_map(params![pattern], row_to_symbol_row)
             .map_err(|e| Error::Storage(format!("Failed to query symbols: {}", e)))?;
 
         let mut results = Vec::new();
@@ -854,6 +855,7 @@ impl Database {
     }
 
     /// Get extended index statistics including symbol breakdown
+    #[allow(clippy::field_reassign_with_default)]
     pub fn get_extended_stats(&self) -> Result<ExtendedIndexStats> {
         let conn = self.conn.lock();
         let mut stats = ExtendedIndexStats::default();
