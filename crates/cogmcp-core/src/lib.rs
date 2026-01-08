@@ -8,4 +8,4 @@ pub mod error;
 pub mod types;
 
 pub use config::{Config, SearchConfig};
-pub use error::{Error, Result};
+pub use error::{ActionableError, Error, ErrorCode, Result};

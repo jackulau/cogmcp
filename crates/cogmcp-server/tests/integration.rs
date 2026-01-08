@@ -94,7 +94,7 @@ fn test_unknown_tool() {
     assert!(result.is_err(), "Unknown tool should fail");
     let err = result.unwrap_err();
     assert!(
-        err.contains("Unknown tool"),
+        err.message.contains("Unknown tool"),
         "Error should indicate unknown tool"
     );
 }
@@ -134,7 +134,13 @@ fn test_context_grep_with_pattern() {
         }),
     );
 
-    assert!(result.is_ok(), "Search should succeed even with no results");
+    // With ActionableError, no results returns an error now
+    assert!(result.is_err(), "Search with no results should return error");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("No results") || err.message.contains("empty"),
+        "Error should indicate no results or empty index"
+    );
 }
 
 #[test]
@@ -149,7 +155,13 @@ fn test_context_search_with_query() {
         }),
     );
 
-    assert!(result.is_ok(), "Search should succeed even with no results");
+    // With ActionableError, no results returns an error now
+    assert!(result.is_err(), "Search with no results should return error");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("No results") || err.message.contains("empty"),
+        "Error should indicate no results or empty index"
+    );
 }
 
 #[test]
@@ -294,8 +306,13 @@ mod e2e_tests {
             }),
         );
 
-        assert!(result.is_ok(), "call_tool with arguments should succeed");
-        // Even with no matches, this should succeed (return "No matches found")
+        // With ActionableError, no results returns an error now
+        assert!(result.is_err(), "call_tool with no results should return error");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("No results") || err.message.contains("empty"),
+            "Error should indicate no results or empty index"
+        );
     }
 
     #[test]
@@ -308,7 +325,7 @@ mod e2e_tests {
         assert!(result.is_err(), "Unknown tool should return error");
         let err = result.unwrap_err();
         assert!(
-            err.contains("Unknown tool"),
+            err.message.contains("Unknown tool"),
             "Error message should indicate unknown tool"
         );
     }
@@ -326,7 +343,7 @@ mod e2e_tests {
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("Missing pattern") || err.contains("pattern"),
+            err.message.contains("pattern"),
             "Error should mention missing pattern"
         );
     }
@@ -367,7 +384,7 @@ mod e2e_tests {
     fn test_e2e_context_search_modes() {
         let server = create_test_server();
 
-        // Test keyword mode
+        // Test keyword mode - with ActionableError, no results returns error
         let result = server.call_tool(
             "context_search",
             json!({
@@ -375,7 +392,7 @@ mod e2e_tests {
                 "mode": "keyword"
             }),
         );
-        assert!(result.is_ok(), "keyword search should succeed");
+        assert!(result.is_err(), "keyword search with empty index should return error");
 
         // Test hybrid mode (default)
         let result = server.call_tool(
@@ -384,9 +401,9 @@ mod e2e_tests {
                 "query": "test query"
             }),
         );
-        assert!(result.is_ok(), "hybrid search should succeed");
+        assert!(result.is_err(), "hybrid search with empty index should return error");
 
-        // Test semantic mode
+        // Test semantic mode (requires embeddings, so may fail)
         let result = server.call_tool(
             "context_search",
             json!({
@@ -394,7 +411,9 @@ mod e2e_tests {
                 "mode": "semantic"
             }),
         );
-        assert!(result.is_ok(), "semantic search should succeed");
+        // Semantic search can fail due to empty index or embeddings not enabled
+        // Both cases return an error now
+        assert!(result.is_err(), "semantic search with empty index should return error");
     }
 
     #[test]
@@ -410,8 +429,13 @@ mod e2e_tests {
             }),
         );
 
-        assert!(result.is_ok(), "find_symbol should succeed");
-        // Even with no matches, this should succeed
+        // With ActionableError, no symbols found returns an error
+        assert!(result.is_err(), "find_symbol with no results should return error");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("symbol") || err.message.contains("empty"),
+            "Error should indicate no symbols or empty index"
+        );
     }
 
     #[test]
@@ -425,11 +449,11 @@ mod e2e_tests {
             }),
         );
 
-        assert!(result.is_ok(), "get_file_outline should return Ok");
-        let output = result.unwrap();
-        // Should return a graceful error message
+        // With ActionableError, file not found returns an error
+        assert!(result.is_err(), "get_file_outline for nonexistent file should return error");
+        let err = result.unwrap_err();
         assert!(
-            output.contains("Failed to read") || output.contains("error"),
+            err.message.contains("not found") || err.message.contains("File"),
             "Should indicate file not found"
         );
     }
@@ -491,7 +515,8 @@ mod e2e_tests {
     fn test_e2e_tool_with_limit_parameter() {
         let server = create_test_server();
 
-        // Test with various limit values
+        // Test with various limit values - with ActionableError,
+        // empty index returns error
         for limit in [1, 5, 10, 50, 100] {
             let result = server.call_tool(
                 "context_grep",
@@ -500,9 +525,10 @@ mod e2e_tests {
                     "limit": limit
                 }),
             );
+            // With empty index, the error should indicate that
             assert!(
-                result.is_ok(),
-                "context_grep should succeed with limit={}",
+                result.is_err(),
+                "context_grep with empty index should return error with limit={}",
                 limit
             );
         }
