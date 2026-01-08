@@ -1,11 +1,10 @@
 //! SQLite database for structured data storage
 
+use crate::pool::{ConnectionPool, PoolConfig};
 use cogmcp_core::{Error, Result};
-use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Arc;
 
 /// A parameter with name and optional type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,39 +123,39 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
 
 /// SQLite database wrapper with connection pooling
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
+    pool: ConnectionPool,
 }
 
 impl Database {
     /// Open or create a database at the given path
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| Error::Storage(format!("Failed to open database: {}", e)))?;
+        Self::open_with_config(path, PoolConfig::default())
+    }
 
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-
+    /// Open or create a database with custom pool configuration
+    pub fn open_with_config(path: &Path, config: PoolConfig) -> Result<Self> {
+        let pool = ConnectionPool::new(path, config)?;
+        let db = Self { pool };
         db.initialize_schema()?;
         Ok(db)
     }
 
     /// Create an in-memory database (for testing)
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| Error::Storage(format!("Failed to create in-memory database: {}", e)))?;
+        Self::in_memory_with_config(PoolConfig::for_testing())
+    }
 
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-
+    /// Create an in-memory database with custom pool configuration
+    pub fn in_memory_with_config(config: PoolConfig) -> Result<Self> {
+        let pool = ConnectionPool::in_memory(config)?;
+        let db = Self { pool };
         db.initialize_schema()?;
         Ok(db)
     }
 
     /// Initialize the database schema
     fn initialize_schema(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         conn.execute_batch(SCHEMA).map_err(|e| {
             Error::Storage(format!("Failed to initialize schema: {}", e))
         })?;
@@ -170,7 +169,7 @@ impl Database {
     /// Migration to add extended symbol metadata columns (v2)
     /// This handles both fresh installs (no-op) and upgrades gracefully.
     fn migrate_symbols_table_v2(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         // Check if migration is needed by looking for one of the new columns
         let needs_migration: bool = conn
@@ -213,12 +212,12 @@ impl Database {
         Ok(())
     }
 
-    /// Execute a query with the connection
+    /// Execute a query with a connection from the pool
     pub fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
-        F: FnOnce(&Connection) -> Result<T>,
+        F: FnOnce(&rusqlite::Connection) -> Result<T>,
     {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         f(&conn)
     }
 
@@ -231,7 +230,7 @@ impl Database {
         size: u64,
         language: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         conn.execute(
             r#"
             INSERT INTO files (path, hash, modified_at, size, language, indexed_at)
@@ -258,7 +257,7 @@ impl Database {
 
     /// Get a file by path
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let mut stmt = conn
             .prepare(
                 r#"
@@ -339,7 +338,7 @@ impl Database {
         parameters: Option<&str>,
         return_type: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         conn.execute(
             r#"
@@ -364,7 +363,7 @@ impl Database {
 
     /// Delete all symbols for a file
     pub fn delete_symbols_for_file(&self, file_id: i64) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         conn.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])
             .map_err(|e| Error::Storage(format!("Failed to delete symbols: {}", e)))?;
         Ok(())
@@ -372,7 +371,7 @@ impl Database {
 
     /// Update a symbol's parent reference
     pub fn update_symbol_parent(&self, symbol_id: i64, parent_id: i64) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE symbols SET parent_symbol_id = ?1 WHERE id = ?2",
             params![parent_id, symbol_id],
@@ -383,7 +382,7 @@ impl Database {
 
     /// Find symbols by name
     pub fn find_symbols_by_name(&self, name: &str, fuzzy: bool) -> Result<Vec<SymbolRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let pattern = if fuzzy {
             format!("%{}%", name)
         } else {
@@ -405,7 +404,7 @@ impl Database {
         };
 
         let mut stmt = conn
-            .prepare(&query)
+            .prepare(query)
             .map_err(|e| Error::Storage(format!("Failed to prepare query: {}", e)))?;
 
         let rows = stmt
@@ -422,7 +421,7 @@ impl Database {
 
     /// Find symbols by visibility
     pub fn find_symbols_by_visibility(&self, visibility: &str) -> Result<Vec<SymbolRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         let mut stmt = conn
             .prepare(
@@ -471,7 +470,7 @@ impl Database {
 
     /// Get child symbols (symbols with given parent_symbol_id)
     pub fn get_symbol_children(&self, parent_id: i64) -> Result<Vec<SymbolRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         let mut stmt = conn
             .prepare(
@@ -520,7 +519,7 @@ impl Database {
 
     /// Get symbols for a file with enhanced data
     pub fn get_file_symbols(&self, file_id: i64) -> Result<Vec<SymbolRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         let mut stmt = conn
             .prepare(
@@ -570,7 +569,7 @@ impl Database {
 
     /// Get all files in the index
     pub fn get_all_files(&self) -> Result<Vec<FileRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let mut stmt = conn
             .prepare(
                 r#"
@@ -614,7 +613,7 @@ impl Database {
         embedding: &[f32],
         chunk_type: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let embedding_bytes: Vec<u8> = embedding
             .iter()
             .flat_map(|f| f.to_le_bytes())
@@ -637,7 +636,7 @@ impl Database {
         &self,
         embeddings: &[EmbeddingInput],
     ) -> Result<Vec<i64>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         let mut ids = Vec::with_capacity(embeddings.len());
 
@@ -690,7 +689,7 @@ impl Database {
 
     /// Get all embeddings for a specific file
     pub fn get_embeddings_for_file(&self, file_id: i64) -> Result<Vec<EmbeddingRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let mut stmt = conn
             .prepare(
                 r#"
@@ -732,7 +731,7 @@ impl Database {
 
     /// Get all embeddings in the database
     pub fn get_all_embeddings(&self) -> Result<Vec<EmbeddingRow>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let mut stmt = conn
             .prepare(
                 r#"
@@ -773,7 +772,7 @@ impl Database {
 
     /// Delete all embeddings for a specific file
     pub fn delete_embeddings_for_file(&self, file_id: i64) -> Result<u64> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let deleted = conn
             .execute("DELETE FROM embeddings WHERE file_id = ?1", params![file_id])
             .map_err(|e| Error::Storage(format!("Failed to delete embeddings: {}", e)))?;
@@ -782,7 +781,7 @@ impl Database {
 
     /// Get the count of embeddings in the database
     pub fn get_embedding_count(&self) -> Result<u64> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
             .map_err(|e| Error::Storage(format!("Failed to count embeddings: {}", e)))?;
@@ -832,7 +831,7 @@ impl Database {
 
     /// Get index statistics
     pub fn get_stats(&self) -> Result<IndexStats> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         let file_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
@@ -855,7 +854,7 @@ impl Database {
 
     /// Get extended index statistics including symbol breakdown
     pub fn get_extended_stats(&self) -> Result<ExtendedIndexStats> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let mut stats = ExtendedIndexStats::default();
 
         // Basic counts

@@ -4,6 +4,7 @@
 //! symbols, embeddings, and full-text search.
 
 pub mod cache;
+pub mod pool;
 pub mod sqlite;
 pub mod tantivy_index;
 
