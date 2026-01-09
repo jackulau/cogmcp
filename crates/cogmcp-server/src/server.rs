@@ -109,7 +109,7 @@ impl CogMcpServer {
         };
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::new(model_config)?));
-        let semantic = Arc::new(SemanticSearch::new(engine.clone(), db));
+        let semantic = Arc::new(SemanticSearch::new(engine.clone(), db, &config.cache));
 
         {
             let engine_guard = engine.lock();

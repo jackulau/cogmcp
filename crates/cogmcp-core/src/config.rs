@@ -595,10 +595,8 @@ impl Default for GitConfig {
 pub struct CacheConfig {
     /// Whether caching is enabled
     pub enabled: bool,
-    /// Maximum number of entries in the embedding cache
-    pub embedding_cache_capacity: usize,
-    /// Optional TTL for cached embeddings in seconds (None = no TTL)
-    pub embedding_cache_ttl_seconds: Option<u64>,
+    /// Maximum number of entries in the query embedding cache
+    pub query_cache_capacity: usize,
     /// TTL for query cache in seconds
     pub query_cache_ttl_seconds: u64,
 }
@@ -607,8 +605,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            embedding_cache_capacity: 10000,
-            embedding_cache_ttl_seconds: None,
+            query_cache_capacity: 1000,
             query_cache_ttl_seconds: 300,
         }
     }
@@ -674,6 +671,7 @@ mod tests {
         assert!(config.watching.enabled);
         assert_eq!(config.context.default_max_tokens, 8000);
         assert!(config.git.enabled);
+        assert!(config.cache.enabled);
     }
 
     #[test]
@@ -1035,5 +1033,13 @@ log_level = "warn"
         assert!(config.cache.enabled);
         assert!(config.cache.embedding_cache_ttl_seconds.is_none());
         assert_eq!(config.cache.query_cache_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn test_cache_config_defaults() {
+        let config = CacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.query_cache_capacity, 1000);
+        assert_eq!(config.query_cache_ttl_seconds, 300);
     }
 }

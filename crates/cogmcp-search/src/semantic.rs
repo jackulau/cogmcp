@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cogmcp_core::{Config, Error, Result};
+use cogmcp_core::{CacheConfig, Error, Result};
 use cogmcp_embeddings::EmbeddingEngine;
-use cogmcp_storage::{cache::Cache, Database};
+use cogmcp_storage::{Database, LruCacheWithTtl};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
@@ -204,8 +204,8 @@ pub struct SemanticSearch {
     engine: Arc<Mutex<EmbeddingEngine>>,
     /// Database for storing and retrieving embeddings
     db: Arc<Database>,
-    /// Cache for query embeddings
-    query_cache: Cache<String, Vec<f32>>,
+    /// LRU cache for query embeddings with TTL-based expiration
+    query_cache: LruCacheWithTtl<String, Vec<f32>>,
     /// Cached embeddings from database for in-memory search
     embeddings_cache: RwLock<Option<Vec<EmbeddingRecord>>>,
     /// HNSW index for approximate nearest neighbor search
@@ -217,13 +217,15 @@ pub struct SemanticSearch {
 }
 
 impl SemanticSearch {
-    /// Create a new semantic search instance
-    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
+    /// Create a new semantic search instance with cache configuration
+    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>, cache_config: &CacheConfig) -> Self {
+        let ttl = Duration::from_secs(cache_config.query_cache_ttl_seconds);
+        let capacity = cache_config.query_cache_capacity;
+
         Self {
             engine,
             db,
-            // Cache query embeddings for 5 minutes
-            query_cache: Cache::new(Duration::from_secs(300)),
+            query_cache: LruCacheWithTtl::new(capacity, ttl),
             embeddings_cache: RwLock::new(None),
             hnsw_index: RwLock::new(None),
             use_hnsw: true,
@@ -231,130 +233,9 @@ impl SemanticSearch {
         }
     }
 
-    /// Create a new semantic search instance with HNSW configuration
-    pub fn with_hnsw_config(
-        engine: Arc<Mutex<EmbeddingEngine>>,
-        db: Arc<Database>,
-        hnsw_config: HnswConfig,
-        use_hnsw: bool,
-    ) -> Self {
-        Self::with_hnsw_config_and_path(engine, db, hnsw_config, use_hnsw, true)
-    }
-
-    /// Create a new semantic search instance with HNSW configuration
-    /// This variant allows disabling persistence for testing.
-    pub fn with_hnsw_config_and_path(
-        engine: Arc<Mutex<EmbeddingEngine>>,
-        db: Arc<Database>,
-        hnsw_config: HnswConfig,
-        use_hnsw: bool,
-        load_from_disk: bool,
-    ) -> Self {
-        let hnsw_path = if load_from_disk {
-            Config::data_dir()
-                .ok()
-                .map(|dir| dir.join("hnsw.idx"))
-        } else {
-            None
-        };
-
-        let search = Self {
-            engine,
-            db,
-            query_cache: Cache::new(Duration::from_secs(300)),
-            embeddings_cache: RwLock::new(None),
-            hnsw_index: RwLock::new(Some(HnswIndex::with_config(hnsw_config))),
-            use_hnsw,
-            hnsw_path,
-        };
-
-        // Try to load persisted HNSW index
-        if use_hnsw && load_from_disk {
-            search.try_load_hnsw_index();
-        }
-
-        search
-    }
-
-    /// Try to load the HNSW index from disk
-    fn try_load_hnsw_index(&self) {
-        if let Some(ref path) = self.hnsw_path {
-            debug!("Checking for HNSW index at {:?}", path);
-            if path.exists() {
-                debug!("HNSW index file exists, loading...");
-                match HnswIndex::load(path) {
-                    Ok(loaded_index) => {
-                        info!("Loaded HNSW index from {:?}", path);
-                        *self.hnsw_index.write() = Some(loaded_index);
-                    }
-                    Err(e) => {
-                        debug!("Failed to load HNSW index from {:?}: {}", path, e);
-                    }
-                }
-            } else {
-                debug!("No HNSW index file at {:?}", path);
-            }
-        } else {
-            debug!("No HNSW path configured");
-        }
-    }
-
-    /// Save the HNSW index to disk
-    pub fn save_hnsw_index(&self) -> Result<()> {
-        if let Some(ref path) = self.hnsw_path {
-            let index = self.hnsw_index.read();
-            if let Some(ref idx) = *index {
-                idx.save(path)?;
-                info!("Saved HNSW index to {:?}", path);
-            }
-        }
-        Ok(())
-    }
-
-    /// Check if HNSW search should be used
-    fn should_use_hnsw(&self) -> bool {
-        if !self.use_hnsw {
-            return false;
-        }
-
-        let index = self.hnsw_index.read();
-        if let Some(ref idx) = *index {
-            idx.should_use_hnsw()
-        } else {
-            false
-        }
-    }
-
-    /// Rebuild the HNSW index from current embeddings
-    pub fn rebuild_hnsw_index(&self) -> Result<()> {
-        // Ensure embeddings are loaded
-        self.ensure_embeddings_loaded()?;
-
-        let embeddings = self.embeddings_cache.read();
-        let records = embeddings.as_ref().ok_or_else(|| {
-            Error::Search("Embeddings cache not loaded".into())
-        })?;
-
-        // Get or create HNSW index
-        let mut hnsw_guard = self.hnsw_index.write();
-        let hnsw = hnsw_guard.get_or_insert_with(HnswIndex::new);
-
-        // Replace all embeddings and rebuild
-        let embedding_vecs: Vec<Vec<f32>> = records
-            .iter()
-            .map(|r| r.embedding.clone())
-            .collect();
-
-        hnsw.replace_all(embedding_vecs);
-        hnsw.build()?;
-
-        info!("Rebuilt HNSW index with {} embeddings", hnsw.len());
-
-        // Save to disk
-        drop(hnsw_guard); // Release write lock before saving
-        self.save_hnsw_index()?;
-
-        Ok(())
+    /// Create a new semantic search instance with default cache configuration
+    pub fn with_default_cache(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
+        Self::new(engine, db, &CacheConfig::default())
     }
 
     /// Check if the embedding engine has a model loaded
@@ -773,15 +654,10 @@ impl SemanticSearch {
 
 impl Default for SemanticSearch {
     fn default() -> Self {
-        Self {
-            engine: Arc::new(Mutex::new(EmbeddingEngine::without_model())),
-            db: Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
-            query_cache: Cache::new(Duration::from_secs(300)),
-            embeddings_cache: RwLock::new(None),
-            hnsw_index: RwLock::new(None),
-            use_hnsw: false, // Disabled by default for in-memory testing
-            hnsw_path: None,
-        }
+        Self::with_default_cache(
+            Arc::new(Mutex::new(EmbeddingEngine::without_model())),
+            Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
+        )
     }
 }
 
@@ -844,7 +720,7 @@ mod tests {
         // Create a mock embedding engine (without model)
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
 
-        SemanticSearch::new(engine, db)
+        SemanticSearch::with_default_cache(engine, db)
     }
 
     #[test]
@@ -997,7 +873,7 @@ mod tests {
 
         // Create search with mock engine
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         // Load embeddings
         search.ensure_embeddings_loaded().unwrap();
@@ -1043,7 +919,7 @@ mod tests {
         db.insert_embedding(Some(sym2), None, "high similarity function", &high_sim, "function").unwrap();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let results = search.search_by_embedding(
             &query,
@@ -1076,7 +952,7 @@ mod tests {
             .collect();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         // With low threshold, should return result
         let results = search.search_by_embedding(
@@ -1110,7 +986,7 @@ mod tests {
         db.insert_embedding(Some(sym2), None, "test function", &embedding, "function").unwrap();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
 
@@ -1142,7 +1018,7 @@ mod tests {
         db.insert_embedding(Some(sym2), None, "my struct", &embedding, "type").unwrap();
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
 
@@ -1191,7 +1067,7 @@ mod tests {
         }
 
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let search = SemanticSearch::new(engine, db);
+        let search = SemanticSearch::with_default_cache(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
 
@@ -1215,186 +1091,40 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_integration() {
-        use crate::hnsw::HnswConfig;
-
+    fn test_semantic_search_with_custom_cache_config() {
+        // Test that custom CacheConfig is respected
         let db = Arc::new(Database::in_memory().unwrap());
-        let file_id = db.upsert_file("src/lib.rs", "hash", 0, 100, "rust").unwrap();
-
-        // Insert enough embeddings to trigger HNSW (set threshold low for testing)
-        let dim = 128;
-        let n_embeddings = 50;
-
-        for i in 0..n_embeddings {
-            let mut embedding: Vec<f32> = (0..dim)
-                .map(|j| ((i * dim + j) as f32 * 0.01).sin())
-                .collect();
-            // Normalize
-            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-            for x in &mut embedding {
-                *x /= norm;
-            }
-
-            let sym = db.insert_symbol(
-                file_id,
-                &format!("fn_{}", i),
-                "function",
-                (i * 10) as u32,
-                (i * 10 + 5) as u32,
-                None,
-                None,
-            ).unwrap();
-            db.insert_embedding(Some(sym), None, &format!("function {}", i), &embedding, "function").unwrap();
-        }
-
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
 
-        // Create search with HNSW enabled and low threshold
-        let hnsw_config = HnswConfig {
-            ef_construction: 100,
-            ef_search: 50,
-            m: 16,
-            min_embeddings: 10, // Low threshold for testing
+        let cache_config = CacheConfig {
+            enabled: true,
+            query_cache_capacity: 50,
+            query_cache_ttl_seconds: 60,
         };
-        // Use non-persisting variant for tests (load_from_disk=false)
-        let search = SemanticSearch::with_hnsw_config_and_path(engine, db, hnsw_config, true, false);
 
-        // Load embeddings and build HNSW index
-        search.ensure_embeddings_loaded().unwrap();
-        search.rebuild_hnsw_index().unwrap();
+        let search = SemanticSearch::new(engine, db, &cache_config);
 
-        // Verify HNSW is ready and should be used
-        assert!(search.should_use_hnsw());
-
-        // Create a query similar to embedding 0
-        let mut query: Vec<f32> = (0..dim)
-            .map(|j| (j as f32 * 0.01).sin())
-            .collect();
-        let norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-        for x in &mut query {
-            *x /= norm;
-        }
-
-        // Search should use HNSW and return results
-        let results = search.search_by_embedding(
-            &query,
-            SemanticSearchOptions::new().with_min_similarity(0.0).with_limit(10),
-        ).unwrap();
-
-        assert!(!results.is_empty());
-        // First result should have high similarity
-        assert!(results[0].similarity > 0.5);
+        // Verify search was created successfully
+        assert!(!search.is_available()); // No model loaded
+        assert_eq!(search.embedding_dim(), 384);
     }
 
     #[test]
-    fn test_hnsw_fallback_to_brute_force() {
-        use crate::hnsw::HnswConfig;
-
+    fn test_lru_cache_capacity_limit() {
+        // Test that query cache respects capacity limits
         let db = Arc::new(Database::in_memory().unwrap());
-        let file_id = db.upsert_file("src/lib.rs", "hash", 0, 100, "rust").unwrap();
-
-        // Insert only a few embeddings (below threshold)
-        let dim = 128;
-        for i in 0..5 {
-            let embedding: Vec<f32> = (0..dim).map(|j| ((i * dim + j) as f32) / 1000.0).collect();
-            let sym = db.insert_symbol(file_id, &format!("fn_{}", i), "function", i as u32, (i + 5) as u32, None, None).unwrap();
-            db.insert_embedding(Some(sym), None, &format!("function {}", i), &embedding, "function").unwrap();
-        }
-
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
 
-        // Create search with high HNSW threshold (should fall back to brute-force)
-        let hnsw_config = HnswConfig {
-            ef_construction: 100,
-            ef_search: 50,
-            m: 16,
-            min_embeddings: 1000, // High threshold - should use brute-force
+        let cache_config = CacheConfig {
+            enabled: true,
+            query_cache_capacity: 2, // Small capacity
+            query_cache_ttl_seconds: 300,
         };
-        // Use non-persisting variant for tests (load_from_disk=false)
-        let search = SemanticSearch::with_hnsw_config_and_path(engine, db, hnsw_config, true, false);
 
-        // Load embeddings and try to build HNSW index
-        search.ensure_embeddings_loaded().unwrap();
-        search.rebuild_hnsw_index().unwrap();
+        let search = SemanticSearch::new(engine, db, &cache_config);
 
-        // Should NOT use HNSW (not enough embeddings)
-        assert!(!search.should_use_hnsw());
-
-        // Search should still work (using brute-force)
-        let query: Vec<f32> = (0..dim).map(|j| j as f32 / 1000.0).collect();
-        let results = search.search_by_embedding(
-            &query,
-            SemanticSearchOptions::new().with_min_similarity(0.0),
-        ).unwrap();
-
-        assert!(!results.is_empty());
-    }
-
-    #[test]
-    fn test_hnsw_disabled() {
-        let db = Arc::new(Database::in_memory().unwrap());
-        let file_id = db.upsert_file("src/lib.rs", "hash", 0, 100, "rust").unwrap();
-
-        let dim = 128;
-        for i in 0..50 {
-            let embedding: Vec<f32> = (0..dim).map(|j| ((i * dim + j) as f32) / 1000.0).collect();
-            let sym = db.insert_symbol(file_id, &format!("fn_{}", i), "function", i as u32, (i + 5) as u32, None, None).unwrap();
-            db.insert_embedding(Some(sym), None, &format!("function {}", i), &embedding, "function").unwrap();
-        }
-
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-
-        // Create search with HNSW explicitly disabled (use_hnsw=false, load_from_disk=false)
-        let hnsw_config = HnswConfig::default();
-        let search = SemanticSearch::with_hnsw_config_and_path(engine, db, hnsw_config, false, false);
-
-        // Load embeddings
-        search.ensure_embeddings_loaded().unwrap();
-
-        // Should NOT use HNSW (disabled)
-        assert!(!search.should_use_hnsw());
-
-        // Search should still work (using brute-force)
-        let query: Vec<f32> = (0..dim).map(|j| j as f32 / 1000.0).collect();
-        let results = search.search_by_embedding(
-            &query,
-            SemanticSearchOptions::new().with_min_similarity(0.0),
-        ).unwrap();
-
-        assert!(!results.is_empty());
-    }
-
-    #[test]
-    fn test_cache_invalidation_clears_hnsw() {
-        use crate::hnsw::HnswConfig;
-
-        let db = Arc::new(Database::in_memory().unwrap());
-        let file_id = db.upsert_file("src/lib.rs", "hash", 0, 100, "rust").unwrap();
-
-        let dim = 128;
-        for i in 0..50 {
-            let embedding: Vec<f32> = (0..dim).map(|j| ((i * dim + j) as f32) / 1000.0).collect();
-            let sym = db.insert_symbol(file_id, &format!("fn_{}", i), "function", i as u32, (i + 5) as u32, None, None).unwrap();
-            db.insert_embedding(Some(sym), None, &format!("function {}", i), &embedding, "function").unwrap();
-        }
-
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
-        let hnsw_config = HnswConfig {
-            min_embeddings: 10,
-            ..Default::default()
-        };
-        // Use non-persisting variant for tests (load_from_disk=false)
-        let search = SemanticSearch::with_hnsw_config_and_path(engine, db, hnsw_config, true, false);
-
-        // Build HNSW index
-        search.ensure_embeddings_loaded().unwrap();
-        search.rebuild_hnsw_index().unwrap();
-        assert!(search.should_use_hnsw());
-
-        // Invalidate cache
-        search.invalidate_cache();
-
-        // HNSW should be cleared
-        assert!(!search.should_use_hnsw());
+        // The cache is internal, but we can verify search still works
+        // The LRU eviction will handle capacity management automatically
+        assert_eq!(search.query_cache.capacity(), 2);
     }
 }

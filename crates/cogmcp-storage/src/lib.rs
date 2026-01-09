@@ -8,6 +8,7 @@ pub mod lru_cache;
 pub mod sqlite;
 pub mod tantivy_index;
 
+pub use lru_cache::{LruCache, LruCacheWithTtl};
 pub use sqlite::{
     deserialize_parameters, deserialize_type_params, serialize_parameters, serialize_type_params,
     Database, EmbeddingInput, EmbeddingRow, ExtendedIndexStats, ExtendedSymbolMetadata, FileInsert,
