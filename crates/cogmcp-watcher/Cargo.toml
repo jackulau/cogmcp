@@ -6,8 +6,6 @@ license.workspace = true
 
 [dependencies]
 cogmcp-core = { workspace = true }
-cogmcp-storage = { workspace = true }
-cogmcp-index = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 tokio = { workspace = true }
@@ -16,3 +14,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
