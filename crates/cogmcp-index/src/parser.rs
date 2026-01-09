@@ -1610,6 +1610,7 @@ impl CodeParser {
         None
     }
 
+    #[allow(clippy::never_loop)]
     fn find_python_docstring(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
         // Look for string as first child of body
         let body = node.child_by_field_name("body")?;

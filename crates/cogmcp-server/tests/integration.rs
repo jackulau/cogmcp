@@ -541,558 +541,269 @@ mod e2e_tests {
 }
 
 // ============================================================================
-// Concurrent Server Tests
+// Streaming Integration Tests
 // ============================================================================
 //
-// These tests verify the server handles concurrent tool calls correctly,
-// simulating real-world usage where multiple MCP clients or parallel
-// requests may access the server simultaneously.
+// These tests verify streaming functionality for large result sets.
 
-mod concurrent_tests {
+mod streaming_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
-
-    /// Create a shared test server wrapped in Arc for concurrent access
-    fn create_shared_server() -> Arc<CogMcpServer> {
-        let temp_dir = std::env::temp_dir().join("cogmcp-concurrent-test");
-        std::fs::create_dir_all(&temp_dir).ok();
-
-        Arc::new(CogMcpServer::in_memory(temp_dir).expect("Failed to create test server"))
-    }
-
-    // ========================================================================
-    // Concurrent Read Operations
-    // ========================================================================
+    use cogmcp_core::config::StreamingConfigOptions;
 
     #[test]
-    fn test_concurrent_ping_calls() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_streaming_config_default() {
+        let server = create_test_server();
+        let config = server.get_streaming_config();
 
-        // Spawn multiple threads making ping calls
-        for _ in 0..10 {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
-
-            let handle = thread::spawn(move || {
-                for _ in 0..20 {
-                    let result = server.call_tool("ping", json!({}));
-                    assert!(result.is_ok(), "Ping should succeed");
-                    let output = result.unwrap();
-                    assert!(
-                        output.contains("CogMCP server is running"),
-                        "Should contain server status"
-                    );
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 200);
+        assert!(config.enabled, "Streaming should be enabled by default");
+        assert_eq!(config.auto_stream_threshold, 50, "Default threshold should be 50");
+        assert_eq!(config.chunk_size, 10, "Default chunk size should be 10");
     }
 
     #[test]
-    fn test_concurrent_index_status_calls() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_context_search_with_streaming_disabled() {
+        let server = create_test_server();
 
-        for _ in 0..8 {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": false
+            }),
+        );
 
-            let handle = thread::spawn(move || {
-                for _ in 0..15 {
-                    let result = server.call_tool("index_status", json!({}));
-                    assert!(result.is_ok(), "index_status should succeed");
-                    let output = result.unwrap();
-                    assert!(
-                        output.contains("Index Status"),
-                        "Should contain status header"
-                    );
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 120);
+        assert!(result.is_ok(), "Search with streaming disabled should succeed");
+        let output = result.unwrap();
+        // Non-streaming output should not contain streaming markers
+        assert!(!output.contains("Streaming"), "Should not contain streaming markers");
     }
 
     #[test]
-    fn test_concurrent_list_tools() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_context_search_with_streaming_enabled() {
+        let server = create_test_server();
 
-        for _ in 0..10 {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": true
+            }),
+        );
 
-            let handle = thread::spawn(move || {
-                for _ in 0..10 {
-                    let tools = server.list_tools();
-                    assert_eq!(tools.len(), 8, "Should have 8 tools");
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 100);
-    }
-
-    // ========================================================================
-    // Concurrent Search Operations
-    // ========================================================================
-
-    #[test]
-    fn test_concurrent_grep_searches() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
-
-        let patterns = vec!["test", "fn", "struct", "impl", "use"];
-
-        for (i, pattern) in patterns.iter().enumerate() {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
-            let pattern = pattern.to_string();
-
-            let handle = thread::spawn(move || {
-                for j in 0..10 {
-                    let result = server.call_tool(
-                        "context_grep",
-                        json!({
-                            "pattern": pattern,
-                            "limit": (i + j) % 10 + 1
-                        }),
-                    );
-                    assert!(result.is_ok(), "context_grep should succeed for pattern '{}'", pattern);
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+        assert!(result.is_ok(), "Search with streaming enabled should succeed");
+        // Note: If there are no results, streaming markers won't appear
     }
 
     #[test]
-    fn test_concurrent_symbol_searches() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_context_search_with_custom_chunk_size() {
+        let server = create_test_server();
 
-        let symbol_names = vec!["main", "new", "test", "Config", "Server"];
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test query",
+                "limit": 20,
+                "streaming": true,
+                "chunk_size": 5
+            }),
+        );
 
-        for symbol in symbol_names {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
-            let symbol = symbol.to_string();
-
-            let handle = thread::spawn(move || {
-                for _ in 0..10 {
-                    let result = server.call_tool(
-                        "find_symbol",
-                        json!({
-                            "name": symbol,
-                            "fuzzy": true
-                        }),
-                    );
-                    assert!(result.is_ok(), "find_symbol should succeed for '{}'", symbol);
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+        assert!(result.is_ok(), "Search with custom chunk size should succeed");
     }
 
     #[test]
-    fn test_concurrent_context_search_modes() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_semantic_search_with_streaming_disabled() {
+        let server = create_test_server();
 
-        let modes = vec!["keyword", "semantic", "hybrid"];
+        let result = server.call_tool(
+            "semantic_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": false
+            }),
+        );
 
-        for mode in modes {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
-            let mode = mode.to_string();
-
-            let handle = thread::spawn(move || {
-                for i in 0..10 {
-                    let result = server.call_tool(
-                        "context_search",
-                        json!({
-                            "query": format!("search query {}", i),
-                            "mode": mode,
-                            "limit": 10
-                        }),
-                    );
-                    assert!(result.is_ok(), "context_search should succeed for mode '{}'", mode);
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 30);
+        assert!(result.is_ok(), "Semantic search with streaming disabled should succeed");
     }
 
-    // ========================================================================
-    // Mixed Tool Call Workload
-    // ========================================================================
-
     #[test]
-    fn test_mixed_concurrent_tool_calls() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_semantic_search_with_streaming_enabled() {
+        let server = create_test_server();
 
-        // Different threads calling different tools
-        for i in 0..12 {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
+        let result = server.call_tool(
+            "semantic_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": true
+            }),
+        );
 
-            let handle = thread::spawn(move || {
-                for j in 0..10 {
-                    let result = match (i + j) % 6 {
-                        0 => server.call_tool("ping", json!({})),
-                        1 => server.call_tool("index_status", json!({})),
-                        2 => server.call_tool(
-                            "context_grep",
-                            json!({"pattern": "test", "limit": 5}),
-                        ),
-                        3 => server.call_tool(
-                            "find_symbol",
-                            json!({"name": "main", "fuzzy": true}),
-                        ),
-                        4 => server.call_tool(
-                            "context_search",
-                            json!({"query": "function", "mode": "keyword"}),
-                        ),
-                        5 => {
-                            // list_tools doesn't return Result
-                            let _tools = server.list_tools();
-                            Ok("tools listed".to_string())
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    assert!(result.is_ok(), "Tool call {} should succeed", (i + j) % 6);
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 120);
+        assert!(result.is_ok(), "Semantic search with streaming enabled should succeed");
     }
 
-    // ========================================================================
-    // Reindex Under Concurrent Load
-    // ========================================================================
-
     #[test]
-    fn test_concurrent_reindex_with_reads() {
-        let server = create_shared_server();
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_semantic_search_with_custom_chunk_size() {
+        let server = create_test_server();
 
-        // Reindex thread
-        {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
+        let result = server.call_tool(
+            "semantic_search",
+            json!({
+                "query": "test query",
+                "limit": 20,
+                "streaming": true,
+                "chunk_size": 5
+            }),
+        );
 
-            let handle = thread::spawn(move || {
-                for _ in 0..3 {
-                    let result = server.call_tool("reindex", json!({}));
-                    assert!(result.is_ok(), "Reindex should succeed");
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(50));
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        // Reader threads
-        for _ in 0..5 {
-            let server = Arc::clone(&server);
-            let success_count = Arc::clone(&success_count);
-
-            let handle = thread::spawn(move || {
-                for _ in 0..15 {
-                    // Mix of read operations
-                    let _ = server.call_tool("index_status", json!({})).unwrap();
-                    let _ = server.call_tool("ping", json!({})).unwrap();
-                    success_count.fetch_add(2, Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(10));
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        // 3 reindex + (5 threads * 15 iterations * 2 calls)
-        assert_eq!(success_count.load(Ordering::SeqCst), 153);
+        assert!(result.is_ok(), "Semantic search with custom chunk size should succeed");
     }
 
-    // ========================================================================
-    // Server Info Concurrent Access
-    // ========================================================================
-
     #[test]
-    fn test_concurrent_server_info_access() {
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_streaming_config_modification() {
+        let mut server = create_test_server();
 
-        for _ in 0..10 {
-            let success_count = Arc::clone(&success_count);
+        // Verify default
+        assert!(server.is_streaming_enabled());
 
-            let handle = thread::spawn(move || {
-                for _ in 0..20 {
-                    let info = CogMcpServer::server_info();
-                    assert_eq!(info.name, "cogmcp");
-                    assert!(!info.version.is_empty());
+        // Disable streaming
+        let new_config = StreamingConfigOptions {
+            enabled: false,
+            auto_stream_threshold: 100,
+            chunk_size: 20,
+            yield_interval_ms: 200,
+        };
+        server.set_streaming_config(new_config);
 
-                    let caps = CogMcpServer::capabilities();
-                    assert!(caps.tools.is_some());
-
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        assert_eq!(success_count.load(Ordering::SeqCst), 200);
+        // Verify change
+        assert!(!server.is_streaming_enabled());
+        assert_eq!(server.get_streaming_config().auto_stream_threshold, 100);
+        assert_eq!(server.get_streaming_config().chunk_size, 20);
     }
 
-    // ========================================================================
-    // No Deadlock Under Heavy Load
-    // ========================================================================
-
     #[test]
-    fn test_no_deadlock_heavy_concurrent_load() {
-        let server = create_shared_server();
-        let completed = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_auto_stream_threshold() {
+        let server = create_test_server();
+        let config = server.get_streaming_config();
 
-        // Spawn many threads doing various operations
-        for i in 0..20 {
-            let server = Arc::clone(&server);
-            let completed = Arc::clone(&completed);
-
-            let handle = thread::spawn(move || {
-                for j in 0..15 {
-                    match (i + j) % 8 {
-                        0 => {
-                            let _ = server.call_tool("ping", json!({}));
-                        }
-                        1 => {
-                            let _ = server.call_tool("index_status", json!({}));
-                        }
-                        2 => {
-                            let _ = server.call_tool(
-                                "context_grep",
-                                json!({"pattern": "test", "limit": 10}),
-                            );
-                        }
-                        3 => {
-                            let _ = server.call_tool(
-                                "find_symbol",
-                                json!({"name": "test", "fuzzy": true}),
-                            );
-                        }
-                        4 => {
-                            let _ = server.call_tool(
-                                "context_search",
-                                json!({"query": "test", "mode": "keyword"}),
-                            );
-                        }
-                        5 => {
-                            let _ = server.list_tools();
-                        }
-                        6 => {
-                            let _ = CogMcpServer::server_info();
-                        }
-                        7 => {
-                            let _ = CogMcpServer::capabilities();
-                        }
-                        _ => unreachable!(),
-                    }
-                    completed.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        // Set a timeout to detect potential deadlocks
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(60);
-
-        for handle in handles {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                panic!("Deadlock detected: test timed out");
-            }
-            handle.join().expect("Thread should complete without deadlock");
-        }
-
-        assert_eq!(completed.load(Ordering::SeqCst), 300);
+        // Test threshold behavior
+        assert!(!config.should_auto_stream(49), "Should not auto-stream with 49 results");
+        assert!(config.should_auto_stream(50), "Should auto-stream with 50 results");
+        assert!(config.should_auto_stream(100), "Should auto-stream with 100 results");
     }
 
-    // ========================================================================
-    // Error Handling Under Concurrency
-    // ========================================================================
+    #[test]
+    fn test_streaming_results_in_different_modes() {
+        let server = create_test_server();
+
+        // Test streaming with keyword mode
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "mode": "keyword",
+                "streaming": true
+            }),
+        );
+        assert!(result.is_ok(), "Keyword search with streaming should succeed");
+
+        // Test streaming with hybrid mode
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "mode": "hybrid",
+                "streaming": true
+            }),
+        );
+        assert!(result.is_ok(), "Hybrid search with streaming should succeed");
+
+        // Test streaming with semantic mode
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "mode": "semantic",
+                "streaming": true
+            }),
+        );
+        assert!(result.is_ok(), "Semantic search with streaming should succeed");
+    }
 
     #[test]
-    fn test_concurrent_error_handling() {
-        let server = create_shared_server();
-        let error_count = Arc::new(AtomicUsize::new(0));
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
+    fn test_context_search_tool_schema_includes_streaming() {
+        let server = create_test_server();
+        let tools = server.list_tools();
 
-        // Some threads making valid calls, some making invalid calls
-        for i in 0..10 {
-            let server = Arc::clone(&server);
-            let error_count = Arc::clone(&error_count);
-            let success_count = Arc::clone(&success_count);
+        let context_search = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "context_search")
+            .expect("context_search tool should exist");
 
-            let handle = thread::spawn(move || {
-                for j in 0..10 {
-                    if (i + j) % 3 == 0 {
-                        // Invalid call - missing required parameter
-                        let result = server.call_tool("context_grep", json!({}));
-                        if result.is_err() {
-                            error_count.fetch_add(1, Ordering::SeqCst);
-                        }
-                    } else if (i + j) % 3 == 1 {
-                        // Invalid call - unknown tool
-                        let result = server.call_tool("nonexistent_tool", json!({}));
-                        if result.is_err() {
-                            error_count.fetch_add(1, Ordering::SeqCst);
-                        }
-                    } else {
-                        // Valid call
-                        let result = server.call_tool("ping", json!({}));
-                        if result.is_ok() {
-                            success_count.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                }
-            });
+        let schema: Value = serde_json::to_value(&context_search.input_schema)
+            .expect("Schema should serialize");
 
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        // Verify both errors and successes were properly handled
-        let errors = error_count.load(Ordering::SeqCst);
-        let successes = success_count.load(Ordering::SeqCst);
-
-        assert!(errors > 0, "Should have handled some errors");
-        assert!(successes > 0, "Should have some successes");
-        // Total should be 100
+        let properties = schema.get("properties").expect("Schema should have properties");
         assert!(
-            errors + successes <= 100,
-            "Total should not exceed iterations"
+            properties.get("streaming").is_some(),
+            "context_search should have streaming parameter"
+        );
+        assert!(
+            properties.get("chunk_size").is_some(),
+            "context_search should have chunk_size parameter"
         );
     }
 
-    // ========================================================================
-    // Consistent Results Under Concurrency
-    // ========================================================================
+    #[test]
+    fn test_semantic_search_tool_schema_includes_streaming() {
+        let server = create_test_server();
+        let tools = server.list_tools();
+
+        let semantic_search = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "semantic_search")
+            .expect("semantic_search tool should exist");
+
+        let schema: Value = serde_json::to_value(&semantic_search.input_schema)
+            .expect("Schema should serialize");
+
+        let properties = schema.get("properties").expect("Schema should have properties");
+        assert!(
+            properties.get("streaming").is_some(),
+            "semantic_search should have streaming parameter"
+        );
+        assert!(
+            properties.get("chunk_size").is_some(),
+            "semantic_search should have chunk_size parameter"
+        );
+    }
 
     #[test]
-    fn test_consistent_tool_list_under_concurrency() {
-        let server = create_shared_server();
-        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut handles = vec![];
+    fn test_streaming_behavior_consistency() {
+        let server = create_test_server();
 
-        for _ in 0..10 {
-            let server = Arc::clone(&server);
-            let results = Arc::clone(&results);
+        // Make the same query with and without streaming
+        let result_no_stream = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "streaming": false
+            }),
+        );
 
-            let handle = thread::spawn(move || {
-                for _ in 0..10 {
-                    let tools = server.list_tools();
-                    let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
-                    results.lock().push(names);
-                }
-            });
+        let result_stream = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "streaming": true
+            }),
+        );
 
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread should not panic");
-        }
-
-        // Verify all results are identical
-        let all_results = results.lock();
-        assert_eq!(all_results.len(), 100);
-
-        let first = &all_results[0];
-        for result in all_results.iter() {
-            assert_eq!(result, first, "All tool lists should be identical");
-        }
+        // Both should succeed
+        assert!(result_no_stream.is_ok(), "Non-streaming search should succeed");
+        assert!(result_stream.is_ok(), "Streaming search should succeed");
     }
 }

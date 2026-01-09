@@ -7,9 +7,11 @@ pub mod cache;
 pub mod text;
 pub mod semantic;
 pub mod hybrid;
-pub mod hnsw;
+pub mod streaming;
 
 pub use cache::{CacheStats, SearchCache, SearchCacheConfig, make_cache_key, normalize_query};
 pub use hybrid::{HybridSearch, HybridSearchConfig, HybridSearchResult, MatchType, SearchMode};
 pub use semantic::{ChunkType, SemanticSearch, SemanticSearchOptions, SemanticSearchResult};
-pub use hnsw::{HnswConfig, HnswIndex, HnswSearchResult};
+pub use streaming::{
+    StreamingHybridSearch, StreamingSearchOptions, StreamingSemanticSearch, TopKHeap,
+};

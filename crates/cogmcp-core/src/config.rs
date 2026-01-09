@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
+use crate::streaming::StreamingConfig;
+
 /// Main configuration for CogMCP
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,7 +19,52 @@ pub struct Config {
     pub context: ContextConfig,
     pub git: GitConfig,
     pub search: SearchConfig,
-    pub pool: PoolConfig,
+    pub streaming: StreamingConfigOptions,
+}
+
+/// Streaming configuration options (stored in config files)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingConfigOptions {
+    /// Whether streaming is enabled by default
+    pub enabled: bool,
+    /// Minimum number of results to trigger automatic streaming
+    pub auto_stream_threshold: usize,
+    /// Number of results per chunk when streaming
+    pub chunk_size: usize,
+    /// Maximum time in milliseconds between yields
+    pub yield_interval_ms: u64,
+}
+
+impl Default for StreamingConfigOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_stream_threshold: 50,
+            chunk_size: 10,
+            yield_interval_ms: 100,
+        }
+    }
+}
+
+impl StreamingConfigOptions {
+    /// Convert to StreamingConfig for use in search operations
+    pub fn to_streaming_config(&self) -> StreamingConfig {
+        if self.enabled {
+            StreamingConfig {
+                chunk_size: self.chunk_size,
+                yield_interval_ms: self.yield_interval_ms,
+                enabled: self.enabled,
+            }
+        } else {
+            StreamingConfig::disabled()
+        }
+    }
+
+    /// Check if streaming should be auto-enabled based on result count
+    pub fn should_auto_stream(&self, result_count: usize) -> bool {
+        self.enabled && result_count >= self.auto_stream_threshold
+    }
 }
 
 impl Config {
@@ -488,5 +535,53 @@ mod tests {
         assert_eq!(config.cache.max_entries, 1000);
         assert_eq!(config.cache.result_ttl_secs, 300);
         assert_eq!(config.cache.embedding_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn test_streaming_config_defaults() {
+        let config = StreamingConfigOptions::default();
+        assert!(config.enabled);
+        assert_eq!(config.auto_stream_threshold, 50);
+        assert_eq!(config.chunk_size, 10);
+        assert_eq!(config.yield_interval_ms, 100);
+    }
+
+    #[test]
+    fn test_streaming_config_to_streaming_config() {
+        let options = StreamingConfigOptions::default();
+        let streaming_config = options.to_streaming_config();
+        assert!(streaming_config.enabled);
+        assert_eq!(streaming_config.chunk_size, 10);
+    }
+
+    #[test]
+    fn test_streaming_config_disabled() {
+        let options = StreamingConfigOptions {
+            enabled: false,
+            ..Default::default()
+        };
+        let streaming_config = options.to_streaming_config();
+        assert!(!streaming_config.enabled);
+    }
+
+    #[test]
+    fn test_should_auto_stream() {
+        let options = StreamingConfigOptions {
+            enabled: true,
+            auto_stream_threshold: 50,
+            ..Default::default()
+        };
+
+        assert!(!options.should_auto_stream(49));
+        assert!(options.should_auto_stream(50));
+        assert!(options.should_auto_stream(100));
+
+        // Disabled config should never auto-stream
+        let disabled = StreamingConfigOptions {
+            enabled: false,
+            auto_stream_threshold: 50,
+            ..Default::default()
+        };
+        assert!(!disabled.should_auto_stream(100));
     }
 }
