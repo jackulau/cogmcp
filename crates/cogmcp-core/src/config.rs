@@ -19,6 +19,21 @@ pub struct Config {
     pub context: ContextConfig,
     pub git: GitConfig,
     pub search: SearchConfig,
+    pub cache: CacheConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            indexing: IndexingConfig::default(),
+            watching: WatchingConfig::default(),
+            context: ContextConfig::default(),
+            git: GitConfig::default(),
+            search: SearchConfig::default(),
+            cache: CacheConfig::default(),
+        }
+    }
 }
 
 impl Config {
@@ -574,6 +589,31 @@ impl Default for GitConfig {
     }
 }
 
+/// Cache configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Whether caching is enabled
+    pub enabled: bool,
+    /// Maximum number of entries in the embedding cache
+    pub embedding_cache_capacity: usize,
+    /// Optional TTL for cached embeddings in seconds (None = no TTL)
+    pub embedding_cache_ttl_seconds: Option<u64>,
+    /// TTL for query cache in seconds
+    pub query_cache_ttl_seconds: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            embedding_cache_capacity: 10000,
+            embedding_cache_ttl_seconds: None,
+            query_cache_ttl_seconds: 300,
+        }
+    }
+}
+
 /// Search configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -946,5 +986,54 @@ log_level = "warn"
 
         shared.set_config_path(None);
         assert!(shared.config_path().is_none());
+    }
+
+    #[test]
+    fn test_cache_config_defaults() {
+        let config = CacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.embedding_cache_capacity, 10000);
+        assert!(config.embedding_cache_ttl_seconds.is_none());
+        assert_eq!(config.query_cache_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn test_config_includes_cache() {
+        let config = Config::default();
+        assert!(config.cache.enabled);
+        assert_eq!(config.cache.embedding_cache_capacity, 10000);
+    }
+
+    #[test]
+    fn test_cache_config_toml_parsing() {
+        let toml_str = r#"
+            [cache]
+            enabled = false
+            embedding_cache_capacity = 5000
+            embedding_cache_ttl_seconds = 600
+            query_cache_ttl_seconds = 120
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.cache.enabled);
+        assert_eq!(config.cache.embedding_cache_capacity, 5000);
+        assert_eq!(config.cache.embedding_cache_ttl_seconds, Some(600));
+        assert_eq!(config.cache.query_cache_ttl_seconds, 120);
+    }
+
+    #[test]
+    fn test_cache_config_partial_toml_parsing() {
+        let toml_str = r#"
+            [cache]
+            embedding_cache_capacity = 20000
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        // Specified value
+        assert_eq!(config.cache.embedding_cache_capacity, 20000);
+        // Defaults for unspecified values
+        assert!(config.cache.enabled);
+        assert!(config.cache.embedding_cache_ttl_seconds.is_none());
+        assert_eq!(config.cache.query_cache_ttl_seconds, 300);
     }
 }
