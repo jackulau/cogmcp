@@ -76,7 +76,7 @@ dirs = "5.0"
 once_cell = "1"
 num_cpus = "1.16"
 
-# Internal crates (cogmcp-* names used by crate Cargo.toml)
+# Internal crates
 cogmcp-core = { path = "crates/contextmcp-core" }
 cogmcp-storage = { path = "crates/contextmcp-storage" }
 cogmcp-index = { path = "crates/contextmcp-index" }
