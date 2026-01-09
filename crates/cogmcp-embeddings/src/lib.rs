@@ -30,6 +30,6 @@ pub mod inference;
 pub mod model;
 pub mod tokenizer;
 
-pub use inference::EmbeddingEngine;
+pub use inference::{EmbeddingEngine, DEFAULT_BATCH_SIZE};
 pub use model::{ModelConfig, ModelManager};
 pub use tokenizer::{BatchTokenizedInput, TokenizedInput, Tokenizer};
