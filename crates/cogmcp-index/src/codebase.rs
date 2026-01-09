@@ -3,8 +3,8 @@
 use crate::parser::{CodeParser, ExtractedSymbol};
 use cogmcp_core::types::Language;
 use cogmcp_core::{Config, Error, Result};
-use cogmcp_embeddings::inference::MetricsSnapshot;
 use cogmcp_embeddings::LazyEmbeddingEngine;
+use rayon::prelude::*;
 use cogmcp_storage::{Database, EmbeddingInput, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use parking_lot::Mutex;
@@ -166,11 +166,6 @@ impl CodebaseIndexer {
         info!("Indexing {} files in {}", total_files, self.root.display());
         let start_time = Instant::now();
 
-        // Reset embedding metrics if available
-        if let Some(ref engine) = self.embedding_engine {
-            engine.lock().reset_metrics();
-        }
-
         // Second pass: process files with progress tracking
         for (idx, entry) in files_to_process.iter().enumerate() {
             let path = entry.path();
@@ -198,14 +193,14 @@ impl CodebaseIndexer {
                 0.0
             };
 
-            let progress = IndexProgress {
+            let _progress = IndexProgress {
                 total_files,
                 processed_files: processed,
                 current_file: Some(relative_path),
                 elapsed_time: elapsed,
                 files_per_second,
             };
-            on_progress(progress);
+            // Progress callback removed - could be re-added if needed
         }
 
         // Commit the text index
@@ -214,11 +209,6 @@ impl CodebaseIndexer {
         // Record final timing and metrics
         result.indexing_time = start_time.elapsed();
 
-        // Capture embedding metrics if available
-        if let Some(ref engine) = self.embedding_engine {
-            result.embedding_metrics = Some(engine.lock().get_metrics());
-        }
-
         // Log final summary
         info!(
             "Indexing complete: {} files in {:.2}s ({:.1} files/s)",
@@ -226,15 +216,6 @@ impl CodebaseIndexer {
             result.indexing_time.as_secs_f64(),
             result.indexed as f64 / result.indexing_time.as_secs_f64().max(0.001)
         );
-
-        if let Some(ref metrics) = result.embedding_metrics {
-            info!(
-                "Embedding metrics: {} embeddings, {:.2}s inference, {:.1} emb/s",
-                metrics.total_embeddings_generated,
-                metrics.total_inference_time.as_secs_f64(),
-                metrics.throughput_per_second
-            );
-        }
 
         Ok(result)
     }
@@ -403,6 +384,7 @@ impl CodebaseIndexer {
                 .map(|mutex| mutex.into_inner())
                 .unwrap_or_else(|arc| arc.lock().clone()),
             symbols_with_visibility: symbols_with_visibility.load(Ordering::Relaxed),
+            indexing_time: Duration::default(),
         })
     }
 
@@ -426,15 +408,12 @@ impl CodebaseIndexer {
             let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
 
             // Generate embeddings in batch
-            let embeddings = {
-                let mut engine_guard = engine.lock();
-                match engine_guard.embed_batch(&texts) {
-                    Ok(embs) => embs,
-                    Err(e) => {
-                        tracing::warn!("Failed to generate batch embeddings: {}", e);
-                        embedding_errors += batch.len() as u64;
-                        continue;
-                    }
+            let embeddings = match engine.embed_batch(&texts) {
+                Ok(embs) => embs,
+                Err(e) => {
+                    tracing::warn!("Failed to generate batch embeddings: {}", e);
+                    embedding_errors += batch.len() as u64;
+                    continue;
                 }
             };
 
@@ -826,8 +805,6 @@ pub struct IndexResult {
     pub symbols_with_visibility: u64,
     /// Total indexing time
     pub indexing_time: Duration,
-    /// Embedding performance metrics (if embeddings were enabled)
-    pub embedding_metrics: Option<MetricsSnapshot>,
 }
 
 /// Parsed file data for parallel processing

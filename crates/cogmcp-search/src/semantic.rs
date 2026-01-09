@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use cogmcp_core::{Error, Result};
 use cogmcp_embeddings::{EmbeddingEngine, LazyEmbeddingEngine};
+use cogmcp_storage::lru_cache::LruCacheWithTtl;
 use cogmcp_storage::Database;
-use futures::{stream, Stream};
+use futures::{stream, Stream, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
@@ -223,9 +224,9 @@ impl SemanticSearch {
             engine,
             db,
             // Cache query embeddings for 5 minutes (legacy cache, kept for backward compat)
-            query_cache: Cache::new(Duration::from_secs(300)),
+            query_cache: LruCacheWithTtl::new(100, Duration::from_secs(300)),
             embeddings_cache: RwLock::new(None),
-            search_cache: Arc::new(SearchCache::new(cache_config)),
+            search_cache: Arc::new(SearchCache::new(SearchCacheConfig::default())),
         }
     }
 
@@ -280,7 +281,7 @@ impl SemanticSearch {
     fn search_uncached(&self, query: &str, options: &SemanticSearchOptions) -> Result<Vec<SemanticSearchResult>> {
         // Get query embedding using the search cache for embeddings
         let query_embedding = self.search_cache.get_or_compute_embedding(query, || {
-            self.engine.lock().embed(query)
+            self.engine.embed(query)
         })?;
 
         // Search with the embedding
@@ -306,14 +307,9 @@ impl SemanticSearch {
         // Load embeddings from database if not cached
         self.ensure_embeddings_loaded()?;
 
-        // Decide whether to use HNSW or brute-force search
-        if self.should_use_hnsw() {
-            debug!("Using HNSW approximate nearest neighbor search");
-            self.search_by_embedding_hnsw(query_embedding, options)
-        } else {
-            debug!("Using brute-force cosine similarity search");
-            self.search_by_embedding_brute_force(query_embedding, options)
-        }
+        // Use brute-force cosine similarity search
+        debug!("Using brute-force cosine similarity search");
+        self.search_by_embedding_brute_force(query_embedding, options)
     }
 
     /// Search using HNSW approximate nearest neighbor index
