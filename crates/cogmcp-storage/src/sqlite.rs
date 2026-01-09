@@ -843,6 +843,21 @@ impl Database {
         Ok(results)
     }
 
+    /// Get symbols by file path
+    pub fn get_symbols_by_file(&self, file_path: &str) -> Result<Vec<SymbolRow>> {
+        // First get the file ID
+        let file = self.get_file_by_path(file_path)?;
+        match file {
+            Some(f) => self.get_file_symbols(f.id),
+            None => Ok(vec![]),
+        }
+    }
+
+    /// List all indexed files (alias for get_all_files)
+    pub fn list_files(&self) -> Result<Vec<FileRow>> {
+        self.get_all_files()
+    }
+
     /// Get all files in the index
     pub fn get_all_files(&self) -> Result<Vec<FileRow>> {
         let conn = self.pool.get()?;
