@@ -8,4 +8,4 @@ pub mod semantic;
 pub mod hybrid;
 
 pub use hybrid::{HybridSearch, HybridSearchConfig, HybridSearchResult, MatchType, SearchMode};
-pub use semantic::{ChunkType, SemanticSearch, SemanticSearchOptions, SemanticSearchResult};
+pub use semantic::{ChunkInput, ChunkType, SemanticSearch, SemanticSearchOptions, SemanticSearchResult};
