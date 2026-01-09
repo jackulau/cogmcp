@@ -296,181 +296,53 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_to_onnx_inputs() {
-        // Create a batch with 2 sequences, each of length 3
+    fn test_batch_tokenized_input_non_empty() {
+        let batch = BatchTokenizedInput {
+            input_ids: vec![1, 2, 3, 4],
+            attention_mask: vec![1, 1, 1, 1],
+            token_type_ids: vec![0, 0, 0, 0],
+            batch_size: 2,
+            seq_length: 2,
+        };
+        assert!(!batch.is_empty());
+        assert_eq!(batch.batch_size, 2);
+        assert_eq!(batch.seq_length, 2);
+    }
+
+    #[test]
+    fn test_tokenized_input_empty() {
+        let input = TokenizedInput {
+            input_ids: vec![],
+            attention_mask: vec![],
+            token_type_ids: vec![],
+        };
+        assert!(input.is_empty());
+        assert_eq!(input.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_flattened_structure() {
+        // Test that batch data is flattened correctly
+        // Simulating 2 sequences of length 3 each
         let batch = BatchTokenizedInput {
             input_ids: vec![1, 2, 3, 4, 5, 6],
-            attention_mask: vec![1, 1, 1, 1, 1, 0],
+            attention_mask: vec![1, 1, 1, 1, 1, 0], // Second sequence padded
             token_type_ids: vec![0, 0, 0, 0, 0, 0],
             batch_size: 2,
-            max_length: 3,
+            seq_length: 3,
         };
 
-        let (input_ids, attention_mask, token_type_ids) = batch.to_onnx_inputs().unwrap();
+        // Verify we can access elements correctly
+        assert_eq!(batch.input_ids.len(), batch.batch_size * batch.seq_length);
+        assert_eq!(batch.attention_mask.len(), batch.batch_size * batch.seq_length);
+        assert_eq!(batch.token_type_ids.len(), batch.batch_size * batch.seq_length);
 
-        // Check shapes
-        assert_eq!(input_ids.shape(), &[2, 3]);
-        assert_eq!(attention_mask.shape(), &[2, 3]);
-        assert_eq!(token_type_ids.shape(), &[2, 3]);
+        // First sequence: [1, 2, 3], all attended
+        assert_eq!(&batch.input_ids[0..3], &[1, 2, 3]);
+        assert_eq!(&batch.attention_mask[0..3], &[1, 1, 1]);
 
-        // Check values for first sequence
-        assert_eq!(input_ids[[0, 0]], 1);
-        assert_eq!(input_ids[[0, 1]], 2);
-        assert_eq!(input_ids[[0, 2]], 3);
-
-        // Check values for second sequence
-        assert_eq!(input_ids[[1, 0]], 4);
-        assert_eq!(input_ids[[1, 1]], 5);
-        assert_eq!(input_ids[[1, 2]], 6);
-
-        // Check attention mask shows padding in second sequence
-        assert_eq!(attention_mask[[0, 0]], 1);
-        assert_eq!(attention_mask[[0, 1]], 1);
-        assert_eq!(attention_mask[[0, 2]], 1);
-        assert_eq!(attention_mask[[1, 0]], 1);
-        assert_eq!(attention_mask[[1, 1]], 1);
-        assert_eq!(attention_mask[[1, 2]], 0); // Padding
-    }
-
-    #[test]
-    fn test_batch_to_onnx_inputs_empty() {
-        let batch = BatchTokenizedInput {
-            input_ids: vec![],
-            attention_mask: vec![],
-            token_type_ids: vec![],
-            batch_size: 0,
-            max_length: 0,
-        };
-
-        let (input_ids, attention_mask, token_type_ids) = batch.to_onnx_inputs().unwrap();
-
-        assert_eq!(input_ids.shape(), &[0, 0]);
-        assert_eq!(attention_mask.shape(), &[0, 0]);
-        assert_eq!(token_type_ids.shape(), &[0, 0]);
-    }
-
-    #[test]
-    fn test_batch_attention_masks() {
-        // Create a batch with 2 sequences, max_length 4
-        // First sequence: all real tokens [1, 1, 1, 1]
-        // Second sequence: 2 real tokens + 2 padding [1, 1, 0, 0]
-        let batch = BatchTokenizedInput {
-            input_ids: vec![1, 2, 3, 4, 5, 6, 0, 0],
-            attention_mask: vec![1, 1, 1, 1, 1, 1, 0, 0],
-            token_type_ids: vec![0, 0, 0, 0, 0, 0, 0, 0],
-            batch_size: 2,
-            max_length: 4,
-        };
-
-        let masks = batch.attention_masks();
-
-        assert_eq!(masks.len(), 2);
-        assert_eq!(masks[0], vec![1, 1, 1, 1]);
-        assert_eq!(masks[1], vec![1, 1, 0, 0]);
-    }
-
-    #[test]
-    fn test_batch_attention_masks_empty() {
-        let batch = BatchTokenizedInput {
-            input_ids: vec![],
-            attention_mask: vec![],
-            token_type_ids: vec![],
-            batch_size: 0,
-            max_length: 0,
-        };
-
-        let masks = batch.attention_masks();
-        assert!(masks.is_empty());
-    }
-
-    #[test]
-    fn test_batch_variable_length_sequences() {
-        // Simulate a batch where sequences have different original lengths
-        // but are padded to the same length
-        // Sequence 1: 5 tokens (full)
-        // Sequence 2: 3 tokens (2 padding)
-        // Sequence 3: 1 token (4 padding)
-        let batch = BatchTokenizedInput {
-            input_ids: vec![
-                1, 2, 3, 4, 5, // seq 1: 5 tokens
-                6, 7, 8, 0, 0, // seq 2: 3 tokens + 2 padding
-                9, 0, 0, 0, 0, // seq 3: 1 token + 4 padding
-            ],
-            attention_mask: vec![
-                1, 1, 1, 1, 1, // seq 1: all real
-                1, 1, 1, 0, 0, // seq 2: 3 real, 2 padding
-                1, 0, 0, 0, 0, // seq 3: 1 real, 4 padding
-            ],
-            token_type_ids: vec![0; 15],
-            batch_size: 3,
-            max_length: 5,
-        };
-
-        // Test to_onnx_inputs
-        let (input_ids, attention_mask, _) = batch.to_onnx_inputs().unwrap();
-
-        assert_eq!(input_ids.shape(), &[3, 5]);
-        assert_eq!(attention_mask.shape(), &[3, 5]);
-
-        // Verify attention mask correctly identifies real tokens vs padding
-        // Sequence 1
-        for i in 0..5 {
-            assert_eq!(attention_mask[[0, i]], 1, "seq 1, pos {}", i);
-        }
-        // Sequence 2
-        for i in 0..3 {
-            assert_eq!(attention_mask[[1, i]], 1, "seq 2, pos {}", i);
-        }
-        for i in 3..5 {
-            assert_eq!(attention_mask[[1, i]], 0, "seq 2, pos {} (padding)", i);
-        }
-        // Sequence 3
-        assert_eq!(attention_mask[[2, 0]], 1, "seq 3, pos 0");
-        for i in 1..5 {
-            assert_eq!(attention_mask[[2, i]], 0, "seq 3, pos {} (padding)", i);
-        }
-
-        // Test attention_masks method
-        let masks = batch.attention_masks();
-        assert_eq!(masks.len(), 3);
-        assert_eq!(masks[0], vec![1, 1, 1, 1, 1]);
-        assert_eq!(masks[1], vec![1, 1, 1, 0, 0]);
-        assert_eq!(masks[2], vec![1, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn test_batch_padding_token_used() {
-        // Test that the padding token ID is used correctly
-        // Using a custom padding token (e.g., 99)
-        let padding_token_id = 99;
-        let batch = BatchTokenizedInput {
-            input_ids: vec![
-                1, 2, 3, padding_token_id, padding_token_id, // seq 1: 3 real + 2 padding
-                4, 5, padding_token_id, padding_token_id, padding_token_id, // seq 2: 2 real + 3 padding
-            ],
-            attention_mask: vec![
-                1, 1, 1, 0, 0, // seq 1
-                1, 1, 0, 0, 0, // seq 2
-            ],
-            token_type_ids: vec![0; 10],
-            batch_size: 2,
-            max_length: 5,
-        };
-
-        let (input_ids, attention_mask, _) = batch.to_onnx_inputs().unwrap();
-
-        // Verify padding positions have the padding token ID
-        assert_eq!(input_ids[[0, 3]], padding_token_id);
-        assert_eq!(input_ids[[0, 4]], padding_token_id);
-        assert_eq!(input_ids[[1, 2]], padding_token_id);
-        assert_eq!(input_ids[[1, 3]], padding_token_id);
-        assert_eq!(input_ids[[1, 4]], padding_token_id);
-
-        // Verify attention mask is 0 for padding
-        assert_eq!(attention_mask[[0, 3]], 0);
-        assert_eq!(attention_mask[[0, 4]], 0);
-        assert_eq!(attention_mask[[1, 2]], 0);
-        assert_eq!(attention_mask[[1, 3]], 0);
-        assert_eq!(attention_mask[[1, 4]], 0);
+        // Second sequence: [4, 5, 6], last token padded (mask=0)
+        assert_eq!(&batch.input_ids[3..6], &[4, 5, 6]);
+        assert_eq!(&batch.attention_mask[3..6], &[1, 1, 0]);
     }
 }
