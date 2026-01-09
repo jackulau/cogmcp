@@ -1,12 +1,13 @@
 //! Codebase file indexing
 
-use crate::parallel_indexer::{ParallelIndexConfig, ParallelIndexer, ProgressReport};
 use crate::parser::{CodeParser, ExtractedSymbol};
 use cogmcp_core::types::Language;
 use cogmcp_core::{Config, Error, Result};
+use cogmcp_embeddings::inference::MetricsSnapshot;
 use cogmcp_embeddings::LazyEmbeddingEngine;
-use cogmcp_storage::{Database, FullTextIndex};
+use cogmcp_storage::{Database, EmbeddingInput, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -163,6 +164,7 @@ impl CodebaseIndexer {
 
         let total_files = files_to_process.len();
         info!("Indexing {} files in {}", total_files, self.root.display());
+        let start_time = Instant::now();
 
         // Reset embedding metrics if available
         if let Some(ref engine) = self.embedding_engine {

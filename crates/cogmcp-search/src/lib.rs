@@ -4,6 +4,7 @@
 //! semantic search with embeddings, and hybrid search combining both.
 
 pub mod cache;
+pub mod hnsw;
 pub mod text;
 pub mod semantic;
 pub mod hybrid;

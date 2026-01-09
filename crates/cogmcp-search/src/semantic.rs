@@ -12,14 +12,14 @@ use std::time::Duration;
 
 use cogmcp_core::{Error, Result};
 use cogmcp_embeddings::{EmbeddingEngine, LazyEmbeddingEngine};
-use cogmcp_storage::{cache::Cache, Database};
+use cogmcp_storage::Database;
+use futures::{stream, Stream};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
 
-use crate::hnsw::{HnswConfig, HnswIndex};
-
 use crate::cache::{CacheStats, SearchCache, SearchCacheConfig, make_cache_key};
+use crate::hnsw::{HnswConfig, HnswIndex};
 
 /// Chunk type for categorizing search results
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

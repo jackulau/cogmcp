@@ -297,6 +297,40 @@ impl Database {
         Ok(())
     }
 
+    /// Migration to add quantized embedding columns
+    /// This handles both fresh installs (no-op) and upgrades gracefully.
+    fn migrate_embeddings_quantization(&self) -> Result<()> {
+        let conn = self.pool.get()?;
+
+        // Check if migration is needed by looking for one of the new columns
+        let needs_migration: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('embeddings') WHERE name = 'embedding_quantized'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count == 0)
+            .unwrap_or(true);
+
+        if !needs_migration {
+            return Ok(());
+        }
+
+        // Add new columns one by one (SQLite doesn't support ADD COLUMN in batch)
+        let migrations = [
+            "ALTER TABLE embeddings ADD COLUMN embedding_quantized BLOB",
+            "ALTER TABLE embeddings ADD COLUMN embedding_min REAL",
+            "ALTER TABLE embeddings ADD COLUMN embedding_scale REAL",
+        ];
+
+        for migration in migrations {
+            // Ignore errors for columns that already exist
+            let _ = conn.execute(migration, []);
+        }
+
+        Ok(())
+    }
+
     /// Execute a query with a connection from the pool
     pub fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
@@ -462,7 +496,7 @@ impl Database {
         // Delete embeddings
         let _ = self.delete_embeddings_for_file(file_id);
         // Delete the file record
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])
             .map_err(|e| Error::Storage(format!("Failed to delete file: {}", e)))?;
         Ok(())
@@ -820,7 +854,7 @@ impl Database {
         &self,
         embeddings: &[QuantizedEmbeddingInput],
     ) -> Result<Vec<i64>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
 
         let mut ids = Vec::with_capacity(embeddings.len());
 
@@ -985,7 +1019,7 @@ impl Database {
 
     /// Get file IDs that already have embeddings
     pub fn get_file_ids_with_embeddings(&self) -> Result<std::collections::HashSet<i64>> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let mut stmt = conn
             .prepare("SELECT DISTINCT file_id FROM embeddings WHERE file_id IS NOT NULL")
             .map_err(|e| Error::Storage(format!("Failed to prepare statement: {}", e)))?;
@@ -1000,7 +1034,7 @@ impl Database {
 
     /// Check if a specific file has embeddings
     pub fn file_has_embeddings(&self, file_id: i64) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.pool.get()?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM embeddings WHERE file_id = ?1 LIMIT 1",

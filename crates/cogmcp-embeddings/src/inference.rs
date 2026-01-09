@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use ndarray::Array2;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tracing::{debug, info};
@@ -276,18 +277,18 @@ impl EmbeddingEngine {
 
     /// Create a new embedding engine with a custom batch size
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size.max(1);
+        self.config.batch_size = batch_size.max(1);
         self
     }
 
     /// Get the current batch size
     pub fn batch_size(&self) -> usize {
-        self.batch_size
+        self.config.batch_size
     }
 
     /// Set the batch size for batch inference operations
     pub fn set_batch_size(&mut self, batch_size: usize) {
-        self.batch_size = batch_size.max(1);
+        self.config.batch_size = batch_size.max(1);
     }
 
     /// Create an embedding engine without a model (for testing)
@@ -353,8 +354,7 @@ impl EmbeddingEngine {
                 Error::Embedding("Model not loaded. Call ensure_model_available() first.".into())
             })?;
 
-            let inputs = ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor]
-                .map_err(|e| Error::Embedding(format!("Failed to create inputs: {}", e)))?;
+            let inputs = ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor];
 
             let outputs = session
                 .run(inputs)
@@ -364,15 +364,11 @@ impl EmbeddingEngine {
             let output_value = outputs.iter().next()
                 .ok_or_else(|| Error::Embedding("No output tensor found".into()))?;
 
-            let tensor_view = output_value.1
+            let (shape, data) = output_value.1
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
-            let shape = tensor_view.shape().to_vec();
-
-            let shape = tensor_view.shape();
 
             // Get dimensions: should be [1, seq_len, hidden_dim]
-            let shape = tensor_view.shape();
             if shape.len() != 3 {
                 return Err(Error::Embedding(format!(
                     "Expected 3D output tensor, got {}D with shape {:?}",
@@ -381,9 +377,9 @@ impl EmbeddingEngine {
                 )));
             }
 
-            let hidden_dim = shape[2];
+            let hidden_dim = shape[2] as usize;
             // Copy the data to owned Vec before dropping outputs
-            let raw_data: Vec<f32> = tensor_view.iter().cloned().collect();
+            let raw_data: Vec<f32> = data.iter().cloned().collect();
             (hidden_dim, raw_data)
         };
 
@@ -521,8 +517,8 @@ impl EmbeddingEngine {
             let item_data = &raw_data[start..end];
 
             // Get attention mask for this item
-            let mask_start = i * batch_input.seq_length;
-            let mask_end = mask_start + batch_input.seq_length;
+            let mask_start = i * batch_input.max_length;
+            let mask_end = mask_start + batch_input.max_length;
             let attention_mask = &batch_input.attention_mask[mask_start..mask_end];
 
             // Apply mean pooling
@@ -547,7 +543,7 @@ impl EmbeddingEngine {
         batch_input: &BatchTokenizedInput,
     ) -> Result<(Tensor<i64>, Tensor<i64>, Tensor<i64>)> {
         let batch_size = batch_input.batch_size;
-        let seq_len = batch_input.seq_length;
+        let seq_len = batch_input.max_length;
 
         // Create 2D arrays with shape [batch_size, seq_len]
         let input_ids: Array2<i64> =
@@ -571,11 +567,6 @@ impl EmbeddingEngine {
             .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
 
         Ok((input_ids_tensor, attention_mask_tensor, token_type_ids_tensor))
-    }
-
-    /// Get the configured batch size
-    pub fn batch_size(&self) -> usize {
-        self.config.batch_size
     }
 
     /// Apply mean pooling to get sentence embeddings from flattened output

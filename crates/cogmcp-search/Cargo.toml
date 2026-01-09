@@ -19,3 +19,6 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+lru = "0.12"
+rayon = { workspace = true }
+instant-distance = "0.6"
