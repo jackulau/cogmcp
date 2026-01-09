@@ -4,9 +4,11 @@
 
 pub mod runner;
 pub mod server;
+pub mod status;
 pub mod tools;
 pub mod transport;
 
 pub use runner::{RunnerConfig, ServerRunner};
 pub use server::CogMcpServer;
+pub use status::ServerStatus;
 pub use transport::StdioTransport;

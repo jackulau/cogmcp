@@ -1,6 +1,7 @@
 //! Main MCP server implementation
 
-use cogmcp_core::{ActionableError, Config, ErrorCode, Result};
+use crate::status::ServerStatus;
+use cogmcp_core::{Config, Result};
 use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
@@ -38,6 +39,8 @@ pub struct CogMcpServer {
     pub parser: Arc<CodeParser>,
     pub embedding_engine: Option<Arc<Mutex<EmbeddingEngine>>>,
     pub semantic_search: Option<Arc<SemanticSearch>>,
+    /// Server runtime status tracking
+    pub status: Arc<ServerStatus>,
 }
 
 impl CogMcpServer {
@@ -70,6 +73,7 @@ impl CogMcpServer {
             parser,
             embedding_engine,
             semantic_search,
+            status: Arc::new(ServerStatus::new()),
         })
     }
 
@@ -88,6 +92,7 @@ impl CogMcpServer {
             parser,
             embedding_engine: None,
             semantic_search: None,
+            status: Arc::new(ServerStatus::new()),
         })
     }
 
@@ -288,6 +293,11 @@ impl CogMcpServer {
                     "required": ["query"]
                 }),
             ),
+            make_tool(
+                "server_status",
+                "Get the server runtime status including uptime, request counts, and tool usage statistics",
+                json!({ "type": "object", "properties": {} }),
+            ),
         ]
     }
 
@@ -296,8 +306,8 @@ impl CogMcpServer {
         &self,
         name: &str,
         arguments: serde_json::Value,
-    ) -> std::result::Result<String, ActionableError> {
-        match name {
+    ) -> std::result::Result<String, String> {
+        let result = match name {
             "ping" => Ok(self.ping()),
             "context_grep" => {
                 let pattern = arguments["pattern"]
@@ -388,15 +398,17 @@ impl CogMcpServer {
                 let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
                 self.semantic_search(&query, limit)
             }
-            _ => Err(format_error(
-                &format!("Unknown tool: '{}'", name),
-                &[
-                    "Available tools: ping, context_grep, context_search, find_symbol, get_file_outline, index_status, reindex, semantic_search",
-                    "Check the tool name spelling",
-                    "Use ping to verify server connectivity",
-                ],
-            )),
+            "server_status" => Ok(self.server_status()),
+            _ => Err(format!("Unknown tool: {}", name)),
+        };
+
+        // Track the call in status
+        match &result {
+            Ok(_) => self.status.record_tool_call(name),
+            Err(_) => self.status.record_error(name),
         }
+
+        result
     }
 
     // Tool implementations
@@ -959,6 +971,11 @@ impl CogMcpServer {
                 ],
             ),
         }
+    }
+
+    /// Get server runtime status
+    fn server_status(&self) -> String {
+        self.status.format_status()
     }
 }
 
