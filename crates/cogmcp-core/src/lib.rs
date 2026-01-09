@@ -9,6 +9,7 @@ pub mod error;
 pub mod streaming;
 pub mod types;
 
+pub use actionable_error::ActionableError;
 pub use config::{Config, ReloadResult, SearchConfig, SharedConfig};
 pub use error::{Error, Result};
 pub use streaming::{ResultStream, StreamChunk, StreamingConfig, StreamingResult};

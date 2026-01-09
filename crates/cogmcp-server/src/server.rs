@@ -1,8 +1,14 @@
 //! Main MCP server implementation
 
+use crate::{
+    FormattedResult, StreamingConfig, StreamingFormatter,
+    StreamingResponseBuilder, StreamingThreshold,
+};
 use cogmcp_context::{ContextPrioritizer, prioritizer::PriorityWeights};
-use cogmcp_core::{Config, Result};
+use crate::status::ServerStatus;
+use cogmcp_core::{ActionableError, Config, Result, config::SharedConfig, actionable_error::ErrorCode};
 use cogmcp_embeddings::{LazyEmbeddingEngine, ModelConfig};
+use cogmcp_watcher::{FileDebouncer, FilePrioritizer, FileWatcher};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
 use cogmcp_storage::{Database, FullTextIndex, PoolConfig};
@@ -72,6 +78,7 @@ pub struct ScoreBreakdown {
     pub relevance: f32,
     pub centrality: f32,
     pub git_activity: f32,
+    pub user_focus: f32,
     pub total: f32,
 }
 
@@ -104,6 +111,19 @@ pub struct CogMcpServer {
     pub prioritizer: Option<Arc<FilePrioritizer>>,
     /// File debouncer for Warm-tier files
     pub debouncer: Option<Arc<FileDebouncer>>,
+    /// Streaming configuration
+    pub streaming_config: StreamingConfig,
+    /// Server status tracking
+    pub status: Arc<ServerStatus>,
+}
+
+/// Helper function to format errors consistently with suggestions
+fn format_error(message: &str, suggestions: &[&str]) -> String {
+    let mut output = format!("Error: {}\n\nSuggestions:\n", message);
+    for suggestion in suggestions {
+        output.push_str(&format!("- {}\n", suggestion));
+    }
+    output
 }
 
 impl CogMcpServer {
@@ -155,6 +175,10 @@ impl CogMcpServer {
             (None, None, None)
         };
 
+        let shared_config = SharedConfig::new(config);
+        let streaming_config = StreamingConfig::default();
+        let status = Arc::new(ServerStatus::new());
+
         Ok(Self {
             root,
             shared_config,
@@ -166,6 +190,8 @@ impl CogMcpServer {
             watcher,
             prioritizer,
             debouncer,
+            streaming_config,
+            status,
         })
     }
 
@@ -174,13 +200,20 @@ impl CogMcpServer {
         self.shared_config.get()
     }
 
+    /// Get the streaming configuration
+    pub fn get_streaming_config(&self) -> &StreamingConfig {
+        &self.streaming_config
+    }
+
     /// Create a server with in-memory storage (for testing)
     pub fn in_memory(root: PathBuf) -> Result<Self> {
-        let shared_config = SharedConfig::default();
+        let config = Config::default();
+        let shared_config = SharedConfig::new(config);
         let db = Arc::new(Database::in_memory()?);
         let text_index = Arc::new(FullTextIndex::in_memory()?);
         let parser = Arc::new(CodeParser::new());
-        let streaming_config = config.streaming.clone();
+        let streaming_config = StreamingConfig::default();
+        let status = Arc::new(ServerStatus::new());
 
         Ok(Self {
             root,
@@ -193,6 +226,8 @@ impl CogMcpServer {
             watcher: None,
             prioritizer: None,
             debouncer: None,
+            streaming_config,
+            status,
         })
     }
 
@@ -307,12 +342,12 @@ impl CogMcpServer {
         let indexer = if let Some(ref engine) = self.embedding_engine {
             CodebaseIndexer::with_embedding_engine(
                 self.root.clone(),
-                self.config.clone(),
+                self.config(),
                 self.parser.clone(),
                 engine.clone(),
             )?
         } else {
-            CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone())?
+            CodebaseIndexer::new(self.root.clone(), self.config(), self.parser.clone())?
         };
 
         // Index the single file
@@ -530,7 +565,7 @@ impl CogMcpServer {
                     })?
                     .to_string();
                 let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
-                self.context_grep(&pattern, limit)
+                Ok(self.context_grep(&pattern, limit))
             }
             "context_search" => {
                 let query = arguments["query"]
@@ -567,12 +602,12 @@ impl CogMcpServer {
                 let kind = arguments["kind"].as_str().map(|s| s.to_string());
                 let visibility = arguments["visibility"].as_str().map(|s| s.to_string());
                 let fuzzy = arguments["fuzzy"].as_bool().unwrap_or(false);
-                self.find_symbol_with_visibility(
+                Ok(self.find_symbol_with_visibility(
                     &name,
                     kind.as_deref(),
                     visibility.as_deref(),
                     fuzzy,
-                )
+                ))
             }
             "get_file_outline" => {
                 let file_path = arguments["file_path"]
@@ -587,10 +622,10 @@ impl CogMcpServer {
                         )
                     })?
                     .to_string();
-                self.get_file_outline(&file_path)
+                self.get_file_outline(&file_path).map_err(|e| e.message)
             }
-            "index_status" => self.index_status(),
-            "reindex" => self.reindex(),
+            "index_status" => self.index_status().map_err(|e| e.message),
+            "reindex" => Ok(self.reindex()),
             "semantic_search" => {
                 let query = arguments["query"]
                     .as_str()
@@ -608,41 +643,6 @@ impl CogMcpServer {
                 let streaming = arguments["streaming"].as_bool();
                 let chunk_size = arguments["chunk_size"].as_u64().map(|s| s as usize);
                 Ok(self.semantic_search_with_streaming(&query, limit, streaming, chunk_size))
-            }
-            "get_relevant_context" => {
-                let query = arguments["query"].as_str().map(|s| s.to_string());
-                let paths: Vec<String> = arguments["paths"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let limit = arguments["limit"].as_u64().unwrap_or(20) as usize;
-                let min_score = arguments["min_score"].as_f64().unwrap_or(0.1) as f32;
-                let include_content = arguments["include_content"].as_bool().unwrap_or(false);
-
-                // Parse custom weights if provided
-                let weights = if let Some(w) = arguments["weights"].as_object() {
-                    Some(CustomWeights {
-                        recency: w.get("recency").and_then(|v| v.as_f64()).map(|v| v as f32),
-                        relevance: w.get("relevance").and_then(|v| v.as_f64()).map(|v| v as f32),
-                        centrality: w.get("centrality").and_then(|v| v.as_f64()).map(|v| v as f32),
-                        git_activity: w.get("git_activity").and_then(|v| v.as_f64()).map(|v| v as f32),
-                    })
-                } else {
-                    None
-                };
-
-                Ok(self.get_relevant_context(
-                    query.as_deref(),
-                    &paths,
-                    limit,
-                    min_score,
-                    include_content,
-                    weights,
-                ))
             }
             "get_relevant_context" => {
                 let query = arguments["query"].as_str().map(|s| s.to_string());
@@ -674,6 +674,34 @@ impl CogMcpServer {
     }
 
     // Tool implementations
+
+    /// Check if the index is ready and return an error message if not
+    fn check_index_status(&self) -> Option<String> {
+        match self.db.get_stats() {
+            Ok(stats) => {
+                if stats.file_count == 0 {
+                    Some(format_error(
+                        "Index is empty - no files have been indexed yet.",
+                        &[
+                            "Run `reindex` to index the codebase",
+                            "Ensure the root directory contains code files",
+                            "Check that file patterns in config include your files",
+                        ],
+                    ))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(format_error(
+                "Failed to access index database.",
+                &[
+                    &format!("Error details: {}", e),
+                    "Check if the database file exists",
+                    "Try running `reindex` to rebuild the index",
+                ],
+            )),
+        }
+    }
 
     fn ping(&self) -> String {
         format!(
@@ -711,7 +739,7 @@ impl CogMcpServer {
                         hit.content.trim()
                     ));
                 }
-                Ok(output)
+                output
             }
             Err(e) => format_error(
                 "Search operation failed.",
@@ -737,6 +765,8 @@ impl CogMcpServer {
         streaming: Option<bool>,
         chunk_size: Option<usize>,
     ) -> String {
+        let current_config = self.config();
+
         // Use configured default mode if not specified
         let mode_str = if mode.is_empty() {
             &current_config.search.default_mode
@@ -779,7 +809,7 @@ impl CogMcpServer {
 
                 // Determine if streaming should be used
                 let use_streaming = streaming.unwrap_or_else(|| {
-                    self.streaming_config.should_auto_stream(results.len())
+                    self.config().streaming.should_auto_stream(results.len())
                 });
 
                 let mode_info = if search.has_semantic() {
@@ -828,7 +858,7 @@ impl CogMcpServer {
         results: &[cogmcp_search::HybridSearchResult],
         chunk_size: Option<usize>,
     ) -> String {
-        let chunk_size = chunk_size.unwrap_or(self.streaming_config.chunk_size);
+        let chunk_size = chunk_size.unwrap_or(self.config().streaming.chunk_size);
         let total = results.len();
 
         let mut output = header.to_string();
@@ -850,6 +880,43 @@ impl CogMcpServer {
                 output.push_str(&format!(" (score: {:.2}, type: {:?})\n", hit.score, hit.match_type));
                 output.push_str("```\n");
                 output.push_str(&hit.content);
+                output.push_str("\n```\n\n");
+            }
+        }
+
+        output.push_str("_Streaming complete._\n");
+        output
+    }
+
+    /// Format semantic search results with streaming-style chunked output
+    fn format_semantic_streaming_results(
+        &self,
+        header: &str,
+        results: &[cogmcp_search::SemanticSearchResult],
+        chunk_size: Option<usize>,
+    ) -> String {
+        let chunk_size = chunk_size.unwrap_or(self.config().streaming.chunk_size);
+        let total = results.len();
+
+        let mut output = header.to_string();
+        output.push_str(&format!("_Streaming {} results in chunks of {}..._\n\n", total, chunk_size));
+
+        for (i, chunk) in results.chunks(chunk_size).enumerate() {
+            let chunk_start = i * chunk_size + 1;
+            let chunk_end = (chunk_start + chunk.len() - 1).min(total);
+            let progress = (chunk_end as f32 / total as f32 * 100.0) as u32;
+
+            output.push_str(&format!("### Chunk {}-{} of {} ({}% complete)\n\n",
+                chunk_start, chunk_end, total, progress));
+
+            for result in chunk {
+                output.push_str(&format!("#### `{}`", result.path));
+                if let Some(line) = result.start_line {
+                    output.push_str(&format!(":{}", line));
+                }
+                output.push_str(&format!(" (similarity: {:.2}, type: {:?})\n", result.similarity, result.chunk_type));
+                output.push_str("```\n");
+                output.push_str(&result.chunk_text);
                 output.push_str("\n```\n\n");
             }
         }
@@ -969,7 +1036,7 @@ impl CogMcpServer {
                         output.push_str(&format!("  Returns: `{}`\n", ret_type));
                     }
                 }
-                Ok(output)
+                output
             }
             Err(e) => format_error(
                 "Symbol search failed.",
@@ -989,23 +1056,21 @@ impl CogMcpServer {
         let content = match std::fs::read_to_string(&full_path) {
             Ok(c) => c,
             Err(e) => {
-                let suggestions: Vec<&str> =
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        vec![
-                            "Check that the path is relative to the project root",
-                            "Verify the file exists in the repository",
-                            "Use `context_grep` to search for the file name",
-                        ]
-                    } else {
-                        vec![
-                            "Check file permissions",
-                            "Ensure the file is not locked by another process",
-                        ]
-                    };
-                return format_error(
-                    &format!("Cannot read file: {} ({})", file_path, e),
-                    &suggestions,
-                );
+                let (code, suggestions) = if e.kind() == std::io::ErrorKind::NotFound {
+                    (ErrorCode::FileNotFound, vec![
+                        "Check that the path is relative to the project root".to_string(),
+                        "Verify the file exists in the repository".to_string(),
+                        "Use `context_grep` to search for the file name".to_string(),
+                    ])
+                } else {
+                    (ErrorCode::FileUnreadable, vec![
+                        "Check file permissions".to_string(),
+                        "Ensure the file is not locked by another process".to_string(),
+                    ])
+                };
+                return Err(ActionableError::new(code, format!("Cannot read file: {} ({})", file_path, e))
+                    .with_suggestions(suggestions)
+                    .with_cause(e.to_string()));
             }
         };
 
@@ -1018,17 +1083,14 @@ impl CogMcpServer {
         match self.parser.parse(&content, language) {
             Ok(symbols) => {
                 if symbols.is_empty() {
-                    return format_error(
-                        &format!("No symbols found in '{}'.", file_path),
-                        &[
-                            &format!(
-                                "File extension '{}' may not have symbol extraction support",
-                                ext
-                            ),
-                            "Supported: .rs, .py, .js, .ts, .go, .java, .c, .cpp, .rb",
-                            "Try `context_grep` to search file contents instead",
-                        ],
-                    );
+                    return Err(ActionableError::new(
+                        ErrorCode::SymbolNotFound,
+                        format!("No symbols found in '{}'.", file_path),
+                    ).with_suggestions(vec![
+                        format!("File extension '{}' may not have symbol extraction support", ext),
+                        "Supported: .rs, .py, .js, .ts, .go, .java, .c, .cpp, .rb".to_string(),
+                        "Try `context_grep` to search file contents instead".to_string(),
+                    ]));
                 }
                 let mut output = String::new();
                 output.push_str(&format!("## Outline: {}\n\n", file_path));
@@ -1086,14 +1148,14 @@ impl CogMcpServer {
                 }
                 Ok(output)
             }
-            Err(e) => format_error(
-                &format!("Failed to parse file: {}", file_path),
-                &[
-                    &format!("Parse error: {}", e),
-                    "Check that the file contains valid syntax",
-                    "The file may have unsupported language features",
-                ],
-            ),
+            Err(e) => Err(ActionableError::new(
+                ErrorCode::InternalError,
+                format!("Failed to parse file: {}", file_path),
+            ).with_suggestions(vec![
+                format!("Parse error: {}", e),
+                "Check that the file contains valid syntax".to_string(),
+                "The file may have unsupported language features".to_string(),
+            ]).with_cause(e.to_string())),
         }
     }
 
@@ -1161,16 +1223,16 @@ impl CogMcpServer {
                     output.push_str(&format!("- Index version: {}\n", cache_stats.index_version));
                 }
 
-                output
+                Ok(output)
             }
-            Err(e) => format_error(
+            Err(e) => Err(ActionableError::new(
+                ErrorCode::InternalError,
                 "Failed to retrieve index statistics.",
-                &[
-                    &format!("Error details: {}", e),
-                    "Run `reindex` to rebuild the index",
-                    "Check disk space and file permissions",
-                ],
-            ),
+            ).with_suggestions(vec![
+                format!("Error details: {}", e),
+                "Run `reindex` to rebuild the index".to_string(),
+                "Check disk space and file permissions".to_string(),
+            ]).with_cause(e.to_string())),
         }
     }
 
@@ -1214,7 +1276,7 @@ impl CogMcpServer {
                         }
                     }
 
-                    Ok(output)
+                    output
                 }
                 Err(e) => format_error(
                     "Indexing operation failed.",
@@ -1287,7 +1349,7 @@ impl CogMcpServer {
 
                 // Determine if streaming should be used
                 let use_streaming = streaming.unwrap_or_else(|| {
-                    self.streaming_config.should_auto_stream(results.len())
+                    self.config().streaming.should_auto_stream(results.len())
                 });
 
                 let header = format!("## Semantic search results for: {}\n\n", query);
@@ -1315,14 +1377,15 @@ impl CogMcpServer {
                     output
                 }
             }
-            Err(e) => {
-                let action_noun = if validate_only { "validation" } else { "reload" };
-                format!(
-                    "## Configuration {} failed\n\n**Error:** {}\n\n\
-                     The previous configuration remains active.",
-                    action_noun, e
-                )
-            }
+            Err(e) => format_error(
+                "Semantic search failed.",
+                &[
+                    &format!("Error details: {}", e),
+                    "Try a different search query",
+                    "Check `index_status` to verify embeddings exist",
+                    "Run `reindex` if the index is corrupted",
+                ],
+            ),
         }
     }
 
@@ -1405,6 +1468,7 @@ impl CogMcpServer {
                     centrality: centrality_score,
                     git_activity: git_activity_score,
                     user_focus: user_focus_score,
+                    total: total_score,
                 };
 
                 (file.path.clone(), total_score, breakdown)
@@ -1509,16 +1573,6 @@ impl CogMcpServer {
     }
 }
 
-/// Score breakdown for debugging and transparency
-#[derive(Debug, Clone)]
-struct ScoreBreakdown {
-    recency: f32,
-    relevance: f32,
-    centrality: f32,
-    git_activity: f32,
-    user_focus: f32,
-}
-
 /// MCP ServerHandler implementation
 impl ServerHandler for CogMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -1565,23 +1619,12 @@ impl ServerHandler for CogMcpServer {
                 meta: None,
                 structured_content: None,
             }),
-            Err(actionable_error) => {
-                // Build metadata with error details for programmatic handling
-                let mut meta_obj = serde_json::Map::new();
-                meta_obj.insert("errorCode".to_string(), json!(actionable_error.code.code()));
-                meta_obj.insert("suggestions".to_string(), json!(actionable_error.suggestions));
-                if let Some(cause) = &actionable_error.cause {
-                    meta_obj.insert("cause".to_string(), json!(cause));
-                }
-                let meta = Some(rmcp::model::Meta(meta_obj));
-
-                Ok(CallToolResult {
-                    content: vec![Content::text(actionable_error.to_user_message())],
-                    is_error: Some(true),
-                    meta,
-                    structured_content: None,
-                })
-            }
+            Err(error_message) => Ok(CallToolResult {
+                content: vec![Content::text(error_message)],
+                is_error: Some(true),
+                meta: None,
+                structured_content: None,
+            }),
         }
     }
 }

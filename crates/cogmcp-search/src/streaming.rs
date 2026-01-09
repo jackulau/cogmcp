@@ -388,8 +388,9 @@ mod tests {
     use parking_lot::Mutex;
 
     fn create_test_semantic_search() -> Arc<SemanticSearch> {
+        use cogmcp_embeddings::{LazyEmbeddingEngine, ModelConfig};
         let db = Arc::new(Database::in_memory().unwrap());
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         Arc::new(SemanticSearch::new(engine, db))
     }
 
@@ -609,7 +610,8 @@ mod tests {
         let sym3 = db.insert_symbol(file_id, "high_fn", "function", 20, 25, None, None).unwrap();
         db.insert_embedding(Some(sym3), None, "high similarity function", &high_sim, "function").unwrap();
 
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        use cogmcp_embeddings::{LazyEmbeddingEngine, ModelConfig};
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let semantic_search = Arc::new(SemanticSearch::new(engine, db.clone()));
 
         (db, semantic_search)
@@ -766,9 +768,10 @@ mod tests {
 
     #[test]
     fn test_semantic_search_streaming_method() {
+        use cogmcp_embeddings::{LazyEmbeddingEngine, ModelConfig};
         // Test that SemanticSearch has the search_streaming method
         let db = Arc::new(Database::in_memory().unwrap());
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let semantic = SemanticSearch::new(engine, db);
 
         // Just verify the method exists and returns the right type

@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod response_builder;
 pub mod runner;
 pub mod server;
+pub mod status;
 pub mod streaming;
 pub mod tools;
 pub mod transport;

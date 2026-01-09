@@ -20,6 +20,7 @@ pub struct Config {
     pub git: GitConfig,
     pub search: SearchConfig,
     pub streaming: StreamingConfigOptions,
+    pub pool: PoolConfig,
 }
 
 /// Streaming configuration options (stored in config files)

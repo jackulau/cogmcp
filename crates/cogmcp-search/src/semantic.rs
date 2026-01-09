@@ -309,79 +309,7 @@ impl SemanticSearch {
 
         // Use brute-force cosine similarity search
         debug!("Using brute-force cosine similarity search");
-        self.search_by_embedding_brute_force(query_embedding, options)
-    }
-
-    /// Search using HNSW approximate nearest neighbor index
-    fn search_by_embedding_hnsw(
-        &self,
-        query_embedding: &[f32],
-        options: SemanticSearchOptions,
-    ) -> Result<Vec<SemanticSearchResult>> {
-        let embeddings = self.embeddings_cache.read();
-        let records = embeddings.as_ref().ok_or_else(|| {
-            Error::Search("Embeddings cache not loaded".into())
-        })?;
-
-        let hnsw_guard = self.hnsw_index.read();
-        let hnsw = hnsw_guard.as_ref().ok_or_else(|| {
-            Error::Search("HNSW index not available".into())
-        })?;
-
-        // Request more results from HNSW to account for filtering
-        // We request 3x the limit to handle filtering, then take the top N
-        let hnsw_limit = options.limit * 3;
-        let hnsw_results = hnsw.search_with_threshold(
-            query_embedding,
-            hnsw_limit,
-            options.min_similarity,
-        )?;
-
-        // Map HNSW results back to records and apply additional filters
-        let results: Vec<SemanticSearchResult> = hnsw_results
-            .into_iter()
-            .filter_map(|hnsw_result| {
-                let record = records.get(hnsw_result.index)?;
-
-                // Apply file filter if specified
-                if let Some(ref patterns) = options.file_filter {
-                    if let Some(ref path) = record.file_path {
-                        let matches = patterns.iter().any(|pattern| {
-                            path.contains(pattern) || glob_match(pattern, path)
-                        });
-                        if !matches {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-
-                // Apply chunk type filter if specified
-                if let Some(ref types) = options.chunk_types {
-                    let chunk_type = ChunkType::from_str(&record.chunk_type);
-                    if !types.contains(&chunk_type) {
-                        return None;
-                    }
-                }
-
-                Some(SemanticSearchResult {
-                    path: record.file_path.clone().unwrap_or_default(),
-                    chunk_text: record.chunk_text.clone(),
-                    similarity: hnsw_result.similarity,
-                    chunk_type: ChunkType::from_str(&record.chunk_type),
-                    start_line: record.start_line,
-                    end_line: record.end_line,
-                    symbol_id: record.symbol_id,
-                    context: None,
-                })
-            })
-            .take(options.limit)
-            .collect();
-
-        // Results from HNSW are already sorted by similarity
-        debug!("HNSW search returned {} results", results.len());
-        Ok(results)
+        self.search_by_embedding_brute_force(query_embedding, options.clone())
     }
 
     /// Search using brute-force cosine similarity
@@ -409,8 +337,8 @@ impl SemanticSearch {
                 // Apply file filter if specified
                 if let Some(ref patterns) = options.file_filter {
                     if let Some(ref path) = record.file_path {
-                        let matches = patterns.iter().any(|pattern| {
-                            path.contains(pattern) || glob_match(pattern, path)
+                        let matches = patterns.iter().any(|pattern: &String| {
+                            path.contains(pattern.as_str()) || glob_match(pattern, path)
                         });
                         if !matches {
                             return None;
@@ -666,7 +594,7 @@ impl SemanticSearch {
         let texts: Vec<&str> = chunks.iter().map(|c| c.chunk_text.as_str()).collect();
 
         // Generate embeddings in batch
-        let embeddings = self.engine.lock().embed_batch_optimized(&texts, batch_size)?;
+        let embeddings = self.engine.embed_batch(&texts)?;
 
         // Prepare inputs for batch database insertion
         let inputs: Vec<cogmcp_storage::EmbeddingInput> = chunks
@@ -714,7 +642,7 @@ impl SemanticSearch {
         let texts: Vec<&str> = chunks.iter().map(|c| c.chunk_text.as_str()).collect();
 
         // Generate embeddings using parallel batch processing
-        let embeddings = self.engine.lock().embed_large_batch(&texts, batch_size)?;
+        let embeddings = self.engine.embed_batch(&texts)?;
 
         // Prepare inputs for batch database insertion
         let inputs: Vec<cogmcp_storage::EmbeddingInput> = chunks
@@ -745,7 +673,6 @@ impl Default for SemanticSearch {
         Self::new(
             Arc::new(LazyEmbeddingEngine::new(ModelConfig::default())),
             Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
-            SearchCacheConfig::default(),
         )
     }
 }
