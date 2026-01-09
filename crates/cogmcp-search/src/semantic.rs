@@ -13,6 +13,8 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
+use crate::cache::{CacheStats, SearchCache, SearchCacheConfig, make_cache_key};
+
 /// Chunk type for categorizing search results
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChunkType {
@@ -112,7 +114,7 @@ impl SemanticSearchOptions {
 }
 
 /// Semantic search result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SemanticSearchResult {
     /// File path containing the match
     pub path: String,
@@ -161,17 +163,29 @@ pub struct SemanticSearch {
     query_cache: Cache<String, Vec<f32>>,
     /// Cached embeddings from database for in-memory search
     embeddings_cache: RwLock<Option<Vec<EmbeddingRecord>>>,
+    /// Multi-level search cache for results and embeddings
+    search_cache: Arc<SearchCache>,
 }
 
 impl SemanticSearch {
     /// Create a new semantic search instance
     pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
+        Self::with_cache_config(engine, db, SearchCacheConfig::default())
+    }
+
+    /// Create a new semantic search instance with custom cache configuration
+    pub fn with_cache_config(
+        engine: Arc<Mutex<EmbeddingEngine>>,
+        db: Arc<Database>,
+        cache_config: SearchCacheConfig,
+    ) -> Self {
         Self {
             engine,
             db,
-            // Cache query embeddings for 5 minutes
+            // Cache query embeddings for 5 minutes (legacy cache, kept for backward compat)
             query_cache: Cache::new(Duration::from_secs(300)),
             embeddings_cache: RwLock::new(None),
+            search_cache: Arc::new(SearchCache::new(cache_config)),
         }
     }
 
@@ -198,11 +212,24 @@ impl SemanticSearch {
         query: &str,
         options: SemanticSearchOptions,
     ) -> Result<Vec<SemanticSearchResult>> {
-        // Get query embedding (from cache or compute)
-        let query_embedding = self.get_or_compute_embedding(query)?;
+        // Create cache key from query and options
+        let cache_key = make_cache_key(query, options.limit, options.min_similarity);
+
+        // Use search cache for results
+        self.search_cache.get_or_compute_results(&cache_key, || {
+            self.search_uncached(query, &options)
+        })
+    }
+
+    /// Perform search without caching (internal implementation)
+    fn search_uncached(&self, query: &str, options: &SemanticSearchOptions) -> Result<Vec<SemanticSearchResult>> {
+        // Get query embedding using the search cache for embeddings
+        let query_embedding = self.search_cache.get_or_compute_embedding(query, || {
+            self.engine.lock().embed(query)
+        })?;
 
         // Search with the embedding
-        self.search_by_embedding(&query_embedding, options)
+        self.search_by_embedding_internal(&query_embedding, options)
     }
 
     /// Search using a pre-computed embedding vector
@@ -211,6 +238,15 @@ impl SemanticSearch {
         &self,
         query_embedding: &[f32],
         options: SemanticSearchOptions,
+    ) -> Result<Vec<SemanticSearchResult>> {
+        self.search_by_embedding_internal(query_embedding, &options)
+    }
+
+    /// Internal search using a pre-computed embedding vector
+    fn search_by_embedding_internal(
+        &self,
+        query_embedding: &[f32],
+        options: &SemanticSearchOptions,
     ) -> Result<Vec<SemanticSearchResult>> {
         // Load embeddings from database if not cached
         self.ensure_embeddings_loaded()?;
@@ -278,23 +314,6 @@ impl SemanticSearch {
 
         debug!("Semantic search returned {} results", results.len());
         Ok(results)
-    }
-
-    /// Get or compute embedding for a query string
-    fn get_or_compute_embedding(&self, query: &str) -> Result<Vec<f32>> {
-        // Check cache first
-        if let Some(cached) = self.query_cache.get(&query.to_string()) {
-            debug!("Using cached embedding for query");
-            return Ok(cached);
-        }
-
-        // Compute embedding
-        let embedding = self.engine.lock().embed(query)?;
-
-        // Cache the result
-        self.query_cache.insert(query.to_string(), embedding.clone());
-
-        Ok(embedding)
     }
 
     /// Ensure embeddings are loaded from the database
@@ -371,6 +390,18 @@ impl SemanticSearch {
         let mut cache = self.embeddings_cache.write();
         *cache = None;
         self.query_cache.clear();
+        // Also invalidate search cache on index change
+        self.search_cache.invalidate_on_index_change();
+    }
+
+    /// Get cache statistics for monitoring
+    pub fn cache_stats(&self) -> CacheStats {
+        self.search_cache.stats()
+    }
+
+    /// Get the search cache for external use
+    pub fn search_cache(&self) -> &Arc<SearchCache> {
+        &self.search_cache
     }
 
     /// Index text and store its embedding
@@ -398,9 +429,10 @@ impl SemanticSearch {
 
 impl Default for SemanticSearch {
     fn default() -> Self {
-        Self::new(
+        Self::with_cache_config(
             Arc::new(Mutex::new(EmbeddingEngine::without_model())),
             Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
+            SearchCacheConfig::default(),
         )
     }
 }
@@ -464,7 +496,7 @@ mod tests {
         // Create a mock embedding engine (without model)
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
 
-        SemanticSearch::new(engine, db)
+        SemanticSearch::with_cache_config(engine, db, SearchCacheConfig::default())
     }
 
     #[test]
@@ -832,5 +864,27 @@ mod tests {
         let search = SemanticSearch::default();
         assert!(!search.is_available());
         assert_eq!(search.embedding_dim(), 384);
+    }
+
+    #[test]
+    fn test_cache_stats() {
+        let search = create_test_search();
+
+        // Initial stats should be zero
+        let stats = search.cache_stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.result_cache_size, 0);
+    }
+
+    #[test]
+    fn test_cache_invalidation_increments_version() {
+        let search = create_test_search();
+
+        let initial_version = search.cache_stats().index_version;
+        search.invalidate_cache();
+        let new_version = search.cache_stats().index_version;
+
+        assert_eq!(new_version, initial_version + 1);
     }
 }

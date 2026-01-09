@@ -255,6 +255,33 @@ pub struct SearchConfig {
     pub rrf_k: f32,
     /// Default result limit
     pub default_limit: usize,
+    /// Cache configuration
+    pub cache: CacheConfig,
+}
+
+/// Cache configuration for search results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Whether caching is enabled
+    pub enabled: bool,
+    /// Maximum number of cached search results
+    pub max_entries: usize,
+    /// TTL for cached results in seconds
+    pub result_ttl_secs: u64,
+    /// TTL for cached embeddings in seconds
+    pub embedding_ttl_secs: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: 1000,
+            result_ttl_secs: 300,      // 5 minutes
+            embedding_ttl_secs: 3600,  // 1 hour
+        }
+    }
 }
 
 impl Default for SearchConfig {
@@ -266,6 +293,7 @@ impl Default for SearchConfig {
             semantic_weight: 0.5,
             rrf_k: 60.0,
             default_limit: 20,
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -293,5 +321,9 @@ mod tests {
         assert_eq!(config.semantic_weight, 0.5);
         assert_eq!(config.rrf_k, 60.0);
         assert_eq!(config.default_limit, 20);
+        assert!(config.cache.enabled);
+        assert_eq!(config.cache.max_entries, 1000);
+        assert_eq!(config.cache.result_ttl_secs, 300);
+        assert_eq!(config.cache.embedding_ttl_secs, 3600);
     }
 }
