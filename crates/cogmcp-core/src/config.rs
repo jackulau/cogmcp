@@ -595,6 +595,16 @@ pub struct SearchConfig {
     pub rrf_k: f32,
     /// Default result limit
     pub default_limit: usize,
+    /// Enable HNSW approximate nearest neighbor search
+    pub use_hnsw: bool,
+    /// HNSW ef_construction parameter (higher = better recall, slower build)
+    pub hnsw_ef_construction: u32,
+    /// HNSW ef_search parameter (higher = better recall, slower search)
+    pub hnsw_ef_search: u32,
+    /// HNSW m parameter (connections per layer)
+    pub hnsw_m: u32,
+    /// Minimum embeddings count to trigger HNSW (below this, brute-force is used)
+    pub hnsw_min_embeddings: usize,
 }
 
 impl Default for SearchConfig {
@@ -606,6 +616,11 @@ impl Default for SearchConfig {
             semantic_weight: 0.5,
             rrf_k: 60.0,
             default_limit: 20,
+            use_hnsw: true,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 100,
+            hnsw_m: 16,
+            hnsw_min_embeddings: 1000,
         }
     }
 }
@@ -635,6 +650,12 @@ mod tests {
         assert_eq!(config.semantic_weight, 0.5);
         assert_eq!(config.rrf_k, 60.0);
         assert_eq!(config.default_limit, 20);
+        // HNSW config
+        assert!(config.use_hnsw);
+        assert_eq!(config.hnsw_ef_construction, 200);
+        assert_eq!(config.hnsw_ef_search, 100);
+        assert_eq!(config.hnsw_m, 16);
+        assert_eq!(config.hnsw_min_embeddings, 1000);
     }
 
     #[test]

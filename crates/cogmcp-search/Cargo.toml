@@ -17,3 +17,5 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+instant-distance = "0.6"  # HNSW approximate nearest neighbor search
+bytemuck = { version = "1.14", features = ["derive"] }  # For efficient serialization
