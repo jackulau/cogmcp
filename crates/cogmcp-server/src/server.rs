@@ -1,11 +1,10 @@
 //! Main MCP server implementation
 
 use cogmcp_core::{Config, Result};
-use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
+use cogmcp_embeddings::{LazyEmbeddingEngine, ModelConfig};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
 use cogmcp_storage::{Database, FullTextIndex};
-use parking_lot::Mutex;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
@@ -23,7 +22,7 @@ pub struct CogMcpServer {
     pub db: Arc<Database>,
     pub text_index: Arc<FullTextIndex>,
     pub parser: Arc<CodeParser>,
-    pub embedding_engine: Option<Arc<Mutex<EmbeddingEngine>>>,
+    pub embedding_engine: Option<Arc<LazyEmbeddingEngine>>,
     pub semantic_search: Option<Arc<SemanticSearch>>,
 }
 
@@ -82,7 +81,7 @@ impl CogMcpServer {
     fn init_embedding_engine(
         config: &Config,
         db: Arc<Database>,
-    ) -> Result<(Arc<Mutex<EmbeddingEngine>>, Arc<SemanticSearch>)> {
+    ) -> Result<(Arc<LazyEmbeddingEngine>, Arc<SemanticSearch>)> {
         let model_path = config
             .indexing
             .embedding_model
@@ -95,26 +94,27 @@ impl CogMcpServer {
             ..Default::default()
         };
 
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::new(model_config)?));
+        // Create lazy engine - model is NOT loaded yet
+        let engine = Arc::new(LazyEmbeddingEngine::new(model_config));
         let semantic = Arc::new(SemanticSearch::new(engine.clone(), db));
 
-        {
-            let engine_guard = engine.lock();
-            info!(
-                "Embedding engine initialized (model loaded: {}, dim: {})",
-                engine_guard.is_loaded(),
-                engine_guard.embedding_dim()
-            );
-        }
+        info!(
+            "Embedding engine initialized (lazy loading enabled, dim: {})",
+            engine.embedding_dim()
+        );
+        debug!("ONNX model will be loaded on first use");
 
         Ok((engine, semantic))
     }
 
     /// Check if semantic search is available
+    ///
+    /// Returns true if the embedding engine is configured and model files exist.
+    /// This does NOT require the model to be loaded.
     pub fn has_semantic_search(&self) -> bool {
-        self.semantic_search
+        self.embedding_engine
             .as_ref()
-            .map_or(false, |s| s.is_available())
+            .map_or(false, |e| e.is_available())
     }
 
     /// Index the codebase
