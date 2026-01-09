@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use cogmcp_core::Result;
 use cogmcp_storage::FullTextIndex;
+use futures::stream::{self, Stream, StreamExt};
 
 use crate::semantic::{SemanticSearch, SemanticSearchOptions};
 use crate::text::TextSearch;
@@ -114,6 +115,29 @@ impl<'a> HybridSearch<'a> {
             SearchMode::Semantic => self.semantic_search_impl(query, limit),
             SearchMode::Hybrid => self.hybrid_search(query, limit),
         }
+    }
+
+    /// Search with specified mode, yielding results incrementally as a stream
+    ///
+    /// This method yields results one at a time, allowing consumers to process
+    /// results as they become available rather than waiting for all results.
+    pub fn search_streaming(
+        &self,
+        query: &str,
+        mode: SearchMode,
+        limit: usize,
+    ) -> impl Stream<Item = Result<HybridSearchResult>> + '_ {
+        let query = query.to_string();
+
+        stream::once(async move { self.search(&query, mode, limit) }).flat_map(|results| {
+            match results {
+                Ok(results) => {
+                    let items: Vec<_> = results.into_iter().map(Ok).collect();
+                    stream::iter(items)
+                }
+                Err(e) => stream::iter(vec![Err(e)]),
+            }
+        })
     }
 
     fn keyword_search(&self, query: &str, limit: usize) -> Result<Vec<HybridSearchResult>> {

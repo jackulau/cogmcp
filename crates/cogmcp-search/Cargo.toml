@@ -17,3 +17,5 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
