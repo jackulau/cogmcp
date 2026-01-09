@@ -35,6 +35,8 @@ toml = "0.8"
 # Database & Storage
 rusqlite = { version = "0.32", features = ["bundled"] }
 tantivy = "0.22"
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
 
 # Note: No external ML models - fully self-contained
 
