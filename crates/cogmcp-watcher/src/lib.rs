@@ -4,13 +4,10 @@
 //! for efficient incremental updates, plus config file watching with
 //! automatic reload support.
 
-pub mod config_watcher;
+pub mod handler;
 pub mod prioritizer;
 pub mod realtime;
 
-pub use config_watcher::{
-    AutoReloadingConfig, ConfigChangeEvent, ConfigChangeKind, ConfigWatcher, ConfigWatcherOptions,
-    ReloadEvent, SharedConfigWatcher,
-};
+pub use handler::{FnCallback, IndexAction, IndexCallback, WatcherEventHandler};
 pub use prioritizer::FilePrioritizer;
-pub use realtime::FileWatcher;
+pub use realtime::{ChangeKind, FileChangeEvent, FileWatcher};
