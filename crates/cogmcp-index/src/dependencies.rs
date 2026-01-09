@@ -179,7 +179,7 @@ impl DependencyParser {
             }
 
             // Parse requirement line (e.g., "requests>=2.28.0" or "flask==2.0.1")
-            let (name, version) = if let Some(pos) = line.find(|c| c == '=' || c == '>' || c == '<' || c == '!' || c == '~') {
+            let (name, version) = if let Some(pos) = line.find(['=', '>', '<', '!', '~']) {
                 (line[..pos].to_string(), Some(line[pos..].to_string()))
             } else {
                 (line.to_string(), None)

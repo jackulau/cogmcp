@@ -61,7 +61,7 @@ impl CodeParser {
             Language::Rust => self.parse_rust(content),
             Language::TypeScript | Language::JavaScript => self.parse_typescript(content),
             Language::Python => self.parse_python(content),
-            Language::Java => self.parse_java(content),
+            Language::Ruby => self.parse_ruby(content),
             _ => Ok(Vec::new()), // Unsupported language
         }
     }
@@ -1249,95 +1249,133 @@ impl CodeParser {
             .map(|s| s.to_string())
     }
 
-    fn parse_java(&self, content: &str) -> Result<Vec<ExtractedSymbol>> {
+    fn parse_ruby(&self, content: &str) -> Result<Vec<ExtractedSymbol>> {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
             .map_err(|e| Error::Parse(format!("Failed to set language: {}", e)))?;
 
         let tree = parser
             .parse(content, None)
-            .ok_or_else(|| Error::Parse("Failed to parse Java code".into()))?;
+            .ok_or_else(|| Error::Parse("Failed to parse Ruby code".into()))?;
 
         let mut symbols = Vec::new();
         let root = tree.root_node();
 
-        self.extract_java_symbols(&root, content, &mut symbols);
+        self.extract_ruby_symbols(&root, content, &mut symbols);
 
         Ok(symbols)
     }
 
-    fn extract_java_symbols(
+    fn extract_ruby_symbols(
         &self,
         node: &tree_sitter::Node,
         content: &str,
         symbols: &mut Vec<ExtractedSymbol>,
     ) {
-        self.extract_java_symbols_with_parent(node, content, symbols, None);
+        // Track visibility state: public is default
+        let mut visibility = SymbolVisibility::Public;
+        self.extract_ruby_symbols_with_context(node, content, symbols, None, &mut visibility);
     }
 
-    fn extract_java_symbols_with_parent(
+    fn extract_ruby_symbols_with_context(
         &self,
         node: &tree_sitter::Node,
         content: &str,
         symbols: &mut Vec<ExtractedSymbol>,
         parent_name: Option<String>,
+        current_visibility: &mut SymbolVisibility,
     ) {
         let kind_str = node.kind();
 
+        // Check for visibility modifier calls that change state
+        if kind_str == "call" || kind_str == "identifier" {
+            if let Some(new_vis) = self.check_ruby_visibility_modifier(node, content) {
+                *current_visibility = new_vis;
+            }
+        }
+
         let current_parent = match kind_str {
-            "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration"
-            | "annotation_type_declaration"
-            | "method_declaration"
-            | "constructor_declaration"
-            | "field_declaration" => {
-                if let Some(symbol) = self.extract_java_symbol(node, content, kind_str, parent_name.clone()) {
+            "class" | "module" | "method" | "singleton_method" => {
+                if let Some(symbol) = self.extract_ruby_symbol(node, content, kind_str, parent_name.clone(), *current_visibility) {
                     let name = symbol.name.clone();
                     symbols.push(symbol);
-                    // Only class-like declarations become parents for nested symbols
-                    match kind_str {
-                        "class_declaration"
-                        | "interface_declaration"
-                        | "enum_declaration"
-                        | "record_declaration"
-                        | "annotation_type_declaration" => Some(name),
-                        _ => parent_name.clone(),
-                    }
+                    Some(name)
                 } else {
                     parent_name.clone()
                 }
             }
+            "assignment" => {
+                // Check for constant assignments (CONSTANT = value)
+                if let Some(symbol) = self.extract_ruby_constant(node, content, parent_name.clone()) {
+                    symbols.push(symbol);
+                }
+                parent_name.clone()
+            }
+            "call" => {
+                // Check for attr_accessor, attr_reader, attr_writer
+                self.extract_ruby_attribute_accessors(node, content, symbols, parent_name.clone());
+                parent_name.clone()
+            }
             _ => parent_name.clone(),
         };
 
-        // Recurse into children with updated parent
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            self.extract_java_symbols_with_parent(&child, content, symbols, current_parent.clone());
+        // When entering a class or module, reset visibility for the scope
+        if kind_str == "class" || kind_str == "module" {
+            // Process children with a fresh visibility scope
+            let mut scope_visibility = SymbolVisibility::Public;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                self.extract_ruby_symbols_with_context(&child, content, symbols, current_parent.clone(), &mut scope_visibility);
+            }
+        } else {
+            // Recurse into children with current visibility
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                self.extract_ruby_symbols_with_context(&child, content, symbols, current_parent.clone(), current_visibility);
+            }
         }
     }
 
-    fn extract_java_symbol(
+    fn check_ruby_visibility_modifier(&self, node: &tree_sitter::Node, content: &str) -> Option<SymbolVisibility> {
+        // Check if this is a standalone visibility modifier call (private, protected, public)
+        let text = node.utf8_text(content.as_bytes()).ok()?;
+        let text = text.trim();
+
+        // Standalone visibility modifiers
+        match text {
+            "private" => Some(SymbolVisibility::Private),
+            "protected" => Some(SymbolVisibility::Protected),
+            "public" => Some(SymbolVisibility::Public),
+            _ => None,
+        }
+    }
+
+    fn extract_ruby_symbol(
         &self,
         node: &tree_sitter::Node,
         content: &str,
         kind_str: &str,
         parent_name: Option<String>,
+        visibility: SymbolVisibility,
     ) -> Option<ExtractedSymbol> {
-        // Handle field declarations specially - they may have multiple declarators
-        if kind_str == "field_declaration" {
-            return self.extract_java_field(node, content, parent_name);
-        }
-
-        // Find the name node
-        let name_node = node.child_by_field_name("name")?;
-        let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
+        let name = self.get_ruby_symbol_name(node, content, kind_str)?;
 
         // Determine symbol kind
-        let kind = self.determine_java_symbol_kind(node, kind_str, parent_name.is_some());
+        let kind = match kind_str {
+            "class" => SymbolKind::Class,
+            "module" => SymbolKind::Module,
+            "method" => {
+                // Check if it's initialize (constructor)
+                if name == "initialize" {
+                    SymbolKind::Function
+                } else {
+                    SymbolKind::Method
+                }
+            }
+            "singleton_method" => SymbolKind::Function, // Class methods are Functions
+            _ => SymbolKind::Unknown,
+        };
 
         let start_line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
@@ -1348,30 +1386,20 @@ impl CodeParser {
             .nth(start_line as usize - 1)
             .map(|s| s.trim().to_string());
 
-        // Look for doc comment above
-        let doc_comment = self.find_java_doc_comment(node, content);
+        // Look for comment above
+        let doc_comment = self.find_ruby_comment(node, content);
 
-        // Extract visibility
-        let visibility = self.extract_java_visibility(node, content);
+        // Determine visibility - check for inline visibility modifier
+        let actual_visibility = self.check_ruby_inline_visibility(node, content).unwrap_or(visibility);
 
         // Extract modifiers
-        let modifiers = self.extract_java_modifiers(node, content);
+        let modifiers = SymbolModifiers::default();
 
-        // Extract type parameters (generics)
-        let type_parameters = self.extract_java_type_params(node, content);
-
-        // Extract parameters for methods/constructors
-        let parameters = if kind_str == "method_declaration" || kind_str == "constructor_declaration" {
-            self.extract_java_parameters(node, content)
+        // Extract parameters for methods
+        let parameters = if kind_str == "method" || kind_str == "singleton_method" {
+            self.extract_ruby_parameters(node, content)
         } else {
             Vec::new()
-        };
-
-        // Extract return type for methods
-        let return_type = if kind_str == "method_declaration" {
-            self.extract_java_return_type(node, content)
-        } else {
-            None
         };
 
         Some(ExtractedSymbol {
@@ -1381,187 +1409,178 @@ impl CodeParser {
             end_line,
             signature,
             doc_comment,
-            visibility,
+            visibility: actual_visibility,
             modifiers,
             parent_name,
-            type_parameters,
+            type_parameters: Vec::new(), // Ruby doesn't have type parameters
             parameters,
-            return_type,
+            return_type: None, // Ruby doesn't have explicit return types
         })
     }
 
-    fn determine_java_symbol_kind(&self, node: &tree_sitter::Node, kind_str: &str, has_parent: bool) -> SymbolKind {
+    fn get_ruby_symbol_name(&self, node: &tree_sitter::Node, content: &str, kind_str: &str) -> Option<String> {
         match kind_str {
-            "class_declaration" => SymbolKind::Class,
-            "interface_declaration" => SymbolKind::Interface,
-            "enum_declaration" => SymbolKind::Enum,
-            "record_declaration" => SymbolKind::Struct, // Records are similar to structs
-            "annotation_type_declaration" => SymbolKind::Interface, // Annotations are interface-like
-            "method_declaration" => {
-                // Check if static - static methods are Functions, instance methods are Methods
-                if self.is_java_static(node) {
-                    SymbolKind::Function
-                } else if has_parent {
-                    SymbolKind::Method
-                } else {
-                    SymbolKind::Function
-                }
+            "class" | "module" => {
+                // Look for constant child (class/module name)
+                node.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                    .map(|s| s.to_string())
             }
-            "constructor_declaration" => SymbolKind::Function,
-            _ => SymbolKind::Unknown,
+            "method" => {
+                // Look for name field
+                node.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                    .map(|s| s.to_string())
+            }
+            "singleton_method" => {
+                // For def self.method_name, get the name
+                node.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                    .map(|s| s.to_string())
+            }
+            _ => None,
         }
     }
 
-    fn extract_java_field(
-        &self,
-        node: &tree_sitter::Node,
-        content: &str,
-        parent_name: Option<String>,
-    ) -> Option<ExtractedSymbol> {
-        // Get the first variable declarator to find the field name
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "variable_declarator" {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
-
-                    let is_static = self.is_java_static(node);
-                    let kind = if is_static {
-                        SymbolKind::Variable // Static fields are Variables
-                    } else {
-                        SymbolKind::Field // Instance fields are Fields
-                    };
-
-                    let start_line = node.start_position().row as u32 + 1;
-                    let end_line = node.end_position().row as u32 + 1;
-
-                    let signature = content
-                        .lines()
-                        .nth(start_line as usize - 1)
-                        .map(|s| s.trim().to_string());
-
-                    let doc_comment = self.find_java_doc_comment(node, content);
-                    let visibility = self.extract_java_visibility(node, content);
-                    let modifiers = self.extract_java_modifiers(node, content);
-
-                    return Some(ExtractedSymbol {
-                        name,
-                        kind,
-                        start_line,
-                        end_line,
-                        signature,
-                        doc_comment,
-                        visibility,
-                        modifiers,
-                        parent_name,
-                        type_parameters: Vec::new(),
-                        parameters: Vec::new(),
-                        return_type: None,
-                    });
-                }
-            }
-        }
-        None
-    }
-
-    fn extract_java_visibility(&self, node: &tree_sitter::Node, content: &str) -> SymbolVisibility {
-        // Look for modifiers node (not a field, iterate children)
-        if let Some(modifiers) = self.find_java_modifiers_node(node) {
-            let text = modifiers.utf8_text(content.as_bytes()).unwrap_or("");
-            if text.contains("public") {
-                return SymbolVisibility::Public;
-            }
-            if text.contains("protected") {
-                return SymbolVisibility::Protected;
-            }
-            if text.contains("private") {
-                return SymbolVisibility::Private;
-            }
-        }
-        // Default for Java is package-private (Internal)
-        SymbolVisibility::Internal
-    }
-
-    fn find_java_modifiers_node<'a>(&self, node: &'a tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "modifiers" {
-                return Some(child);
-            }
-        }
-        None
-    }
-
-    fn extract_java_modifiers(&self, node: &tree_sitter::Node, content: &str) -> SymbolModifiers {
-        let mut modifiers = SymbolModifiers::default();
-
-        if let Some(mod_node) = self.find_java_modifiers_node(node) {
-            let text = mod_node.utf8_text(content.as_bytes()).unwrap_or("");
-            if text.contains("static") {
-                modifiers.is_static = true;
-            }
-            if text.contains("abstract") {
-                modifiers.is_abstract = true;
-            }
-            if text.contains("final") {
-                modifiers.is_const = true; // final is closest to const
-            }
-        }
-
-        modifiers
-    }
-
-    fn is_java_static(&self, node: &tree_sitter::Node) -> bool {
-        if let Some(modifiers) = self.find_java_modifiers_node(node) {
-            let mut cursor = modifiers.walk();
-            for child in modifiers.children(&mut cursor) {
-                if child.kind() == "static" {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn extract_java_type_params(&self, node: &tree_sitter::Node, content: &str) -> Vec<String> {
-        let mut params = Vec::new();
-
-        if let Some(type_params) = node.child_by_field_name("type_parameters") {
-            let mut cursor = type_params.walk();
-            for child in type_params.children(&mut cursor) {
-                if child.kind() == "type_parameter" {
-                    // Get the full type parameter including bounds
-                    if let Ok(text) = child.utf8_text(content.as_bytes()) {
-                        params.push(text.to_string());
+    fn check_ruby_inline_visibility(&self, node: &tree_sitter::Node, content: &str) -> Option<SymbolVisibility> {
+        // Check if this method has an inline visibility modifier (e.g., private def foo)
+        // The parent would be a call node with private/protected/public as the method
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "call" {
+                // Get the method name from the call
+                if let Some(method_node) = parent.child_by_field_name("method") {
+                    let method_text = method_node.utf8_text(content.as_bytes()).ok()?;
+                    match method_text {
+                        "private" => return Some(SymbolVisibility::Private),
+                        "protected" => return Some(SymbolVisibility::Protected),
+                        "public" => return Some(SymbolVisibility::Public),
+                        _ => {}
                     }
                 }
             }
         }
-
-        params
+        None
     }
 
-    fn extract_java_parameters(&self, node: &tree_sitter::Node, content: &str) -> Vec<ParameterInfo> {
+    fn extract_ruby_constant(&self, node: &tree_sitter::Node, content: &str, parent_name: Option<String>) -> Option<ExtractedSymbol> {
+        // Assignment node: look for left side being a constant (all uppercase)
+        let left = node.child_by_field_name("left")?;
+        let left_text = left.utf8_text(content.as_bytes()).ok()?;
+
+        // Ruby constants start with uppercase letter
+        if !left_text.chars().next()?.is_uppercase() {
+            return None;
+        }
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        Some(ExtractedSymbol {
+            name: left_text.to_string(),
+            kind: SymbolKind::Constant,
+            start_line,
+            end_line,
+            signature,
+            doc_comment: None,
+            visibility: SymbolVisibility::Public, // Ruby constants are public by default
+            modifiers: SymbolModifiers { is_const: true, ..Default::default() },
+            parent_name,
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            return_type: None,
+        })
+    }
+
+    fn extract_ruby_attribute_accessors(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        symbols: &mut Vec<ExtractedSymbol>,
+        parent_name: Option<String>,
+    ) {
+        // Check if this is an attr_accessor, attr_reader, or attr_writer call
+        let method_node = match node.child_by_field_name("method") {
+            Some(n) => n,
+            None => return,
+        };
+
+        let method_text = match method_node.utf8_text(content.as_bytes()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let is_accessor = matches!(method_text, "attr_accessor" | "attr_reader" | "attr_writer");
+        if !is_accessor {
+            return;
+        }
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        // Look for arguments (symbols)
+        if let Some(args) = node.child_by_field_name("arguments") {
+            let mut cursor = args.walk();
+            for child in args.children(&mut cursor) {
+                if child.kind() == "simple_symbol" || child.kind() == "symbol" {
+                    if let Ok(text) = child.utf8_text(content.as_bytes()) {
+                        // Remove the leading : from symbol
+                        let name = text.trim_start_matches(':').to_string();
+                        symbols.push(ExtractedSymbol {
+                            name,
+                            kind: SymbolKind::Property,
+                            start_line,
+                            end_line,
+                            signature: signature.clone(),
+                            doc_comment: None,
+                            visibility: SymbolVisibility::Public,
+                            modifiers: SymbolModifiers::default(),
+                            parent_name: parent_name.clone(),
+                            type_parameters: Vec::new(),
+                            parameters: Vec::new(),
+                            return_type: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_ruby_parameters(&self, node: &tree_sitter::Node, content: &str) -> Vec<ParameterInfo> {
         let mut params = Vec::new();
 
         if let Some(parameters) = node.child_by_field_name("parameters") {
             let mut cursor = parameters.walk();
             for child in parameters.children(&mut cursor) {
-                if child.kind() == "formal_parameter" || child.kind() == "spread_parameter" {
-                    let name = child
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-
-                    let type_annotation = child
-                        .child_by_field_name("type")
-                        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                        .map(|s| s.to_string());
-
-                    if !name.is_empty() {
-                        params.push(ParameterInfo { name, type_annotation });
+                match child.kind() {
+                    "identifier" => {
+                        if let Ok(text) = child.utf8_text(content.as_bytes()) {
+                            params.push(ParameterInfo {
+                                name: text.to_string(),
+                                type_annotation: None,
+                            });
+                        }
                     }
+                    "optional_parameter" | "keyword_parameter" | "splat_parameter" | "block_parameter" => {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            if let Ok(text) = name_node.utf8_text(content.as_bytes()) {
+                                params.push(ParameterInfo {
+                                    name: text.to_string(),
+                                    type_annotation: None,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1569,17 +1588,13 @@ impl CodeParser {
         params
     }
 
-    fn extract_java_return_type(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
-        node.child_by_field_name("type")
-            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-            .map(|s| s.to_string())
-    }
-
-    fn find_java_doc_comment(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
-        // Look at previous sibling for block_comment (JavaDoc)
+    fn find_ruby_comment(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
+        // Look at previous sibling for comment
         if let Some(prev) = node.prev_sibling() {
-            if prev.kind() == "block_comment" || prev.kind() == "line_comment" {
-                return prev.utf8_text(content.as_bytes()).ok().map(|s| s.to_string());
+            if prev.kind() == "comment" {
+                return prev.utf8_text(content.as_bytes()).ok().map(|s| {
+                    s.trim_start_matches('#').trim().to_string()
+                });
             }
         }
         None
@@ -1596,22 +1611,22 @@ impl CodeParser {
     }
 
     fn find_python_docstring(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
-        // Look for string as first child of body (only check first statement)
+        // Look for string as first child of body
         let body = node.child_by_field_name("body")?;
-        let mut cursor = body.walk();
-        let child = body.children(&mut cursor).next()?;
-
-        if child.kind() == "expression_statement" {
-            let mut inner_cursor = child.walk();
-            for inner in child.children(&mut inner_cursor) {
-                if inner.kind() == "string" {
-                    return inner.utf8_text(content.as_bytes()).ok().map(|s| {
-                        s.trim_matches('"')
-                            .trim_matches('\'')
-                            .trim()
-                            .to_string()
-                    });
-                }
+        // Only check first statement
+        let child = body.child(0)?;
+        if child.kind() != "expression_statement" {
+            return None;
+        }
+        let mut inner_cursor = child.walk();
+        for inner in child.children(&mut inner_cursor) {
+            if inner.kind() == "string" {
+                return inner.utf8_text(content.as_bytes()).ok().map(|s| {
+                    s.trim_matches('"')
+                        .trim_matches('\'')
+                        .trim()
+                        .to_string()
+                });
             }
         }
         None
@@ -2820,239 +2835,192 @@ pub fn returns_nothing() {}
         assert!(no_return.return_type.is_none() || no_return.signature.as_ref().map(|s| !s.contains("->")).unwrap_or(true));
     }
 
-    // Java tests
-
     #[test]
-    fn test_parse_java_class_with_visibility() {
+    fn test_parse_ruby_class_with_visibility() {
         let parser = CodeParser::new();
         let code = r#"
-public class User {
-    private String name;
-    protected int age;
+class User
+  attr_accessor :name, :email
 
-    public User(String name) {
-        this.name = name;
-    }
+  def initialize(name)
+    @name = name
+  end
 
-    public String getName() {
-        return name;
-    }
+  def greet
+    "Hello, #{@name}"
+  end
 
-    private void helper() { }
-}
+  private
+
+  def secret_method
+    # private
+  end
+
+  protected
+
+  def family_method
+    # protected
+  end
+end
 "#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
+        let symbols = parser.parse(code, Language::Ruby).unwrap();
 
-        // Assert User class is Public
-        let user_class = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Class).unwrap();
-        assert_eq!(user_class.visibility, SymbolVisibility::Public);
+        // Assert User class extracted
+        let user_class = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Class);
+        assert!(user_class.is_some(), "User class should be found");
 
-        // Assert name field is Private
-        let name_field = symbols.iter().find(|s| s.name == "name").unwrap();
-        assert_eq!(name_field.kind, SymbolKind::Field);
-        assert_eq!(name_field.visibility, SymbolVisibility::Private);
-        assert_eq!(name_field.parent_name, Some("User".to_string()));
+        // Assert initialize is a constructor (Function)
+        let init = symbols.iter().find(|s| s.name == "initialize").unwrap();
+        assert_eq!(init.kind, SymbolKind::Function, "initialize should be a Function (constructor)");
+        assert_eq!(init.visibility, SymbolVisibility::Public, "initialize should be public");
 
-        // Assert age field is Protected
-        let age_field = symbols.iter().find(|s| s.name == "age").unwrap();
-        assert_eq!(age_field.kind, SymbolKind::Field);
-        assert_eq!(age_field.visibility, SymbolVisibility::Protected);
+        // Assert greet is public
+        let greet = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert_eq!(greet.kind, SymbolKind::Method);
+        assert_eq!(greet.visibility, SymbolVisibility::Public);
 
-        // Assert constructor is extracted
-        let constructor = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Function);
-        assert!(constructor.is_some(), "Constructor should be found");
+        // Assert secret_method is private
+        let secret = symbols.iter().find(|s| s.name == "secret_method").unwrap();
+        assert_eq!(secret.visibility, SymbolVisibility::Private);
 
-        // Assert getName is Public method
-        let get_name = symbols.iter().find(|s| s.name == "getName").unwrap();
-        assert_eq!(get_name.kind, SymbolKind::Method);
-        assert_eq!(get_name.visibility, SymbolVisibility::Public);
-        assert_eq!(get_name.parent_name, Some("User".to_string()));
+        // Assert family_method is protected
+        let family = symbols.iter().find(|s| s.name == "family_method").unwrap();
+        assert_eq!(family.visibility, SymbolVisibility::Protected);
 
-        // Assert helper is Private
-        let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
-        assert_eq!(helper.visibility, SymbolVisibility::Private);
-    }
-
-    #[test]
-    fn test_parse_java_interface() {
-        let parser = CodeParser::new();
-        let code = r#"
-public interface Repository<T, ID> {
-    T findById(ID id);
-    void save(T entity);
-}
-"#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
-
-        // Assert Repository interface extracted
-        let repo = symbols.iter().find(|s| s.name == "Repository").unwrap();
-        assert_eq!(repo.kind, SymbolKind::Interface);
-        assert_eq!(repo.visibility, SymbolVisibility::Public);
-
-        // Assert type parameters [T, ID] captured
-        assert!(repo.type_parameters.len() >= 2 || repo.signature.as_ref().map(|s| s.contains("<T, ID>")).unwrap_or(false));
-
-        // Assert methods extracted
-        let find_by_id = symbols.iter().find(|s| s.name == "findById");
-        assert!(find_by_id.is_some(), "findById method should be found");
-        let find_by_id = find_by_id.unwrap();
-        assert_eq!(find_by_id.parent_name, Some("Repository".to_string()));
-
-        let save = symbols.iter().find(|s| s.name == "save");
-        assert!(save.is_some(), "save method should be found");
+        // Check attr_accessor creates properties
+        let name_prop = symbols.iter().find(|s| s.name == "name" && s.kind == SymbolKind::Property);
+        assert!(name_prop.is_some(), "attr_accessor :name should create a Property");
+        let email_prop = symbols.iter().find(|s| s.name == "email" && s.kind == SymbolKind::Property);
+        assert!(email_prop.is_some(), "attr_accessor :email should create a Property");
     }
 
     #[test]
-    fn test_parse_java_enum() {
+    fn test_parse_ruby_module() {
         let parser = CodeParser::new();
         let code = r#"
-public enum Status {
-    PENDING,
-    ACTIVE,
-    COMPLETED;
+module Searchable
+  def self.included(base)
+    base.extend(ClassMethods)
+  end
 
-    public boolean isTerminal() {
-        return this == COMPLETED;
-    }
-}
+  module ClassMethods
+    def search(query)
+      # search implementation
+    end
+  end
+
+  def find_by_name(name)
+    # instance method
+  end
+end
 "#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
+        let symbols = parser.parse(code, Language::Ruby).unwrap();
 
-        // Assert Status enum extracted
-        let status = symbols.iter().find(|s| s.name == "Status").unwrap();
-        assert_eq!(status.kind, SymbolKind::Enum);
-        assert_eq!(status.visibility, SymbolVisibility::Public);
+        // Assert Searchable module extracted
+        let searchable = symbols.iter().find(|s| s.name == "Searchable" && s.kind == SymbolKind::Module);
+        assert!(searchable.is_some(), "Searchable module should be found");
 
-        // Assert isTerminal method extracted
-        let is_terminal = symbols.iter().find(|s| s.name == "isTerminal");
-        assert!(is_terminal.is_some(), "isTerminal method should be found");
-        let is_terminal = is_terminal.unwrap();
-        assert_eq!(is_terminal.parent_name, Some("Status".to_string()));
+        // Assert ClassMethods nested module extracted
+        let class_methods = symbols.iter().find(|s| s.name == "ClassMethods" && s.kind == SymbolKind::Module);
+        assert!(class_methods.is_some(), "ClassMethods nested module should be found");
+
+        // Assert methods are extracted
+        let included = symbols.iter().find(|s| s.name == "included");
+        assert!(included.is_some(), "self.included should be found");
+
+        let find_by_name = symbols.iter().find(|s| s.name == "find_by_name");
+        assert!(find_by_name.is_some(), "find_by_name instance method should be found");
     }
 
     #[test]
-    fn test_parse_java_static_members() {
+    fn test_parse_ruby_class_methods() {
         let parser = CodeParser::new();
         let code = r#"
-public class Constants {
-    public static final String VERSION = "1.0";
+class Configuration
+  def self.default
+    new
+  end
 
-    public static void main(String[] args) { }
-}
+  def instance_method
+    # instance method
+  end
+end
 "#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
+        let symbols = parser.parse(code, Language::Ruby).unwrap();
 
-        // Assert VERSION is static and const (final)
-        let version = symbols.iter().find(|s| s.name == "VERSION").unwrap();
-        assert_eq!(version.kind, SymbolKind::Variable); // static fields are Variable
-        assert!(version.modifiers.is_static);
-        assert!(version.modifiers.is_const); // final maps to const
+        // Assert Configuration class extracted
+        let config = symbols.iter().find(|s| s.name == "Configuration" && s.kind == SymbolKind::Class);
+        assert!(config.is_some(), "Configuration class should be found");
 
-        // Assert main is static (so it's a Function, not Method)
-        let main = symbols.iter().find(|s| s.name == "main").unwrap();
-        assert_eq!(main.kind, SymbolKind::Function); // static methods are Function
-        assert!(main.modifiers.is_static);
+        // Assert default is a class method (Function - singleton_method)
+        let default_method = symbols.iter().find(|s| s.name == "default");
+        assert!(default_method.is_some(), "self.default should be found");
+        let default_method = default_method.unwrap();
+        assert_eq!(default_method.kind, SymbolKind::Function, "class method should be Function");
+
+        // Assert instance_method is a regular method
+        let instance_method = symbols.iter().find(|s| s.name == "instance_method");
+        assert!(instance_method.is_some(), "instance_method should be found");
+        assert_eq!(instance_method.unwrap().kind, SymbolKind::Method);
     }
 
     #[test]
-    fn test_parse_java_package_private() {
+    fn test_parse_ruby_constants() {
         let parser = CodeParser::new();
         let code = r#"
-class PackagePrivateClass {
-    String packagePrivateField;
+module Constants
+  VERSION = "1.0.0"
+  MAX_RETRIES = 3
 
-    void packagePrivateMethod() { }
-}
+  NESTED = {
+    key: "value"
+  }
+end
 "#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
+        let symbols = parser.parse(code, Language::Ruby).unwrap();
 
-        // Package-private (no modifier) should be Internal
-        let pkg_class = symbols.iter().find(|s| s.name == "PackagePrivateClass").unwrap();
-        assert_eq!(pkg_class.visibility, SymbolVisibility::Internal);
+        // Assert Constants module extracted
+        let constants_mod = symbols.iter().find(|s| s.name == "Constants" && s.kind == SymbolKind::Module);
+        assert!(constants_mod.is_some(), "Constants module should be found");
 
-        let field = symbols.iter().find(|s| s.name == "packagePrivateField").unwrap();
-        assert_eq!(field.visibility, SymbolVisibility::Internal);
+        // Assert VERSION constant extracted
+        let version = symbols.iter().find(|s| s.name == "VERSION" && s.kind == SymbolKind::Constant);
+        assert!(version.is_some(), "VERSION constant should be found");
 
-        let method = symbols.iter().find(|s| s.name == "packagePrivateMethod").unwrap();
-        assert_eq!(method.visibility, SymbolVisibility::Internal);
+        // Assert MAX_RETRIES constant extracted
+        let max_retries = symbols.iter().find(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Constant);
+        assert!(max_retries.is_some(), "MAX_RETRIES constant should be found");
+
+        // Assert NESTED constant extracted
+        let nested = symbols.iter().find(|s| s.name == "NESTED" && s.kind == SymbolKind::Constant);
+        assert!(nested.is_some(), "NESTED constant should be found");
     }
 
     #[test]
-    fn test_parse_java_abstract_class() {
+    fn test_parse_ruby_method_parameters() {
         let parser = CodeParser::new();
         let code = r#"
-public abstract class Shape {
-    public abstract double area();
+class Calculator
+  def add(a, b)
+    a + b
+  end
 
-    public String describe() {
-        return "A shape";
-    }
-}
+  def multiply(a, b = 1)
+    a * b
+  end
+end
 "#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
+        let symbols = parser.parse(code, Language::Ruby).unwrap();
 
-        // Assert Shape is abstract
-        let shape = symbols.iter().find(|s| s.name == "Shape").unwrap();
-        assert_eq!(shape.kind, SymbolKind::Class);
-        assert!(shape.modifiers.is_abstract);
+        // Find the add method and check parameters
+        let add = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(add.parameters.len(), 2);
+        assert_eq!(add.parameters[0].name, "a");
+        assert_eq!(add.parameters[1].name, "b");
 
-        // Assert area is abstract method
-        let area = symbols.iter().find(|s| s.name == "area").unwrap();
-        assert!(area.modifiers.is_abstract);
-    }
-
-    #[test]
-    fn test_parse_java_nested_class() {
-        let parser = CodeParser::new();
-        let code = r#"
-public class Outer {
-    private int x;
-
-    public class Inner {
-        public void innerMethod() { }
-    }
-}
-"#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
-
-        // Find Outer class
-        let outer = symbols.iter().find(|s| s.name == "Outer" && s.kind == SymbolKind::Class);
-        assert!(outer.is_some(), "Outer class should be found");
-
-        // Find Inner class
-        let inner = symbols.iter().find(|s| s.name == "Inner" && s.kind == SymbolKind::Class);
-        assert!(inner.is_some(), "Inner class should be found");
-        let inner = inner.unwrap();
-        assert_eq!(inner.parent_name, Some("Outer".to_string()));
-
-        // Find innerMethod
-        let inner_method = symbols.iter().find(|s| s.name == "innerMethod");
-        assert!(inner_method.is_some(), "innerMethod should be found");
-        let inner_method = inner_method.unwrap();
-        assert_eq!(inner_method.parent_name, Some("Inner".to_string()));
-    }
-
-    #[test]
-    fn test_parse_java_generic_method() {
-        let parser = CodeParser::new();
-        let code = r#"
-public class Utils {
-    public <T extends Comparable<T>> T max(T a, T b) {
-        return a.compareTo(b) > 0 ? a : b;
-    }
-}
-"#;
-        let symbols = parser.parse(code, Language::Java).unwrap();
-
-        // Find the max method
-        let max_method = symbols.iter().find(|s| s.name == "max");
-        assert!(max_method.is_some(), "max method should be found");
-        let max_method = max_method.unwrap();
-
-        // Should have type parameters or be visible in signature
-        assert!(
-            !max_method.type_parameters.is_empty()
-                || max_method.signature.as_ref().map(|s| s.contains("<T")).unwrap_or(false)
-        );
+        // Find multiply method
+        let multiply = symbols.iter().find(|s| s.name == "multiply").unwrap();
+        // Should have at least the 'a' parameter
+        assert!(!multiply.parameters.is_empty());
     }
 }

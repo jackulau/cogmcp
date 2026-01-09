@@ -29,7 +29,7 @@ pub enum SymbolVisibility {
 
 impl SymbolVisibility {
     /// Parse visibility from a string
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "public" | "pub" => Self::Public,
             "private" | "priv" => Self::Private,
@@ -78,6 +78,7 @@ pub enum Language {
     TypeScript,
     JavaScript,
     Python,
+    Ruby,
     Go,
     Java,
     C,
@@ -97,6 +98,7 @@ impl Language {
             "ts" | "tsx" => Language::TypeScript,
             "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
             "py" | "pyi" => Language::Python,
+            "rb" | "rake" | "gemspec" => Language::Ruby,
             "go" => Language::Go,
             "java" => Language::Java,
             "c" | "h" => Language::C,
@@ -116,6 +118,7 @@ impl Language {
             Language::TypeScript => &["ts", "tsx"],
             Language::JavaScript => &["js", "jsx", "mjs", "cjs"],
             Language::Python => &["py", "pyi"],
+            Language::Ruby => &["rb", "rake", "gemspec"],
             Language::Go => &["go"],
             Language::Java => &["java"],
             Language::C => &["c", "h"],
@@ -348,6 +351,9 @@ mod tests {
         assert_eq!(Language::from_extension("ts"), Language::TypeScript);
         assert_eq!(Language::from_extension("tsx"), Language::TypeScript);
         assert_eq!(Language::from_extension("py"), Language::Python);
+        assert_eq!(Language::from_extension("rb"), Language::Ruby);
+        assert_eq!(Language::from_extension("rake"), Language::Ruby);
+        assert_eq!(Language::from_extension("gemspec"), Language::Ruby);
         assert_eq!(Language::from_extension("unknown"), Language::Unknown);
     }
 }

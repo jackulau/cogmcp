@@ -369,7 +369,7 @@ impl EmbeddingEngine {
             })?;
 
             let inputs = ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor]
-                .map_err(|e| Error::Embedding(format!("Failed to create session inputs: {}", e)))?;
+                .map_err(|e| Error::Embedding(format!("Failed to create inputs: {}", e)))?;
 
             let outputs = session
                 .run(inputs)
@@ -386,6 +386,7 @@ impl EmbeddingEngine {
             let shape = tensor_view.shape();
 
             // Get dimensions: should be [1, seq_len, hidden_dim]
+            let shape = tensor_view.shape();
             if shape.len() != 3 {
                 return Err(Error::Embedding(format!(
                     "Expected 3D output tensor, got {}D with shape {:?}",
@@ -396,7 +397,7 @@ impl EmbeddingEngine {
 
             let hidden_dim = shape[2];
             // Copy the data to owned Vec before dropping outputs
-            (hidden_dim, tensor_view.as_slice().unwrap().to_vec())
+            (hidden_dim, tensor_view.iter().copied().collect::<Vec<_>>())
         };
 
         // Apply mean pooling over the sequence dimension
