@@ -1,11 +1,2 @@
-id: mcp-request-handler
-status: pending
-branch: parallel/mcp-request-handler
-worktree_path: null
-assigned_to: null
-started_at: null
-completed_at: null
-dependencies_met: false
-conflicts: []
-commit_sha: null
-tests_passing: null
+status: complete
+completed_at: 2026-01-08T07:45:00Z

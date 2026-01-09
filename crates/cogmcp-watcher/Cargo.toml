@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 cogmcp-core = { workspace = true }
+cogmcp-storage = { workspace = true }
+cogmcp-index = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 tokio = { workspace = true }

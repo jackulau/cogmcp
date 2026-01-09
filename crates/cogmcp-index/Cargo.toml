@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 cogmcp-core = { workspace = true }
 cogmcp-storage = { workspace = true }
-cogmcp-embeddings = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }

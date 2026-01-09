@@ -8,9 +8,7 @@ pub mod methods;
 use crate::protocol::{
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpMethod, RpcError,
 };
-use crate::response_builder::{StreamingResponseBuilder, StreamingThreshold};
 use crate::server::CogMcpServer;
-use crate::streaming::{FormattedResult, StreamingConfig, StreamingFormatter};
 use serde_json::Value;
 use std::fmt::Display;
 use std::sync::Arc;
