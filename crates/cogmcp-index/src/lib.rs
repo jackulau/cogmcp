@@ -7,6 +7,7 @@ pub mod codebase;
 pub mod parser;
 pub mod git;
 pub mod dependencies;
+pub mod parallel_walker;
 
 pub use codebase::{CodebaseIndexer, IndexResult};
 pub use parser::{CodeParser, ExtractedSymbol};
