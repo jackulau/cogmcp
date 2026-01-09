@@ -520,7 +520,7 @@ mod tests {
         assert!(config.watching.enabled);
         assert_eq!(config.context.default_max_tokens, 8000);
         assert!(config.git.enabled);
-        assert!(config.cache.enabled);
+        assert!(config.search.cache.enabled);
     }
 
     #[test]

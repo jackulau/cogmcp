@@ -768,6 +768,7 @@ mod tests {
             config,
             session: None,
             tokenizer: None,
+            metrics: EmbeddingMetrics::new(),
         };
         assert_eq!(engine.batch_size(), 16);
     }
@@ -779,6 +780,7 @@ mod tests {
             config,
             session: None,
             tokenizer: None,
+            metrics: EmbeddingMetrics::new(),
         };
         assert_eq!(engine.batch_size(), MAX_BATCH_SIZE);
     }

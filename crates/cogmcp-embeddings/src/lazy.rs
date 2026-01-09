@@ -190,6 +190,7 @@ mod tests {
             tokenizer_path: "/nonexistent/path/tokenizer.json".to_string(),
             embedding_dim: 384,
             max_length: 512,
+            batch_size: 32,
         };
         let engine = LazyEmbeddingEngine::new(config);
 

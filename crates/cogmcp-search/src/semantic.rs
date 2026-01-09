@@ -737,7 +737,7 @@ mod tests {
         // Create a lazy embedding engine with default config (no model files)
         let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
 
-        SemanticSearch::with_cache_config(engine, db, SearchCacheConfig::default())
+        SemanticSearch::new(engine, db)
     }
 
     #[test]

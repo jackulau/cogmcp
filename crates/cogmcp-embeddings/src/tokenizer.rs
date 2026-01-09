@@ -302,11 +302,11 @@ mod tests {
             attention_mask: vec![1, 1, 1, 1],
             token_type_ids: vec![0, 0, 0, 0],
             batch_size: 2,
-            seq_length: 2,
+            max_length: 2,
         };
         assert!(!batch.is_empty());
         assert_eq!(batch.batch_size, 2);
-        assert_eq!(batch.seq_length, 2);
+        assert_eq!(batch.max_length, 2);
     }
 
     #[test]
@@ -329,13 +329,13 @@ mod tests {
             attention_mask: vec![1, 1, 1, 1, 1, 0], // Second sequence padded
             token_type_ids: vec![0, 0, 0, 0, 0, 0],
             batch_size: 2,
-            seq_length: 3,
+            max_length: 3,
         };
 
         // Verify we can access elements correctly
-        assert_eq!(batch.input_ids.len(), batch.batch_size * batch.seq_length);
-        assert_eq!(batch.attention_mask.len(), batch.batch_size * batch.seq_length);
-        assert_eq!(batch.token_type_ids.len(), batch.batch_size * batch.seq_length);
+        assert_eq!(batch.input_ids.len(), batch.batch_size * batch.max_length);
+        assert_eq!(batch.attention_mask.len(), batch.batch_size * batch.max_length);
+        assert_eq!(batch.token_type_ids.len(), batch.batch_size * batch.max_length);
 
         // First sequence: [1, 2, 3], all attended
         assert_eq!(&batch.input_ids[0..3], &[1, 2, 3]);
