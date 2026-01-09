@@ -1,2 +1,11 @@
-status: complete
-completed_at: 2026-01-09T04:09:11Z
+id: subtask-2-parser-integration
+status: pending
+branch: parallel/subtask-2-parser-integration
+worktree_path: null
+assigned_to: null
+started_at: null
+completed_at: null
+dependencies_met: true
+conflicts: []
+commit_sha: null
+tests_passing: null
