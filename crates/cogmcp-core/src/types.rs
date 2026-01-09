@@ -53,6 +53,14 @@ impl SymbolVisibility {
     }
 }
 
+impl std::str::FromStr for SymbolVisibility {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self::parse(s))
+    }
+}
+
 /// Modifiers that can be applied to symbols
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct SymbolModifiers {

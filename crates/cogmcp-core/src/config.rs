@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 
 /// Main configuration for CogMCP
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -18,20 +18,6 @@ pub struct Config {
     pub git: GitConfig,
     pub search: SearchConfig,
     pub pool: PoolConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            indexing: IndexingConfig::default(),
-            watching: WatchingConfig::default(),
-            context: ContextConfig::default(),
-            git: GitConfig::default(),
-            search: SearchConfig::default(),
-            pool: PoolConfig::default(),
-        }
-    }
 }
 
 impl Config {
