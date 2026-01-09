@@ -9,7 +9,7 @@ pub mod tantivy_index;
 
 pub use sqlite::{
     deserialize_parameters, deserialize_type_params, serialize_parameters, serialize_type_params,
-    Database, EmbeddingInput, EmbeddingRow, ExtendedSymbolMetadata, FileRow, IndexStats,
-    ParameterInfo, SimilarityResult, SymbolRow,
+    Database, EmbeddingInput, EmbeddingRow, ExtendedIndexStats, ExtendedSymbolMetadata, FileInsert,
+    FileRow, IndexStats, ParameterInfo, SimilarityResult, SymbolInsert, SymbolRow,
 };
 pub use tantivy_index::FullTextIndex;
