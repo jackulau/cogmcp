@@ -27,8 +27,8 @@ fn test_list_tools_returns_all_tools() {
     let server = create_test_server();
     let tools = server.list_tools();
 
-    // Verify we have the expected 7 tools
-    assert_eq!(tools.len(), 8, "Should have 8 tools");
+    // Verify we have the expected 9 tools
+    assert_eq!(tools.len(), 9, "Should have 9 tools");
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
 
@@ -54,6 +54,10 @@ fn test_list_tools_returns_all_tools() {
         "Should have index_status tool"
     );
     assert!(tool_names.contains(&"reindex"), "Should have reindex tool");
+    assert!(
+        tool_names.contains(&"reload_config"),
+        "Should have reload_config tool"
+    );
 }
 
 #[test]
@@ -251,12 +255,12 @@ mod e2e_tests {
     }
 
     #[test]
-    fn test_e2e_tools_list_returns_7_tools() {
+    fn test_e2e_tools_list_returns_9_tools() {
         let server = create_test_server();
 
         // List tools through the server's list_tools method
         let tools = server.list_tools();
-        assert_eq!(tools.len(), 8, "Should return 8 tools");
+        assert_eq!(tools.len(), 9, "Should return 9 tools");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(tool_names.contains(&"ping"));
@@ -266,6 +270,7 @@ mod e2e_tests {
         assert!(tool_names.contains(&"get_file_outline"));
         assert!(tool_names.contains(&"index_status"));
         assert!(tool_names.contains(&"reindex"));
+        assert!(tool_names.contains(&"reload_config"));
     }
 
     #[test]

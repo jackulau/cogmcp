@@ -1,6 +1,6 @@
 //! Main MCP server implementation
 
-use cogmcp_core::{Config, Result};
+use cogmcp_core::{Config, Result, SharedConfig};
 use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 #[derive(Clone)]
 pub struct CogMcpServer {
     pub root: PathBuf,
-    pub config: Config,
+    pub shared_config: SharedConfig,
     pub db: Arc<Database>,
     pub text_index: Arc<FullTextIndex>,
     pub parser: Arc<CodeParser>,
@@ -30,7 +30,8 @@ pub struct CogMcpServer {
 impl CogMcpServer {
     /// Create a new server instance
     pub fn new(root: PathBuf) -> Result<Self> {
-        let config = Config::load()?;
+        let shared_config = SharedConfig::load()?;
+        let config = shared_config.get();
         let db = Arc::new(Database::open(&Config::database_path()?)?);
         let text_index = Arc::new(FullTextIndex::open(&Config::tantivy_path()?)?);
         let parser = Arc::new(CodeParser::new());
@@ -51,7 +52,7 @@ impl CogMcpServer {
 
         Ok(Self {
             root,
-            config,
+            shared_config,
             db,
             text_index,
             parser,
@@ -60,16 +61,21 @@ impl CogMcpServer {
         })
     }
 
+    /// Get the current configuration
+    pub fn config(&self) -> Config {
+        self.shared_config.get()
+    }
+
     /// Create a server with in-memory storage (for testing)
     pub fn in_memory(root: PathBuf) -> Result<Self> {
-        let config = Config::default();
+        let shared_config = SharedConfig::default();
         let db = Arc::new(Database::in_memory()?);
         let text_index = Arc::new(FullTextIndex::in_memory()?);
         let parser = Arc::new(CodeParser::new());
 
         Ok(Self {
             root,
-            config,
+            shared_config,
             db,
             text_index,
             parser,
@@ -119,15 +125,16 @@ impl CogMcpServer {
 
     /// Index the codebase
     pub fn index(&self) -> Result<()> {
+        let config = self.config();
         let indexer = if let Some(ref engine) = self.embedding_engine {
             CodebaseIndexer::with_embedding_engine(
                 self.root.clone(),
-                self.config.clone(),
+                config.clone(),
                 self.parser.clone(),
                 engine.clone(),
             )?
         } else {
-            CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone())?
+            CodebaseIndexer::new(self.root.clone(), config, self.parser.clone())?
         };
 
         let result = indexer.index_all(&self.db, &self.text_index)?;
@@ -260,6 +267,19 @@ impl CogMcpServer {
                     "required": ["query"]
                 }),
             ),
+            make_tool(
+                "reload_config",
+                "Reload configuration from disk. Returns the new config summary.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "validate_only": {
+                            "type": "boolean",
+                            "description": "If true, only validate the config without applying"
+                        }
+                    }
+                }),
+            ),
         ]
     }
 
@@ -320,6 +340,10 @@ impl CogMcpServer {
                 let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
                 Ok(self.semantic_search(&query, limit))
             }
+            "reload_config" => {
+                let validate_only = arguments["validate_only"].as_bool().unwrap_or(false);
+                Ok(self.reload_config(validate_only))
+            }
             _ => Err(format!("Unknown tool: {}", name)),
         }
     }
@@ -356,9 +380,10 @@ impl CogMcpServer {
     }
 
     fn context_search(&self, query: &str, limit: usize, mode: &str) -> String {
+        let current_config = self.config();
         // Use configured default mode if not specified
         let mode_str = if mode.is_empty() {
-            &self.config.search.default_mode
+            &current_config.search.default_mode
         } else {
             mode
         };
@@ -366,13 +391,13 @@ impl CogMcpServer {
 
         // Create hybrid search with semantic capability if available
         let search = if let Some(ref semantic) = self.semantic_search {
-            let config = cogmcp_search::HybridSearchConfig {
-                keyword_weight: self.config.search.keyword_weight,
-                semantic_weight: self.config.search.semantic_weight,
-                min_similarity: self.config.search.min_similarity,
-                rrf_k: self.config.search.rrf_k,
+            let hybrid_config = cogmcp_search::HybridSearchConfig {
+                keyword_weight: current_config.search.keyword_weight,
+                semantic_weight: current_config.search.semantic_weight,
+                min_similarity: current_config.search.min_similarity,
+                rrf_k: current_config.search.rrf_k,
             };
-            HybridSearch::with_semantic(&self.text_index, semantic.clone()).with_config(config)
+            HybridSearch::with_semantic(&self.text_index, semantic.clone()).with_config(hybrid_config)
         } else {
             HybridSearch::new(&self.text_index)
         };
@@ -637,15 +662,16 @@ impl CogMcpServer {
     }
 
     fn reindex(&self) -> String {
+        let config = self.config();
         let indexer_result = if let Some(ref engine) = self.embedding_engine {
             CodebaseIndexer::with_embedding_engine(
                 self.root.clone(),
-                self.config.clone(),
+                config.clone(),
                 self.parser.clone(),
                 engine.clone(),
             )
         } else {
-            CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone())
+            CodebaseIndexer::new(self.root.clone(), config, self.parser.clone())
         };
 
         match indexer_result {
@@ -720,6 +746,49 @@ impl CogMcpServer {
                 output
             }
             Err(e) => format!("Semantic search failed: {}", e),
+        }
+    }
+
+    /// Reload configuration from disk
+    fn reload_config(&self, validate_only: bool) -> String {
+        let action = if validate_only { "Validating" } else { "Reloading" };
+        info!("{} configuration", action);
+
+        let result = if validate_only {
+            self.shared_config.validate()
+        } else {
+            self.shared_config.reload()
+        };
+
+        match result {
+            Ok(reload_result) => {
+                let source = match reload_result.source_path {
+                    Some(path) => format!("`{}`", path.display()),
+                    None => "defaults (no config file found)".to_string(),
+                };
+
+                let action_past = if validate_only { "validated" } else { "reloaded" };
+                let mut output = format!("## Configuration {}\n\n", action_past);
+                output.push_str(&format!("**Source:** {}\n\n", source));
+                output.push_str("### Current Settings\n\n");
+                output.push_str("```\n");
+                output.push_str(&reload_result.config_summary);
+                output.push_str("\n```\n");
+
+                if validate_only {
+                    output.push_str("\n*Configuration is valid. Call without `validate_only` to apply.*");
+                }
+
+                output
+            }
+            Err(e) => {
+                let action_noun = if validate_only { "validation" } else { "reload" };
+                format!(
+                    "## Configuration {} failed\n\n**Error:** {}\n\n\
+                     The previous configuration remains active.",
+                    action_noun, e
+                )
+            }
         }
     }
 }

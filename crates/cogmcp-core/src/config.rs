@@ -1,7 +1,9 @@
 //! Configuration management for CogMCP
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
@@ -98,6 +100,122 @@ impl Config {
     pub fn model_path() -> Result<PathBuf> {
         Ok(Self::data_dir()?.join("models").join("all-MiniLM-L6-v2.onnx"))
     }
+
+    /// Find which config file would be loaded
+    pub fn find_config_path() -> Option<PathBuf> {
+        Self::config_locations().into_iter().find(|p| p.exists())
+    }
+
+    /// Generate a summary of key config settings
+    pub fn summary(&self) -> String {
+        format!(
+            "Server: transport={}, log_level={}\n\
+             Indexing: max_file_size={}KB, embeddings={}\n\
+             Search: mode={}, min_similarity={:.2}\n\
+             Watching: enabled={}, debounce={}ms",
+            self.server.transport,
+            self.server.log_level,
+            self.indexing.max_file_size,
+            self.indexing.enable_embeddings,
+            self.search.default_mode,
+            self.search.min_similarity,
+            self.watching.enabled,
+            self.watching.debounce_ms,
+        )
+    }
+}
+
+/// Thread-safe shared configuration that can be reloaded at runtime
+#[derive(Clone)]
+pub struct SharedConfig {
+    inner: Arc<RwLock<Config>>,
+    source_path: Arc<RwLock<Option<PathBuf>>>,
+}
+
+impl SharedConfig {
+    /// Create a new SharedConfig from an existing Config
+    pub fn new(config: Config) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(config)),
+            source_path: Arc::new(RwLock::new(Config::find_config_path())),
+        }
+    }
+
+    /// Load SharedConfig from default locations
+    pub fn load() -> Result<Self> {
+        let source_path = Config::find_config_path();
+        let config = Config::load()?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(config)),
+            source_path: Arc::new(RwLock::new(source_path)),
+        })
+    }
+
+    /// Get a read-only clone of the current config
+    pub fn get(&self) -> Config {
+        self.inner.read().clone()
+    }
+
+    /// Get the path of the config file being used (if any)
+    pub fn source_path(&self) -> Option<PathBuf> {
+        self.source_path.read().clone()
+    }
+
+    /// Reload configuration from disk
+    ///
+    /// Returns a summary of what changed or an error
+    pub fn reload(&self) -> Result<ReloadResult> {
+        let source_path = Config::find_config_path();
+        let new_config = Config::load()?;
+
+        // Update source path
+        *self.source_path.write() = source_path.clone();
+
+        // Update config
+        *self.inner.write() = new_config.clone();
+
+        Ok(ReloadResult {
+            source_path,
+            config_summary: new_config.summary(),
+        })
+    }
+
+    /// Validate configuration from disk without applying
+    ///
+    /// Returns the config summary if valid, or an error
+    pub fn validate(&self) -> Result<ReloadResult> {
+        let source_path = Config::find_config_path();
+        let new_config = Config::load()?;
+
+        Ok(ReloadResult {
+            source_path,
+            config_summary: new_config.summary(),
+        })
+    }
+}
+
+impl Default for SharedConfig {
+    fn default() -> Self {
+        Self::new(Config::default())
+    }
+}
+
+impl std::fmt::Debug for SharedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedConfig")
+            .field("config", &*self.inner.read())
+            .field("source_path", &*self.source_path.read())
+            .finish()
+    }
+}
+
+/// Result of a config reload operation
+#[derive(Debug, Clone)]
+pub struct ReloadResult {
+    /// Path to the config file that was loaded (None if using defaults)
+    pub source_path: Option<PathBuf>,
+    /// Summary of the loaded configuration
+    pub config_summary: String,
 }
 
 /// Server configuration
