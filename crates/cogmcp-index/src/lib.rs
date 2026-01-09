@@ -9,5 +9,5 @@ pub mod git;
 pub mod dependencies;
 pub mod parallel_walker;
 
-pub use codebase::{CodebaseIndexer, IndexResult};
+pub use codebase::{CodebaseIndexer, IndexProgress, IndexResult};
 pub use parser::{CodeParser, ExtractedSymbol};

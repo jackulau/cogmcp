@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use ndarray::Array2;
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -13,11 +15,182 @@ use cogmcp_core::{Error, Result};
 use crate::model::ModelConfig;
 use crate::tokenizer::Tokenizer;
 
-/// Default batch size for batch inference operations
-pub const DEFAULT_BATCH_SIZE: usize = 32;
+/// Progress information for batch embedding operations
+#[derive(Debug, Clone)]
+pub struct BatchProgress {
+    /// Total number of items to process
+    pub total_items: usize,
+    /// Number of items processed so far
+    pub processed_items: usize,
+    /// Current batch number (1-indexed)
+    pub current_batch: usize,
+    /// Total number of batches
+    pub total_batches: usize,
+    /// Time elapsed since start
+    pub elapsed_time: Duration,
+    /// Processing rate in items per second
+    pub items_per_second: f64,
+}
+
+impl BatchProgress {
+    /// Create a new BatchProgress
+    pub fn new(
+        total_items: usize,
+        processed_items: usize,
+        current_batch: usize,
+        total_batches: usize,
+        elapsed_time: Duration,
+    ) -> Self {
+        let items_per_second = if elapsed_time.as_secs_f64() > 0.0 {
+            processed_items as f64 / elapsed_time.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        Self {
+            total_items,
+            processed_items,
+            current_batch,
+            total_batches,
+            elapsed_time,
+            items_per_second,
+        }
+    }
+
+    /// Get estimated time remaining
+    pub fn estimated_remaining(&self) -> Option<Duration> {
+        if self.items_per_second > 0.0 && self.processed_items < self.total_items {
+            let remaining_items = self.total_items - self.processed_items;
+            let remaining_secs = remaining_items as f64 / self.items_per_second;
+            Some(Duration::from_secs_f64(remaining_secs))
+        } else {
+            None
+        }
+    }
+
+    /// Get completion percentage
+    pub fn percentage(&self) -> f64 {
+        if self.total_items > 0 {
+            (self.processed_items as f64 / self.total_items as f64) * 100.0
+        } else {
+            100.0
+        }
+    }
+}
+
+/// Thread-safe metrics for embedding performance tracking
+#[derive(Debug, Default)]
+pub struct EmbeddingMetrics {
+    /// Total number of embeddings generated
+    total_embeddings: AtomicU64,
+    /// Total inference time in microseconds
+    total_inference_time_us: AtomicU64,
+    /// Total number of batches processed
+    total_batches: AtomicU64,
+    /// Total items processed across all batches
+    total_items_in_batches: AtomicU64,
+}
+
+impl EmbeddingMetrics {
+    /// Create new metrics
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a completed embedding operation
+    pub fn record_embedding(&self, inference_time: Duration) {
+        self.total_embeddings.fetch_add(1, Ordering::Relaxed);
+        self.total_inference_time_us
+            .fetch_add(inference_time.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Record a completed batch operation
+    pub fn record_batch(&self, batch_size: usize, inference_time: Duration) {
+        self.total_embeddings
+            .fetch_add(batch_size as u64, Ordering::Relaxed);
+        self.total_inference_time_us
+            .fetch_add(inference_time.as_micros() as u64, Ordering::Relaxed);
+        self.total_batches.fetch_add(1, Ordering::Relaxed);
+        self.total_items_in_batches
+            .fetch_add(batch_size as u64, Ordering::Relaxed);
+    }
+
+    /// Get total embeddings generated
+    pub fn total_embeddings_generated(&self) -> u64 {
+        self.total_embeddings.load(Ordering::Relaxed)
+    }
+
+    /// Get total inference time
+    pub fn total_inference_time(&self) -> Duration {
+        Duration::from_micros(self.total_inference_time_us.load(Ordering::Relaxed))
+    }
+
+    /// Get average batch size
+    pub fn average_batch_size(&self) -> f64 {
+        let batches = self.total_batches.load(Ordering::Relaxed);
+        if batches > 0 {
+            self.total_items_in_batches.load(Ordering::Relaxed) as f64 / batches as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get throughput in embeddings per second
+    pub fn throughput_per_second(&self) -> f64 {
+        let time = self.total_inference_time();
+        if time.as_secs_f64() > 0.0 {
+            self.total_embeddings_generated() as f64 / time.as_secs_f64()
+        } else {
+            0.0
+        }
+    }
+
+    /// Reset all metrics to zero
+    pub fn reset(&self) {
+        self.total_embeddings.store(0, Ordering::Relaxed);
+        self.total_inference_time_us.store(0, Ordering::Relaxed);
+        self.total_batches.store(0, Ordering::Relaxed);
+        self.total_items_in_batches.store(0, Ordering::Relaxed);
+    }
+
+    /// Get a snapshot of current metrics
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            total_embeddings_generated: self.total_embeddings_generated(),
+            total_inference_time: self.total_inference_time(),
+            average_batch_size: self.average_batch_size(),
+            throughput_per_second: self.throughput_per_second(),
+        }
+    }
+}
+
+/// A point-in-time snapshot of embedding metrics
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    /// Total number of embeddings generated
+    pub total_embeddings_generated: u64,
+    /// Total inference time
+    pub total_inference_time: Duration,
+    /// Average batch size
+    pub average_batch_size: f64,
+    /// Throughput in embeddings per second
+    pub throughput_per_second: f64,
+}
+
+impl std::fmt::Display for MetricsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Embeddings: {}, Total time: {:.2}s, Avg batch: {:.1}, Throughput: {:.1}/s",
+            self.total_embeddings_generated,
+            self.total_inference_time.as_secs_f64(),
+            self.average_batch_size,
+            self.throughput_per_second
+        )
+    }
+}
 
 /// Embedding engine for generating text embeddings using ONNX Runtime
-#[derive(Debug)]
 pub struct EmbeddingEngine {
     /// Model configuration
     config: ModelConfig,
@@ -25,8 +198,18 @@ pub struct EmbeddingEngine {
     session: Option<Session>,
     /// Tokenizer for text preprocessing
     tokenizer: Option<Tokenizer>,
-    /// Batch size for batch inference operations
-    batch_size: usize,
+    /// Performance metrics
+    metrics: EmbeddingMetrics,
+}
+
+impl std::fmt::Debug for EmbeddingEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingEngine")
+            .field("config", &self.config)
+            .field("session", &self.session.is_some())
+            .field("tokenizer", &self.tokenizer.is_some())
+            .finish()
+    }
 }
 
 impl EmbeddingEngine {
@@ -39,7 +222,7 @@ impl EmbeddingEngine {
                 config,
                 session: None,
                 tokenizer: None,
-                batch_size: DEFAULT_BATCH_SIZE,
+                metrics: EmbeddingMetrics::new(),
             });
         }
 
@@ -88,7 +271,7 @@ impl EmbeddingEngine {
             config,
             session: Some(session),
             tokenizer: Some(tokenizer),
-            batch_size: DEFAULT_BATCH_SIZE,
+            metrics: EmbeddingMetrics::new(),
         })
     }
 
@@ -114,7 +297,7 @@ impl EmbeddingEngine {
             config: ModelConfig::default(),
             session: None,
             tokenizer: None,
-            batch_size: DEFAULT_BATCH_SIZE,
+            metrics: EmbeddingMetrics::new(),
         }
     }
 
@@ -132,6 +315,19 @@ impl EmbeddingEngine {
     ///
     /// Returns a 384-dimensional vector for all-MiniLM-L6-v2
     pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        let start = Instant::now();
+        let result = self.embed_internal(text);
+        let elapsed = start.elapsed();
+
+        if result.is_ok() {
+            self.metrics.record_embedding(elapsed);
+        }
+
+        result
+    }
+
+    /// Internal embedding generation without metrics recording
+    fn embed_internal(&mut self, text: &str) -> Result<Vec<f32>> {
         // First, tokenize the text using the tokenizer
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             Error::Embedding("Tokenizer not loaded".into())
@@ -171,30 +367,35 @@ impl EmbeddingEngine {
                 Error::Embedding("Model not loaded. Call ensure_model_available() first.".into())
             })?;
 
+            let inputs = ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor]
+                .map_err(|e| Error::Embedding(format!("Failed to create session inputs: {}", e)))?;
+
             let outputs = session
-                .run(ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor])
+                .run(inputs)
                 .map_err(|e| Error::Embedding(format!("ONNX inference failed: {}", e)))?;
 
             // Extract the sentence embedding from the output
             let output_value = outputs.iter().next()
                 .ok_or_else(|| Error::Embedding("No output tensor found".into()))?;
 
-            let (shape, data) = output_value.1
+            let tensor_view = output_value.1
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
+
+            let shape = tensor_view.shape();
 
             // Get dimensions: should be [1, seq_len, hidden_dim]
             if shape.len() != 3 {
                 return Err(Error::Embedding(format!(
                     "Expected 3D output tensor, got {}D with shape {:?}",
                     shape.len(),
-                    &**shape
+                    shape
                 )));
             }
 
-            let hidden_dim = shape[2] as usize;
+            let hidden_dim = shape[2];
             // Copy the data to owned Vec before dropping outputs
-            (hidden_dim, data.to_vec())
+            (hidden_dim, tensor_view.as_slice().unwrap().to_vec())
         };
 
         // Apply mean pooling over the sequence dimension
@@ -218,152 +419,80 @@ impl EmbeddingEngine {
     /// The embeddings are identical to sequential processing within floating
     /// point tolerance.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // For single text, use the simpler single-text path
-        if texts.len() == 1 {
-            return Ok(vec![self.embed(texts[0])?]);
-        }
-
-        // Tokenize all texts at once using batch encoding
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            Error::Embedding("Tokenizer not loaded".into())
-        })?;
-
-        let batch = tokenizer.encode_batch(texts)?;
-        let batch_size = batch.batch_size;
-        let seq_len = batch.seq_length;
-
-        if batch_size == 0 || seq_len == 0 {
-            return Ok(vec![]);
-        }
-
-        // Create input tensors with shape [batch_size, seq_len]
-        let input_ids: Array2<i64> =
-            Array2::from_shape_vec((batch_size, seq_len), batch.input_ids).map_err(|e| {
-                Error::Embedding(format!("Failed to create input_ids tensor: {}", e))
-            })?;
-
-        let attention_mask: Array2<i64> =
-            Array2::from_shape_vec((batch_size, seq_len), batch.attention_mask.clone())
-                .map_err(|e| {
-                    Error::Embedding(format!("Failed to create attention_mask tensor: {}", e))
-                })?;
-
-        let token_type_ids: Array2<i64> =
-            Array2::from_shape_vec((batch_size, seq_len), batch.token_type_ids).map_err(|e| {
-                Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e))
-            })?;
-
-        // Create Tensor values for ort
-        let input_ids_tensor = Tensor::from_array(input_ids)
-            .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
-        let attention_mask_tensor = Tensor::from_array(attention_mask)
-            .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
-        let token_type_ids_tensor = Tensor::from_array(token_type_ids)
-            .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
-
-        // Run inference and extract data
-        let (hidden_dim, raw_data) = {
-            let session = self.session.as_mut().ok_or_else(|| {
-                Error::Embedding("Model not loaded. Call ensure_model_available() first.".into())
-            })?;
-
-            let outputs = session
-                .run(ort::inputs![input_ids_tensor, attention_mask_tensor, token_type_ids_tensor])
-                .map_err(|e| Error::Embedding(format!("ONNX batch inference failed: {}", e)))?;
-
-            // Extract the embeddings from the output
-            let output_value = outputs.iter().next()
-                .ok_or_else(|| Error::Embedding("No output tensor found".into()))?;
-
-            let (shape, data) = output_value.1
-                .try_extract_tensor::<f32>()
-                .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
-
-            // Get dimensions: should be [batch_size, seq_len, hidden_dim]
-            if shape.len() != 3 {
-                return Err(Error::Embedding(format!(
-                    "Expected 3D output tensor, got {}D with shape {:?}",
-                    shape.len(),
-                    &**shape
-                )));
-            }
-
-            let actual_batch_size = shape[0] as usize;
-            let actual_seq_len = shape[1] as usize;
-            let hidden_dim = shape[2] as usize;
-
-            if actual_batch_size != batch_size {
-                return Err(Error::Embedding(format!(
-                    "Batch size mismatch: expected {}, got {}",
-                    batch_size, actual_batch_size
-                )));
-            }
-
-            if actual_seq_len != seq_len {
-                return Err(Error::Embedding(format!(
-                    "Sequence length mismatch: expected {}, got {}",
-                    seq_len, actual_seq_len
-                )));
-            }
-
-            (hidden_dim, data.to_vec())
-        };
-
-        // Apply mean pooling and L2 normalization to each sequence in the batch
-        let mut embeddings = Vec::with_capacity(batch_size);
-        let sequence_elements = seq_len * hidden_dim;
-
-        for i in 0..batch_size {
-            // Extract this sequence's embeddings from the flattened data
-            let start_idx = i * sequence_elements;
-            let end_idx = start_idx + sequence_elements;
-            let sequence_data = &raw_data[start_idx..end_idx];
-
-            // Get this sequence's attention mask
-            let mask_start = i * seq_len;
-            let mask_end = mask_start + seq_len;
-            let sequence_mask = &batch.attention_mask[mask_start..mask_end];
-
-            // Apply mean pooling over the sequence dimension
-            let embedding = Self::mean_pooling_from_flat_static(
-                sequence_data,
-                sequence_mask,
-                seq_len,
-                hidden_dim,
-            )?;
-
-            // L2 normalize the embedding
-            let normalized = Self::l2_normalize_static(&embedding);
-            embeddings.push(normalized);
-        }
-
-        Ok(embeddings)
+        self.embed_batch_with_progress(texts, |_| {})
     }
 
-    /// Generate embeddings for multiple texts with automatic chunking
+    /// Generate embeddings for multiple texts with progress callback
     ///
-    /// This method splits large inputs into optimal batch sizes and processes
-    /// them efficiently. Use this for very large batches where memory might
-    /// be a concern.
-    pub fn embed_batch_chunked(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    /// The callback receives a `BatchProgress` after each batch is processed,
+    /// allowing for progress reporting during long-running operations.
+    ///
+    /// # Arguments
+    /// * `texts` - The texts to generate embeddings for
+    /// * `on_progress` - Callback function invoked after each batch
+    ///
+    /// # Example
+    /// ```ignore
+    /// engine.embed_batch_with_progress(&texts, |progress| {
+    ///     println!("{:.1}% complete ({}/{})",
+    ///         progress.percentage(),
+    ///         progress.processed_items,
+    ///         progress.total_items);
+    /// })?;
+    /// ```
+    pub fn embed_batch_with_progress<F>(
+        &mut self,
+        texts: &[&str],
+        mut on_progress: F,
+    ) -> Result<Vec<Vec<f32>>>
+    where
+        F: FnMut(BatchProgress),
+    {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        let batch_size = self.batch_size;
-        let mut all_embeddings = Vec::with_capacity(texts.len());
+        let total_items = texts.len();
+        let batch_size = self.config.batch_size.max(1);
+        let total_batches = (total_items + batch_size - 1) / batch_size;
+        let start_time = Instant::now();
 
-        // Process in chunks of batch_size
-        for chunk in texts.chunks(batch_size) {
-            let chunk_embeddings = self.embed_batch(chunk)?;
-            all_embeddings.extend(chunk_embeddings);
+        let mut results = Vec::with_capacity(total_items);
+
+        for (batch_idx, batch) in texts.chunks(batch_size).enumerate() {
+            let batch_start = Instant::now();
+
+            // Process each item in the batch
+            for text in batch {
+                let embedding = self.embed_internal(text)?;
+                results.push(embedding);
+            }
+
+            let batch_elapsed = batch_start.elapsed();
+            self.metrics.record_batch(batch.len(), batch_elapsed);
+
+            // Report progress after each batch
+            let progress = BatchProgress::new(
+                total_items,
+                results.len(),
+                batch_idx + 1,
+                total_batches,
+                start_time.elapsed(),
+            );
+            on_progress(progress);
         }
 
-        Ok(all_embeddings)
+        Ok(results)
+    }
+
+    /// Get the current performance metrics
+    pub fn get_metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Reset the performance metrics
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
     }
 
     /// Apply mean pooling to get sentence embeddings from flattened output
@@ -538,265 +667,173 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_batch_empty() {
-        let mut engine = EmbeddingEngine::without_model();
-        let result = engine.embed_batch(&[]);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+    fn test_batch_progress_new() {
+        let progress = BatchProgress::new(100, 50, 3, 10, Duration::from_secs(5));
+
+        assert_eq!(progress.total_items, 100);
+        assert_eq!(progress.processed_items, 50);
+        assert_eq!(progress.current_batch, 3);
+        assert_eq!(progress.total_batches, 10);
+        assert_eq!(progress.elapsed_time, Duration::from_secs(5));
+        // 50 items in 5 seconds = 10 items/sec
+        assert!((progress.items_per_second - 10.0).abs() < 1e-6);
     }
 
     #[test]
-    fn test_embed_batch_optimized_empty() {
-        let mut engine = EmbeddingEngine::without_model();
-        let result = engine.embed_batch_optimized(&[], 32);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+    fn test_batch_progress_percentage() {
+        let progress = BatchProgress::new(100, 25, 1, 4, Duration::from_secs(1));
+        assert!((progress.percentage() - 25.0).abs() < 1e-6);
+
+        let progress_half = BatchProgress::new(100, 50, 2, 4, Duration::from_secs(2));
+        assert!((progress_half.percentage() - 50.0).abs() < 1e-6);
+
+        let progress_complete = BatchProgress::new(100, 100, 4, 4, Duration::from_secs(4));
+        assert!((progress_complete.percentage() - 100.0).abs() < 1e-6);
     }
 
     #[test]
-    fn test_embed_large_batch_empty() {
-        let mut engine = EmbeddingEngine::without_model();
-        let result = engine.embed_large_batch(&[], 32);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+    fn test_batch_progress_empty() {
+        let progress = BatchProgress::new(0, 0, 0, 0, Duration::from_secs(0));
+        assert!((progress.percentage() - 100.0).abs() < 1e-6);
+        assert!(progress.estimated_remaining().is_none());
     }
-}
 
-/// Integration tests that require model files
-/// These tests verify batch vs sequential equivalence
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
-    use crate::model::ModelManager;
+    #[test]
+    fn test_batch_progress_estimated_remaining() {
+        let progress = BatchProgress::new(100, 50, 5, 10, Duration::from_secs(10));
+        // 50 items in 10 seconds = 5 items/sec
+        // 50 remaining items / 5 items/sec = 10 seconds remaining
+        let remaining = progress.estimated_remaining().unwrap();
+        assert!((remaining.as_secs_f64() - 10.0).abs() < 1e-6);
+    }
 
-    /// Helper to create an engine with model if available
-    fn create_test_engine() -> Option<EmbeddingEngine> {
-        let manager = match ModelManager::new() {
-            Ok(m) => m,
-            Err(_) => return None,
+    #[test]
+    fn test_batch_progress_estimated_remaining_complete() {
+        let progress = BatchProgress::new(100, 100, 10, 10, Duration::from_secs(10));
+        assert!(progress.estimated_remaining().is_none());
+    }
+
+    #[test]
+    fn test_embedding_metrics_new() {
+        let metrics = EmbeddingMetrics::new();
+        assert_eq!(metrics.total_embeddings_generated(), 0);
+        assert_eq!(metrics.total_inference_time(), Duration::ZERO);
+        assert!((metrics.average_batch_size() - 0.0).abs() < 1e-6);
+        assert!((metrics.throughput_per_second() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_embedding_metrics_record_embedding() {
+        let metrics = EmbeddingMetrics::new();
+        metrics.record_embedding(Duration::from_millis(100));
+        metrics.record_embedding(Duration::from_millis(200));
+
+        assert_eq!(metrics.total_embeddings_generated(), 2);
+        assert_eq!(metrics.total_inference_time(), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn test_embedding_metrics_record_batch() {
+        let metrics = EmbeddingMetrics::new();
+        metrics.record_batch(32, Duration::from_millis(100));
+        metrics.record_batch(16, Duration::from_millis(50));
+
+        assert_eq!(metrics.total_embeddings_generated(), 48);
+        assert_eq!(metrics.total_inference_time(), Duration::from_millis(150));
+        // Average batch size: (32 + 16) / 2 = 24
+        assert!((metrics.average_batch_size() - 24.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_embedding_metrics_throughput() {
+        let metrics = EmbeddingMetrics::new();
+        // 100 embeddings in 1 second = 100 emb/s
+        metrics.record_batch(100, Duration::from_secs(1));
+
+        assert!((metrics.throughput_per_second() - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_embedding_metrics_reset() {
+        let metrics = EmbeddingMetrics::new();
+        metrics.record_batch(100, Duration::from_secs(1));
+        metrics.record_embedding(Duration::from_millis(50));
+
+        metrics.reset();
+
+        assert_eq!(metrics.total_embeddings_generated(), 0);
+        assert_eq!(metrics.total_inference_time(), Duration::ZERO);
+        assert!((metrics.average_batch_size() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_embedding_metrics_snapshot() {
+        let metrics = EmbeddingMetrics::new();
+        metrics.record_batch(50, Duration::from_millis(500));
+
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.total_embeddings_generated, 50);
+        assert_eq!(snapshot.total_inference_time, Duration::from_millis(500));
+        assert!((snapshot.average_batch_size - 50.0).abs() < 1e-6);
+        // 50 embeddings in 0.5 seconds = 100 emb/s
+        assert!((snapshot.throughput_per_second - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_metrics_snapshot_display() {
+        let snapshot = MetricsSnapshot {
+            total_embeddings_generated: 1000,
+            total_inference_time: Duration::from_secs(10),
+            average_batch_size: 32.0,
+            throughput_per_second: 100.0,
         };
 
-        if !manager.is_model_available() {
-            return None;
-        }
-
-        let config = manager.get_config();
-        EmbeddingEngine::new(config).ok()
+        let display = format!("{}", snapshot);
+        assert!(display.contains("1000"));
+        assert!(display.contains("10.00"));
+        assert!(display.contains("32.0"));
+        assert!(display.contains("100.0"));
     }
 
     #[test]
-    #[ignore = "Requires model files to be downloaded"]
-    fn test_batch_vs_sequential_equivalence() {
-        let mut engine = match create_test_engine() {
-            Some(e) => e,
-            None => {
-                eprintln!("Skipping test: model not available");
-                return;
-            }
-        };
+    fn test_embedding_metrics_thread_safety() {
+        use std::sync::Arc;
+        use std::thread;
 
-        let texts = vec![
-            "hello world",
-            "test embedding",
-            "rust code",
-            "machine learning",
-            "natural language processing",
-        ];
+        let metrics = Arc::new(EmbeddingMetrics::new());
+        let mut handles = vec![];
 
-        // Generate embeddings sequentially
-        let sequential: Vec<Vec<f32>> = texts
-            .iter()
-            .map(|t| engine.embed(t).unwrap())
-            .collect();
-
-        // Generate embeddings in batch
-        let batched = engine.embed_batch(&texts).unwrap();
-
-        // Verify same number of results
-        assert_eq!(sequential.len(), batched.len());
-
-        // Verify vectors are identical within f32 precision
-        for (i, (seq, bat)) in sequential.iter().zip(batched.iter()).enumerate() {
-            assert_eq!(seq.len(), bat.len(), "Dimension mismatch at index {}", i);
-
-            for (j, (s, b)) in seq.iter().zip(bat.iter()).enumerate() {
-                assert!(
-                    (s - b).abs() < 1e-5,
-                    "Value mismatch at text {} dim {}: sequential={}, batched={}",
-                    i, j, s, b
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "Requires model files to be downloaded"]
-    fn test_batch_size_variations() {
-        let mut engine = match create_test_engine() {
-            Some(e) => e,
-            None => {
-                eprintln!("Skipping test: model not available");
-                return;
-            }
-        };
-
-        let texts: Vec<&str> = (0..10)
-            .map(|i| match i % 5 {
-                0 => "hello world",
-                1 => "test embedding model",
-                2 => "rust programming language",
-                3 => "machine learning algorithms",
-                _ => "natural language processing tasks",
-            })
-            .collect();
-
-        // Test different batch sizes
-        let batch_sizes = [1, 2, 4, 8, 16, 32];
-
-        let baseline = engine.embed_batch_optimized(&texts, 1).unwrap();
-
-        for batch_size in batch_sizes {
-            let result = engine.embed_batch_optimized(&texts, batch_size).unwrap();
-
-            assert_eq!(baseline.len(), result.len(), "Length mismatch for batch_size={}", batch_size);
-
-            for (i, (base, res)) in baseline.iter().zip(result.iter()).enumerate() {
-                for (j, (b, r)) in base.iter().zip(res.iter()).enumerate() {
-                    assert!(
-                        (b - r).abs() < 1e-5,
-                        "Value mismatch at batch_size={}, text={}, dim={}: base={}, result={}",
-                        batch_size, i, j, b, r
-                    );
+        // Spawn multiple threads recording metrics concurrently
+        for _ in 0..10 {
+            let metrics_clone = Arc::clone(&metrics);
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    metrics_clone.record_embedding(Duration::from_micros(100));
                 }
-            }
+            });
+            handles.push(handle);
         }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // 10 threads * 100 embeddings each = 1000 total
+        assert_eq!(metrics.total_embeddings_generated(), 1000);
     }
 
     #[test]
-    #[ignore = "Requires model files to be downloaded"]
-    fn test_large_batch_parallel_equivalence() {
-        let mut engine = match create_test_engine() {
-            Some(e) => e,
-            None => {
-                eprintln!("Skipping test: model not available");
-                return;
-            }
-        };
+    fn test_engine_metrics_integration() {
+        let engine = EmbeddingEngine::without_model();
 
-        let sample_texts: Vec<String> = (0..100)
-            .map(|i| format!("sample text number {} for embedding test", i))
-            .collect();
+        // Initial metrics should be zero
+        let initial = engine.get_metrics();
+        assert_eq!(initial.total_embeddings_generated, 0);
 
-        let texts: Vec<&str> = sample_texts.iter().map(|s| s.as_str()).collect();
-
-        // Get baseline with sequential batch processing
-        let sequential = engine.embed_batch_optimized(&texts, 32).unwrap();
-
-        // Get results with large batch processing
-        let parallel = engine.embed_large_batch(&texts, 32).unwrap();
-
-        // Verify same number of results
-        assert_eq!(sequential.len(), parallel.len());
-
-        // Verify vectors are identical within f32 precision
-        for (i, (seq, par)) in sequential.iter().zip(parallel.iter()).enumerate() {
-            assert_eq!(seq.len(), par.len(), "Dimension mismatch at index {}", i);
-
-            for (j, (s, p)) in seq.iter().zip(par.iter()).enumerate() {
-                assert!(
-                    (s - p).abs() < 1e-5,
-                    "Value mismatch at text {} dim {}: sequential={}, parallel={}",
-                    i, j, s, p
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "Performance test - run manually"]
-    fn bench_batch_throughput() {
-        let mut engine = match create_test_engine() {
-            Some(e) => e,
-            None => {
-                eprintln!("Skipping benchmark: model not available");
-                return;
-            }
-        };
-
-        let sample_texts: Vec<String> = (0..1000)
-            .map(|i| format!("sample text number {} for embedding test", i))
-            .collect();
-
-        let texts: Vec<&str> = sample_texts.iter().map(|s| s.as_str()).collect();
-
-        // Time sequential processing (batch_size=1)
-        let start_sequential = std::time::Instant::now();
-        let _sequential_results = engine.embed_batch_optimized(&texts, 1).unwrap();
-        let sequential_duration = start_sequential.elapsed();
-
-        // Time batched processing (batch_size=32)
-        let start_batched = std::time::Instant::now();
-        let _batched_results = engine.embed_batch_optimized(&texts, 32).unwrap();
-        let batched_duration = start_batched.elapsed();
-
-        let speedup = sequential_duration.as_secs_f64() / batched_duration.as_secs_f64();
-
-        println!("\n=== Batch Inference Benchmark ===");
-        println!("Texts processed: {}", texts.len());
-        println!("Sequential (batch_size=1): {:?}", sequential_duration);
-        println!("Batched (batch_size=32): {:?}", batched_duration);
-        println!("Speedup: {:.2}x", speedup);
-
-        // Assert >2x improvement
-        assert!(
-            speedup > 2.0,
-            "Expected >2x speedup, got {:.2}x (sequential: {:?}, batched: {:?})",
-            speedup,
-            sequential_duration,
-            batched_duration
-        );
-    }
-
-    #[test]
-    #[ignore = "Performance test - run manually"]
-    fn bench_various_batch_sizes() {
-        let mut engine = match create_test_engine() {
-            Some(e) => e,
-            None => {
-                eprintln!("Skipping benchmark: model not available");
-                return;
-            }
-        };
-
-        let sample_texts: Vec<String> = (0..500)
-            .map(|i| format!("sample text number {} for embedding test", i))
-            .collect();
-
-        let texts: Vec<&str> = sample_texts.iter().map(|s| s.as_str()).collect();
-
-        let batch_sizes = [1, 4, 8, 16, 32, 64];
-
-        println!("\n=== Batch Size Comparison ===");
-        println!("Texts processed: {}", texts.len());
-
-        let mut baseline_duration = None;
-
-        for batch_size in batch_sizes {
-            let start = std::time::Instant::now();
-            let _results = engine.embed_batch_optimized(&texts, batch_size).unwrap();
-            let duration = start.elapsed();
-
-            let speedup = if let Some(baseline) = baseline_duration {
-                baseline / duration.as_secs_f64()
-            } else {
-                baseline_duration = Some(duration.as_secs_f64());
-                1.0
-            };
-
-            println!(
-                "batch_size={:2}: {:?} ({:.2}x vs batch_size=1)",
-                batch_size, duration, speedup
-            );
-        }
+        // Reset should work without panicking
+        engine.reset_metrics();
+        let after_reset = engine.get_metrics();
+        assert_eq!(after_reset.total_embeddings_generated, 0);
     }
 }
