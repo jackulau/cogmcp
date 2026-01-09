@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cogmcp_core::{Error, Result};
-use cogmcp_embeddings::EmbeddingEngine;
+use cogmcp_embeddings::{EmbeddingEngine, LazyEmbeddingEngine};
 use cogmcp_storage::{cache::Cache, Database};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
@@ -152,9 +152,12 @@ struct EmbeddingRecord {
 /// 1. Generating embeddings for query text
 /// 2. Searching the vector storage for similar embeddings
 /// 3. Enriching results with file path and line number information
+///
+/// Uses `LazyEmbeddingEngine` to defer ONNX model loading until the first
+/// actual search query, improving server startup time.
 pub struct SemanticSearch {
-    /// Embedding engine for generating query embeddings
-    engine: Arc<Mutex<EmbeddingEngine>>,
+    /// Lazy embedding engine for generating query embeddings (defers model loading)
+    engine: Arc<LazyEmbeddingEngine>,
     /// Database for storing and retrieving embeddings
     db: Arc<Database>,
     /// Cache for query embeddings
@@ -165,7 +168,10 @@ pub struct SemanticSearch {
 
 impl SemanticSearch {
     /// Create a new semantic search instance
-    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
+    ///
+    /// The `LazyEmbeddingEngine` defers model loading until the first search query,
+    /// which can significantly improve server startup time.
+    pub fn new(engine: Arc<LazyEmbeddingEngine>, db: Arc<Database>) -> Self {
         Self {
             engine,
             db,
@@ -175,14 +181,29 @@ impl SemanticSearch {
         }
     }
 
-    /// Check if the embedding engine has a model loaded
+    /// Check if the embedding model files are available for loading
+    ///
+    /// This returns true if the model files exist, even if they haven't
+    /// been loaded yet (due to lazy loading). Use `is_loaded()` to check
+    /// if the model has actually been loaded.
     pub fn is_available(&self) -> bool {
-        self.engine.lock().is_loaded()
+        self.engine.is_available()
+    }
+
+    /// Check if the embedding model is currently loaded in memory
+    ///
+    /// Returns true only if the model has been loaded (after the first
+    /// embedding request). Returns false if the model is still in its
+    /// lazy/unloaded state.
+    pub fn is_loaded(&self) -> bool {
+        self.engine.is_loaded()
     }
 
     /// Get the embedding dimension
+    ///
+    /// This returns the configured dimension without loading the model.
     pub fn embedding_dim(&self) -> usize {
-        self.engine.lock().embedding_dim()
+        self.engine.embedding_dim()
     }
 
     /// Search for semantically similar content using a text query
@@ -281,6 +302,9 @@ impl SemanticSearch {
     }
 
     /// Get or compute embedding for a query string
+    ///
+    /// On the first call, this will trigger lazy loading of the embedding model
+    /// if it hasn't been loaded yet.
     fn get_or_compute_embedding(&self, query: &str) -> Result<Vec<f32>> {
         // Check cache first
         if let Some(cached) = self.query_cache.get(&query.to_string()) {
@@ -288,8 +312,8 @@ impl SemanticSearch {
             return Ok(cached);
         }
 
-        // Compute embedding
-        let embedding = self.engine.lock().embed(query)?;
+        // Compute embedding (LazyEmbeddingEngine handles locking internally)
+        let embedding = self.engine.embed(query)?;
 
         // Cache the result
         self.query_cache.insert(query.to_string(), embedding.clone());
@@ -374,13 +398,17 @@ impl SemanticSearch {
     }
 
     /// Index text and store its embedding
+    ///
+    /// On the first call, this will trigger lazy loading of the embedding model
+    /// if it hasn't been loaded yet.
     pub fn index_chunk(
         &self,
         chunk_text: &str,
         symbol_id: Option<i64>,
         chunk_type: ChunkType,
     ) -> Result<i64> {
-        let embedding = self.engine.lock().embed(chunk_text)?;
+        // LazyEmbeddingEngine handles locking internally
+        let embedding = self.engine.embed(chunk_text)?;
         let id = self.db.insert_embedding(
             symbol_id,
             None, // file_id
@@ -398,8 +426,9 @@ impl SemanticSearch {
 
 impl Default for SemanticSearch {
     fn default() -> Self {
+        use cogmcp_embeddings::ModelConfig;
         Self::new(
-            Arc::new(Mutex::new(EmbeddingEngine::without_model())),
+            Arc::new(LazyEmbeddingEngine::new(ModelConfig::default())),
             Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
         )
     }
@@ -456,13 +485,14 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cogmcp_embeddings::ModelConfig;
 
     fn create_test_search() -> SemanticSearch {
         // Create an in-memory database
         let db = Arc::new(Database::in_memory().unwrap());
 
-        // Create a mock embedding engine (without model)
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        // Create a lazy embedding engine with default config (no model files)
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
 
         SemanticSearch::new(engine, db)
     }
@@ -470,7 +500,10 @@ mod tests {
     #[test]
     fn test_semantic_search_creation() {
         let search = create_test_search();
-        assert!(!search.is_available()); // No model loaded
+        // With default config (empty paths), model files are not available
+        assert!(!search.is_available());
+        // Model is not loaded yet (lazy loading)
+        assert!(!search.is_loaded());
     }
 
     #[test]
@@ -615,8 +648,8 @@ mod tests {
             "function",
         ).unwrap();
 
-        // Create search with mock engine
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        // Create search with lazy engine (default config, no model files)
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let search = SemanticSearch::new(engine, db);
 
         // Load embeddings
@@ -662,7 +695,7 @@ mod tests {
         let sym2 = db.insert_symbol(file_id, "high_fn", "function", 10, 15, None, None).unwrap();
         db.insert_embedding(Some(sym2), None, "high similarity function", &high_sim, "function").unwrap();
 
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let search = SemanticSearch::new(engine, db);
 
         let results = search.search_by_embedding(
@@ -695,7 +728,7 @@ mod tests {
             .chain(std::iter::repeat(0.0).take(383))
             .collect();
 
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let search = SemanticSearch::new(engine, db);
 
         // With low threshold, should return result
@@ -729,7 +762,7 @@ mod tests {
         let sym2 = db.insert_symbol(file2_id, "test_fn", "function", 1, 5, None, None).unwrap();
         db.insert_embedding(Some(sym2), None, "test function", &embedding, "function").unwrap();
 
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let search = SemanticSearch::new(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
@@ -761,7 +794,7 @@ mod tests {
         let sym2 = db.insert_symbol(file_id, "MyStruct", "struct", 10, 15, None, None).unwrap();
         db.insert_embedding(Some(sym2), None, "my struct", &embedding, "type").unwrap();
 
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let search = SemanticSearch::new(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
@@ -810,7 +843,7 @@ mod tests {
             db.insert_embedding(Some(sym), None, &format!("function {}", i), &embedding, "function").unwrap();
         }
 
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+        let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let search = SemanticSearch::new(engine, db);
 
         let query: Vec<f32> = vec![1.0; 384];
@@ -831,6 +864,43 @@ mod tests {
         // Test the Default implementation
         let search = SemanticSearch::default();
         assert!(!search.is_available());
+        assert!(!search.is_loaded());
         assert_eq!(search.embedding_dim(), 384);
+    }
+
+    #[test]
+    fn test_lazy_loading_state() {
+        let search = create_test_search();
+
+        // Before any embedding calls, model should not be loaded
+        assert!(!search.is_loaded());
+
+        // With default config (empty paths), model files are not available
+        assert!(!search.is_available());
+
+        // embedding_dim should work without loading the model
+        assert_eq!(search.embedding_dim(), 384);
+
+        // Model still not loaded after getting dimension
+        assert!(!search.is_loaded());
+    }
+
+    #[test]
+    fn test_is_available_vs_is_loaded() {
+        // These test the semantic difference between is_available and is_loaded:
+        // - is_available: checks if model FILES exist on disk
+        // - is_loaded: checks if model is LOADED into memory
+
+        let search = create_test_search();
+
+        // With default config (empty paths), neither condition is true
+        assert!(!search.is_available());
+        assert!(!search.is_loaded());
+
+        // In a real scenario with valid model paths but before first query:
+        // - is_available() would be true (files exist)
+        // - is_loaded() would be false (not loaded yet)
+        // After first query:
+        // - Both would be true
     }
 }
