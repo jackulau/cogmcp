@@ -61,8 +61,7 @@ impl CodeParser {
             Language::Rust => self.parse_rust(content),
             Language::TypeScript | Language::JavaScript => self.parse_typescript(content),
             Language::Python => self.parse_python(content),
-            Language::C => self.parse_c(content),
-            Language::Cpp => self.parse_cpp(content),
+            Language::Go => self.parse_go(content),
             _ => Ok(Vec::new()), // Unsupported language
         }
     }
@@ -521,6 +520,506 @@ impl CodeParser {
             .map(|s| s.trim_start_matches(':').trim().to_string())
     }
 
+    fn parse_go(&self, content: &str) -> Result<Vec<ExtractedSymbol>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set language: {}", e)))?;
+
+        let tree = parser
+            .parse(content, None)
+            .ok_or_else(|| Error::Parse("Failed to parse Go code".into()))?;
+
+        let mut symbols = Vec::new();
+        let root = tree.root_node();
+
+        self.extract_go_symbols(&root, content, &mut symbols);
+
+        Ok(symbols)
+    }
+
+    fn extract_go_symbols(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        symbols: &mut Vec<ExtractedSymbol>,
+    ) {
+        self.extract_go_symbols_with_parent(node, content, symbols, None);
+    }
+
+    fn extract_go_symbols_with_parent(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        symbols: &mut Vec<ExtractedSymbol>,
+        parent_name: Option<String>,
+    ) {
+        let kind_str = node.kind();
+
+        let current_parent = match kind_str {
+            "function_declaration" | "method_declaration" | "type_declaration"
+            | "const_declaration" | "var_declaration" => {
+                // For type_declaration, const_declaration, and var_declaration,
+                // we extract individual specs as separate symbols
+                if kind_str == "type_declaration" {
+                    self.extract_go_type_declaration(node, content, symbols, parent_name.clone());
+                    parent_name.clone()
+                } else if kind_str == "const_declaration" {
+                    self.extract_go_const_declaration(node, content, symbols);
+                    parent_name.clone()
+                } else if kind_str == "var_declaration" {
+                    self.extract_go_var_declaration(node, content, symbols);
+                    parent_name.clone()
+                } else if let Some(symbol) =
+                    self.extract_go_symbol(node, content, kind_str, parent_name.clone())
+                {
+                    let name = symbol.name.clone();
+                    symbols.push(symbol);
+                    Some(name)
+                } else {
+                    parent_name.clone()
+                }
+            }
+            _ => parent_name.clone(),
+        };
+
+        // Recurse into children with updated parent
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.extract_go_symbols_with_parent(&child, content, symbols, current_parent.clone());
+        }
+    }
+
+    fn extract_go_symbol(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        kind_str: &str,
+        parent_name: Option<String>,
+    ) -> Option<ExtractedSymbol> {
+        match kind_str {
+            "function_declaration" => self.extract_go_function(node, content, parent_name),
+            "method_declaration" => self.extract_go_method(node, content),
+            _ => None,
+        }
+    }
+
+    fn extract_go_function(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        parent_name: Option<String>,
+    ) -> Option<ExtractedSymbol> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
+
+        let visibility = self.extract_go_visibility(&name);
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        let doc_comment = self.find_go_doc_comment(node, content);
+        let parameters = self.extract_go_parameters(node, content);
+        let return_type = self.extract_go_return_type(node, content);
+        let type_parameters = self.extract_go_type_params(node, content);
+
+        Some(ExtractedSymbol {
+            name,
+            kind: SymbolKind::Function,
+            start_line,
+            end_line,
+            signature,
+            doc_comment,
+            visibility,
+            modifiers: SymbolModifiers::default(),
+            parent_name,
+            type_parameters,
+            parameters,
+            return_type,
+        })
+    }
+
+    fn extract_go_method(&self, node: &tree_sitter::Node, content: &str) -> Option<ExtractedSymbol> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
+
+        // Get receiver to determine parent type
+        let receiver_name = node.child_by_field_name("receiver").and_then(|receiver| {
+            // The receiver is a parameter_list containing a parameter_declaration
+            let mut cursor = receiver.walk();
+            for child in receiver.children(&mut cursor) {
+                if child.kind() == "parameter_declaration" {
+                    // Look for the type in the parameter
+                    if let Some(type_node) = child.child_by_field_name("type") {
+                        // Handle pointer types like *User
+                        let type_text = type_node.utf8_text(content.as_bytes()).ok()?;
+                        return Some(type_text.trim_start_matches('*').to_string());
+                    }
+                }
+            }
+            None
+        });
+
+        let visibility = self.extract_go_visibility(&name);
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        let doc_comment = self.find_go_doc_comment(node, content);
+        let parameters = self.extract_go_parameters(node, content);
+        let return_type = self.extract_go_return_type(node, content);
+        let type_parameters = self.extract_go_type_params(node, content);
+
+        Some(ExtractedSymbol {
+            name,
+            kind: SymbolKind::Method,
+            start_line,
+            end_line,
+            signature,
+            doc_comment,
+            visibility,
+            modifiers: SymbolModifiers::default(),
+            parent_name: receiver_name,
+            type_parameters,
+            parameters,
+            return_type,
+        })
+    }
+
+    fn extract_go_type_declaration(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        symbols: &mut Vec<ExtractedSymbol>,
+        _parent_name: Option<String>,
+    ) {
+        // type_declaration contains one or more type_spec or type_alias children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "type_spec" => {
+                    if let Some(symbol) = self.extract_go_type_spec(&child, content) {
+                        symbols.push(symbol);
+                    }
+                }
+                "type_alias" => {
+                    if let Some(symbol) = self.extract_go_type_alias(&child, content) {
+                        symbols.push(symbol);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn extract_go_type_spec(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+    ) -> Option<ExtractedSymbol> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
+
+        let visibility = self.extract_go_visibility(&name);
+
+        let type_node = node.child_by_field_name("type")?;
+        let kind = match type_node.kind() {
+            "struct_type" => SymbolKind::Struct,
+            "interface_type" => SymbolKind::Interface,
+            _ => SymbolKind::TypeAlias,
+        };
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        // Look for doc comment above the parent type_declaration
+        let doc_comment = if let Some(parent) = node.parent() {
+            self.find_go_doc_comment(&parent, content)
+        } else {
+            self.find_go_doc_comment(node, content)
+        };
+
+        let type_parameters = self.extract_go_type_params(node, content);
+
+        Some(ExtractedSymbol {
+            name,
+            kind,
+            start_line,
+            end_line,
+            signature,
+            doc_comment,
+            visibility,
+            modifiers: SymbolModifiers::default(),
+            parent_name: None,
+            type_parameters,
+            parameters: Vec::new(),
+            return_type: None,
+        })
+    }
+
+    fn extract_go_type_alias(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+    ) -> Option<ExtractedSymbol> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
+
+        let visibility = self.extract_go_visibility(&name);
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        // Look for doc comment above the parent type_declaration
+        let doc_comment = if let Some(parent) = node.parent() {
+            self.find_go_doc_comment(&parent, content)
+        } else {
+            self.find_go_doc_comment(node, content)
+        };
+
+        let type_parameters = self.extract_go_type_params(node, content);
+
+        Some(ExtractedSymbol {
+            name,
+            kind: SymbolKind::TypeAlias,
+            start_line,
+            end_line,
+            signature,
+            doc_comment,
+            visibility,
+            modifiers: SymbolModifiers::default(),
+            parent_name: None,
+            type_parameters,
+            parameters: Vec::new(),
+            return_type: None,
+        })
+    }
+
+    fn extract_go_const_declaration(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        symbols: &mut Vec<ExtractedSymbol>,
+    ) {
+        // const_declaration contains one or more const_spec children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "const_spec" {
+                if let Some(symbol) = self.extract_go_const_spec(&child, content) {
+                    symbols.push(symbol);
+                }
+            }
+        }
+    }
+
+    fn extract_go_const_spec(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+    ) -> Option<ExtractedSymbol> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
+
+        let visibility = self.extract_go_visibility(&name);
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        // Look for doc comment above the parent const_declaration
+        let doc_comment = if let Some(parent) = node.parent() {
+            self.find_go_doc_comment(&parent, content)
+        } else {
+            self.find_go_doc_comment(node, content)
+        };
+
+        Some(ExtractedSymbol {
+            name,
+            kind: SymbolKind::Constant,
+            start_line,
+            end_line,
+            signature,
+            doc_comment,
+            visibility,
+            modifiers: SymbolModifiers::default(),
+            parent_name: None,
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            return_type: None,
+        })
+    }
+
+    fn extract_go_var_declaration(
+        &self,
+        node: &tree_sitter::Node,
+        content: &str,
+        symbols: &mut Vec<ExtractedSymbol>,
+    ) {
+        // var_declaration contains one or more var_spec children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "var_spec" {
+                if let Some(symbol) = self.extract_go_var_spec(&child, content) {
+                    symbols.push(symbol);
+                }
+            }
+        }
+    }
+
+    fn extract_go_var_spec(&self, node: &tree_sitter::Node, content: &str) -> Option<ExtractedSymbol> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = name_node.utf8_text(content.as_bytes()).ok()?.to_string();
+
+        let visibility = self.extract_go_visibility(&name);
+
+        let start_line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+
+        let signature = content
+            .lines()
+            .nth(start_line as usize - 1)
+            .map(|s| s.trim().to_string());
+
+        // Look for doc comment above the parent var_declaration
+        let doc_comment = if let Some(parent) = node.parent() {
+            self.find_go_doc_comment(&parent, content)
+        } else {
+            self.find_go_doc_comment(node, content)
+        };
+
+        Some(ExtractedSymbol {
+            name,
+            kind: SymbolKind::Variable,
+            start_line,
+            end_line,
+            signature,
+            doc_comment,
+            visibility,
+            modifiers: SymbolModifiers::default(),
+            parent_name: None,
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            return_type: None,
+        })
+    }
+
+    fn extract_go_visibility(&self, name: &str) -> SymbolVisibility {
+        // Go uses capitalization for visibility
+        if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            SymbolVisibility::Public
+        } else {
+            SymbolVisibility::Private
+        }
+    }
+
+    fn extract_go_parameters(&self, node: &tree_sitter::Node, content: &str) -> Vec<ParameterInfo> {
+        let mut params = Vec::new();
+
+        if let Some(parameters) = node.child_by_field_name("parameters") {
+            let mut cursor = parameters.walk();
+            for child in parameters.children(&mut cursor) {
+                if child.kind() == "parameter_declaration" {
+                    // A parameter_declaration can have multiple names with the same type
+                    let type_annotation = child
+                        .child_by_field_name("type")
+                        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                        .map(|s| s.to_string());
+
+                    // Get all name children
+                    let mut name_cursor = child.walk();
+                    let mut has_name = false;
+                    for name_child in child.children(&mut name_cursor) {
+                        if name_child.kind() == "identifier" {
+                            // Check if this is the "name" field, not the "type" field
+                            if let Some(field_name) =
+                                child.field_name_for_child(name_child.id() as u32)
+                            {
+                                if field_name == "name" {
+                                    if let Ok(name) = name_child.utf8_text(content.as_bytes()) {
+                                        params.push(ParameterInfo {
+                                            name: name.to_string(),
+                                            type_annotation: type_annotation.clone(),
+                                        });
+                                        has_name = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If no named parameter found, the type might be the only element (anonymous param)
+                    if !has_name && type_annotation.is_some() {
+                        params.push(ParameterInfo {
+                            name: String::new(),
+                            type_annotation,
+                        });
+                    }
+                }
+            }
+        }
+
+        params
+    }
+
+    fn extract_go_return_type(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
+        node.child_by_field_name("result")
+            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+            .map(|s| s.to_string())
+    }
+
+    fn extract_go_type_params(&self, node: &tree_sitter::Node, content: &str) -> Vec<String> {
+        let mut params = Vec::new();
+
+        if let Some(type_params) = node.child_by_field_name("type_parameters") {
+            let mut cursor = type_params.walk();
+            for child in type_params.children(&mut cursor) {
+                if child.kind() == "type_parameter_declaration" {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        if let Ok(text) = name.utf8_text(content.as_bytes()) {
+                            params.push(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        params
+    }
+
+    fn find_go_doc_comment(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
+        // Look at previous sibling for comment
+        if let Some(prev) = node.prev_sibling() {
+            if prev.kind() == "comment" {
+                return prev.utf8_text(content.as_bytes()).ok().map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
     fn parse_python(&self, content: &str) -> Result<Vec<ExtractedSymbol>> {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -762,19 +1261,23 @@ impl CodeParser {
 
     fn find_python_docstring(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
         // Look for string as first child of body
-        let body = node.child_by_field_name("body")?;
-        // Only check first statement for docstring
-        let first_child = body.child(0)?;
-        if first_child.kind() == "expression_statement" {
-            let mut inner_cursor = first_child.walk();
-            for inner in first_child.children(&mut inner_cursor) {
-                if inner.kind() == "string" {
-                    return inner.utf8_text(content.as_bytes()).ok().map(|s| {
-                        s.trim_matches('"')
-                            .trim_matches('\'')
-                            .trim()
-                            .to_string()
-                    });
+        if let Some(body) = node.child_by_field_name("body") {
+            // Only check the first statement (child at index 0 is often an opening brace)
+            // Use child(0) or iterate once to get first expression_statement
+            let first_child = body.child(0);
+            if let Some(child) = first_child {
+                if child.kind() == "expression_statement" {
+                    let mut inner_cursor = child.walk();
+                    for inner in child.children(&mut inner_cursor) {
+                        if inner.kind() == "string" {
+                            return inner.utf8_text(content.as_bytes()).ok().map(|s| {
+                                s.trim_matches('"')
+                                    .trim_matches('\'')
+                                    .trim()
+                                    .to_string()
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1984,333 +2487,182 @@ pub fn returns_nothing() {}
         assert!(no_return.return_type.is_none() || no_return.signature.as_ref().map(|s| !s.contains("->")).unwrap_or(true));
     }
 
-    // ==================== C Language Tests ====================
-
     #[test]
-    fn test_parse_c_function() {
+    fn test_parse_go_function() {
         let parser = CodeParser::new();
         let code = r#"
-int add(int a, int b) {
-    return a + b;
+package main
+
+func PublicFunction(x int, y string) (int, error) {
+    return 0, nil
 }
 
-static void helper(void) {
-    // file-local function
+func privateFunction() {
+    // private
 }
 "#;
-        let symbols = parser.parse(code, Language::C).unwrap();
+        let symbols = parser.parse(code, Language::Go).unwrap();
 
-        // Assert add function is extracted and Public
-        let add_fn = symbols.iter().find(|s| s.name == "add").unwrap();
-        assert_eq!(add_fn.kind, SymbolKind::Function);
-        assert_eq!(add_fn.visibility, SymbolVisibility::Public);
+        // Assert public function is Public visibility
+        let public_fn = symbols.iter().find(|s| s.name == "PublicFunction").unwrap();
+        assert_eq!(public_fn.kind, SymbolKind::Function);
+        assert_eq!(public_fn.visibility, SymbolVisibility::Public);
 
-        // Assert helper is Private (static)
-        let helper_fn = symbols.iter().find(|s| s.name == "helper").unwrap();
-        assert_eq!(helper_fn.kind, SymbolKind::Function);
-        assert_eq!(helper_fn.visibility, SymbolVisibility::Private);
-        assert!(helper_fn.modifiers.is_static);
+        // Assert private function is Private visibility
+        let private_fn = symbols.iter().find(|s| s.name == "privateFunction").unwrap();
+        assert_eq!(private_fn.kind, SymbolKind::Function);
+        assert_eq!(private_fn.visibility, SymbolVisibility::Private);
     }
 
     #[test]
-    fn test_parse_c_struct() {
+    fn test_parse_go_struct_and_methods() {
         let parser = CodeParser::new();
         let code = r#"
-struct Point {
-    int x;
-    int y;
-};
+package main
 
-typedef struct {
-    char* name;
-    int age;
-} Person;
-"#;
-        let symbols = parser.parse(code, Language::C).unwrap();
+type User struct {
+    Name string
+    Age  int
+}
 
-        // Assert Point struct extracted
-        let point = symbols.iter().find(|s| s.name == "Point");
-        assert!(point.is_some(), "Point struct should be extracted");
-        let point = point.unwrap();
-        assert_eq!(point.kind, SymbolKind::Struct);
+func (u *User) GetName() string {
+    return u.Name
+}
 
-        // Assert Person typedef extracted
-        let person = symbols.iter().find(|s| s.name == "Person");
-        assert!(person.is_some(), "Person typedef should be extracted");
-        let person = person.unwrap();
-        assert_eq!(person.kind, SymbolKind::TypeAlias);
-    }
-
-    #[test]
-    fn test_parse_c_enum() {
-        let parser = CodeParser::new();
-        let code = r#"
-enum Color {
-    RED,
-    GREEN,
-    BLUE
-};
-"#;
-        let symbols = parser.parse(code, Language::C).unwrap();
-
-        let color = symbols.iter().find(|s| s.name == "Color").unwrap();
-        assert_eq!(color.kind, SymbolKind::Enum);
-    }
-
-    #[test]
-    fn test_parse_c_macro() {
-        let parser = CodeParser::new();
-        let code = r#"
-#define MAX_SIZE 100
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-"#;
-        let symbols = parser.parse(code, Language::C).unwrap();
-
-        let max_size = symbols.iter().find(|s| s.name == "MAX_SIZE");
-        assert!(max_size.is_some(), "MAX_SIZE macro should be extracted");
-        assert_eq!(max_size.unwrap().kind, SymbolKind::Macro);
-
-        let min_macro = symbols.iter().find(|s| s.name == "MIN");
-        assert!(min_macro.is_some(), "MIN macro should be extracted");
-        assert_eq!(min_macro.unwrap().kind, SymbolKind::Macro);
-    }
-
-    #[test]
-    fn test_parse_c_union() {
-        let parser = CodeParser::new();
-        let code = r#"
-union Data {
-    int i;
-    float f;
-    char c;
-};
-"#;
-        let symbols = parser.parse(code, Language::C).unwrap();
-
-        let data = symbols.iter().find(|s| s.name == "Data").unwrap();
-        assert_eq!(data.kind, SymbolKind::Struct); // Unions treated as structs
-    }
-
-    #[test]
-    fn test_parse_c_global_variable() {
-        let parser = CodeParser::new();
-        let code = r#"
-int global_var = 42;
-static int file_local_var = 10;
-const int constant_value = 100;
-"#;
-        let symbols = parser.parse(code, Language::C).unwrap();
-
-        let global = symbols.iter().find(|s| s.name == "global_var");
-        assert!(global.is_some(), "global_var should be extracted");
-        let global = global.unwrap();
-        assert_eq!(global.kind, SymbolKind::Variable);
-        assert_eq!(global.visibility, SymbolVisibility::Public);
-
-        let file_local = symbols.iter().find(|s| s.name == "file_local_var");
-        assert!(file_local.is_some(), "file_local_var should be extracted");
-        let file_local = file_local.unwrap();
-        assert_eq!(file_local.visibility, SymbolVisibility::Private);
-        assert!(file_local.modifiers.is_static);
-
-        let const_val = symbols.iter().find(|s| s.name == "constant_value");
-        assert!(const_val.is_some(), "constant_value should be extracted");
-        let const_val = const_val.unwrap();
-        assert!(const_val.modifiers.is_const);
-    }
-
-    // ==================== C++ Language Tests ====================
-
-    #[test]
-    fn test_parse_cpp_class() {
-        let parser = CodeParser::new();
-        let code = r#"
-class Rectangle {
-public:
-    Rectangle(int w, int h);
-    int area() const;
-
-private:
-    int width;
-    int height;
-};
-"#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
-
-        // Assert Rectangle class extracted
-        let rect = symbols.iter().find(|s| s.name == "Rectangle" && s.kind == SymbolKind::Class);
-        assert!(rect.is_some(), "Rectangle class should be extracted");
-
-        // Check for fields (width and height should be private)
-        let width = symbols.iter().find(|s| s.name == "width");
-        let height = symbols.iter().find(|s| s.name == "height");
-        // Fields may or may not be extracted depending on parser detail level
-        // The important thing is the class is extracted
-        if let Some(w) = width {
-            assert_eq!(w.visibility, SymbolVisibility::Private);
-        }
-        if let Some(h) = height {
-            assert_eq!(h.visibility, SymbolVisibility::Private);
-        }
-    }
-
-    #[test]
-    fn test_parse_cpp_namespace() {
-        let parser = CodeParser::new();
-        let code = r#"
-namespace math {
-    int add(int a, int b) {
-        return a + b;
-    }
-
-    class Vector {
-    public:
-        double x, y, z;
-    };
+func (u User) GetAge() int {
+    return u.Age
 }
 "#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
+        let symbols = parser.parse(code, Language::Go).unwrap();
 
-        // Assert math namespace extracted
-        let math_ns = symbols.iter().find(|s| s.name == "math" && s.kind == SymbolKind::Module);
-        assert!(math_ns.is_some(), "math namespace should be extracted");
+        // Assert User struct extracted
+        let user_struct = symbols.iter().find(|s| s.name == "User").unwrap();
+        assert_eq!(user_struct.kind, SymbolKind::Struct);
+        assert_eq!(user_struct.visibility, SymbolVisibility::Public);
 
-        // Assert add function has math as parent
-        let add_fn = symbols.iter().find(|s| s.name == "add" && s.kind == SymbolKind::Function);
-        assert!(add_fn.is_some(), "add function should be extracted");
-        let add_fn = add_fn.unwrap();
-        assert_eq!(add_fn.parent_name, Some("math".to_string()));
+        // Assert GetName method extracted with parent
+        let get_name = symbols.iter().find(|s| s.name == "GetName").unwrap();
+        assert_eq!(get_name.kind, SymbolKind::Method);
+        assert_eq!(get_name.visibility, SymbolVisibility::Public);
+        assert_eq!(get_name.parent_name, Some("User".to_string()));
 
-        // Assert Vector class has math as parent
-        let vector = symbols.iter().find(|s| s.name == "Vector" && s.kind == SymbolKind::Class);
-        assert!(vector.is_some(), "Vector class should be extracted");
-        let vector = vector.unwrap();
-        assert_eq!(vector.parent_name, Some("math".to_string()));
+        // Assert GetAge method extracted
+        let get_age = symbols.iter().find(|s| s.name == "GetAge").unwrap();
+        assert_eq!(get_age.kind, SymbolKind::Method);
+        assert_eq!(get_age.parent_name, Some("User".to_string()));
     }
 
     #[test]
-    fn test_parse_cpp_template() {
+    fn test_parse_go_interface() {
         let parser = CodeParser::new();
         let code = r#"
-template<typename T>
-class Container {
-public:
-    T value;
-    T get() const { return value; }
-};
-"#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
+package main
 
-        // Assert Container extracted with type_parameters = ["T"]
-        let container = symbols.iter().find(|s| s.name == "Container" && s.kind == SymbolKind::Class);
-        assert!(container.is_some(), "Container template class should be extracted");
-        let container = container.unwrap();
-        assert!(container.type_parameters.contains(&"T".to_string()), "Container should have type parameter T");
-    }
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
 
-    #[test]
-    fn test_parse_cpp_virtual_method() {
-        let parser = CodeParser::new();
-        let code = r#"
-class Animal {
-public:
-    virtual void speak() = 0;
-    virtual void move() {}
-};
-"#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
-
-        let animal = symbols.iter().find(|s| s.name == "Animal" && s.kind == SymbolKind::Class);
-        assert!(animal.is_some(), "Animal class should be extracted");
-    }
-
-    #[test]
-    fn test_parse_cpp_operator_overload() {
-        let parser = CodeParser::new();
-        let code = r#"
-class Complex {
-public:
-    Complex operator+(const Complex& other) {
-        return Complex();
-    }
-};
-"#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
-
-        let complex = symbols.iter().find(|s| s.name == "Complex" && s.kind == SymbolKind::Class);
-        assert!(complex.is_some(), "Complex class should be extracted");
-    }
-
-    #[test]
-    fn test_parse_cpp_access_specifiers() {
-        let parser = CodeParser::new();
-        let code = r#"
-class MyClass {
-public:
-    int public_var;
-protected:
-    int protected_var;
-private:
-    int private_var;
-};
-"#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
-
-        let public_v = symbols.iter().find(|s| s.name == "public_var");
-        let protected_v = symbols.iter().find(|s| s.name == "protected_var");
-        let private_v = symbols.iter().find(|s| s.name == "private_var");
-
-        if let Some(v) = public_v {
-            assert_eq!(v.visibility, SymbolVisibility::Public);
-        }
-        if let Some(v) = protected_v {
-            assert_eq!(v.visibility, SymbolVisibility::Protected);
-        }
-        if let Some(v) = private_v {
-            assert_eq!(v.visibility, SymbolVisibility::Private);
-        }
-    }
-
-    #[test]
-    fn test_parse_cpp_method_definition() {
-        let parser = CodeParser::new();
-        let code = r#"
-class MyClass {
-public:
-    void method();
-};
-
-void MyClass::method() {
-    // implementation
+type privateInterface interface {
+    doSomething()
 }
 "#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
+        let symbols = parser.parse(code, Language::Go).unwrap();
 
-        // Should extract MyClass
-        let my_class = symbols.iter().find(|s| s.name == "MyClass" && s.kind == SymbolKind::Class);
-        assert!(my_class.is_some(), "MyClass should be extracted");
+        // Assert Reader interface extracted
+        let reader = symbols.iter().find(|s| s.name == "Reader").unwrap();
+        assert_eq!(reader.kind, SymbolKind::Interface);
+        assert_eq!(reader.visibility, SymbolVisibility::Public);
 
-        // Should extract method (either as declaration inside class or definition outside)
-        let method = symbols.iter().find(|s| s.name == "method" && s.kind == SymbolKind::Method);
-        assert!(method.is_some(), "method should be extracted");
+        // Assert private interface
+        let private_iface = symbols.iter().find(|s| s.name == "privateInterface").unwrap();
+        assert_eq!(private_iface.kind, SymbolKind::Interface);
+        assert_eq!(private_iface.visibility, SymbolVisibility::Private);
     }
 
     #[test]
-    fn test_parse_cpp_multiple_template_params() {
+    fn test_parse_go_constants_and_variables() {
         let parser = CodeParser::new();
         let code = r#"
-template<typename K, typename V>
-class Map {
-public:
-    V& get(const K& key);
-};
-"#;
-        let symbols = parser.parse(code, Language::Cpp).unwrap();
+package main
 
-        let map = symbols.iter().find(|s| s.name == "Map" && s.kind == SymbolKind::Class);
-        assert!(map.is_some(), "Map template class should be extracted");
-        let map = map.unwrap();
-        assert!(map.type_parameters.contains(&"K".to_string()), "Map should have type parameter K");
-        assert!(map.type_parameters.contains(&"V".to_string()), "Map should have type parameter V");
+const MaxSize = 100
+const privateConst = "secret"
+
+var GlobalVar int
+var privateVar string
+"#;
+        let symbols = parser.parse(code, Language::Go).unwrap();
+
+        // Assert public constant
+        let max_size = symbols.iter().find(|s| s.name == "MaxSize").unwrap();
+        assert_eq!(max_size.kind, SymbolKind::Constant);
+        assert_eq!(max_size.visibility, SymbolVisibility::Public);
+
+        // Assert private constant
+        let private_const = symbols.iter().find(|s| s.name == "privateConst").unwrap();
+        assert_eq!(private_const.kind, SymbolKind::Constant);
+        assert_eq!(private_const.visibility, SymbolVisibility::Private);
+
+        // Assert public variable
+        let global_var = symbols.iter().find(|s| s.name == "GlobalVar").unwrap();
+        assert_eq!(global_var.kind, SymbolKind::Variable);
+        assert_eq!(global_var.visibility, SymbolVisibility::Public);
+
+        // Assert private variable
+        let private_var = symbols.iter().find(|s| s.name == "privateVar").unwrap();
+        assert_eq!(private_var.kind, SymbolKind::Variable);
+        assert_eq!(private_var.visibility, SymbolVisibility::Private);
+    }
+
+    #[test]
+    fn test_parse_go_type_alias() {
+        let parser = CodeParser::new();
+        let code = r#"
+package main
+
+type StringAlias = string
+type IntSlice []int
+"#;
+        let symbols = parser.parse(code, Language::Go).unwrap();
+
+        // Type alias
+        let string_alias = symbols.iter().find(|s| s.name == "StringAlias").unwrap();
+        assert_eq!(string_alias.kind, SymbolKind::TypeAlias);
+        assert_eq!(string_alias.visibility, SymbolVisibility::Public);
+
+        // Type definition (not an alias, but a new type)
+        let int_slice = symbols.iter().find(|s| s.name == "IntSlice").unwrap();
+        assert_eq!(int_slice.kind, SymbolKind::TypeAlias);
+        assert_eq!(int_slice.visibility, SymbolVisibility::Public);
+    }
+
+    #[test]
+    fn test_parse_go_function_with_return_type() {
+        let parser = CodeParser::new();
+        let code = r#"
+package main
+
+func ReturnsInt() int {
+    return 42
+}
+
+func ReturnsMultiple() (string, error) {
+    return "", nil
+}
+
+func NoReturn() {
+}
+"#;
+        let symbols = parser.parse(code, Language::Go).unwrap();
+
+        let returns_int = symbols.iter().find(|s| s.name == "ReturnsInt").unwrap();
+        assert!(returns_int.return_type.is_some());
+        assert_eq!(returns_int.return_type.as_ref().unwrap(), "int");
+
+        let returns_multiple = symbols.iter().find(|s| s.name == "ReturnsMultiple").unwrap();
+        assert!(returns_multiple.return_type.is_some());
+
+        let no_return = symbols.iter().find(|s| s.name == "NoReturn").unwrap();
+        assert!(no_return.return_type.is_none());
     }
 }
