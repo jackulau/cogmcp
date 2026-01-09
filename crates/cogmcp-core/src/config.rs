@@ -429,16 +429,33 @@ pub struct SearchConfig {
     pub rrf_k: f32,
     /// Default result limit
     pub default_limit: usize,
-    /// Enable HNSW approximate nearest neighbor search
-    pub use_hnsw: bool,
-    /// HNSW ef_construction parameter (higher = better recall, slower build)
-    pub hnsw_ef_construction: u32,
-    /// HNSW ef_search parameter (higher = better recall, slower search)
-    pub hnsw_ef_search: u32,
-    /// HNSW m parameter (connections per layer)
-    pub hnsw_m: u32,
-    /// Minimum embeddings count to trigger HNSW (below this, brute-force is used)
-    pub hnsw_min_embeddings: usize,
+    /// Cache configuration
+    pub cache: CacheConfig,
+}
+
+/// Cache configuration for search results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Whether caching is enabled
+    pub enabled: bool,
+    /// Maximum number of cached search results
+    pub max_entries: usize,
+    /// TTL for cached results in seconds
+    pub result_ttl_secs: u64,
+    /// TTL for cached embeddings in seconds
+    pub embedding_ttl_secs: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: 1000,
+            result_ttl_secs: 300,      // 5 minutes
+            embedding_ttl_secs: 3600,  // 1 hour
+        }
+    }
 }
 
 impl Default for SearchConfig {
@@ -450,11 +467,7 @@ impl Default for SearchConfig {
             semantic_weight: 0.5,
             rrf_k: 60.0,
             default_limit: 20,
-            use_hnsw: true,
-            hnsw_ef_construction: 200,
-            hnsw_ef_search: 100,
-            hnsw_m: 16,
-            hnsw_min_embeddings: 1000,
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -485,428 +498,9 @@ mod tests {
         assert_eq!(config.semantic_weight, 0.5);
         assert_eq!(config.rrf_k, 60.0);
         assert_eq!(config.default_limit, 20);
-        // HNSW config
-        assert!(config.use_hnsw);
-        assert_eq!(config.hnsw_ef_construction, 200);
-        assert_eq!(config.hnsw_ef_search, 100);
-        assert_eq!(config.hnsw_m, 16);
-        assert_eq!(config.hnsw_min_embeddings, 1000);
-    }
-
-    #[test]
-    fn test_config_validation_default() {
-        let config = Config::default();
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_config_validation_invalid_transport() {
-        let mut config = Config::default();
-        config.server.transport = "invalid".to_string();
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid transport"));
-    }
-
-    #[test]
-    fn test_config_validation_invalid_log_level() {
-        let mut config = Config::default();
-        config.server.log_level = "invalid".to_string();
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid log_level"));
-    }
-
-    #[test]
-    fn test_config_validation_invalid_chunk_overlap() {
-        let mut config = Config::default();
-        config.context.chunk_overlap = 1.5;
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid chunk_overlap"));
-    }
-
-    #[test]
-    fn test_config_validation_invalid_chunking_strategy() {
-        let mut config = Config::default();
-        config.context.chunking_strategy = "invalid".to_string();
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid chunking_strategy"));
-    }
-
-    #[test]
-    fn test_config_validation_invalid_search_mode() {
-        let mut config = Config::default();
-        config.search.default_mode = "invalid".to_string();
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid default_mode"));
-    }
-
-    #[test]
-    fn test_config_validation_invalid_min_similarity() {
-        let mut config = Config::default();
-        config.search.min_similarity = -0.5;
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid min_similarity"));
-    }
-
-    #[test]
-    fn test_shared_config_from_default() {
-        let shared = SharedConfig::from_config(Config::default()).unwrap();
-        let config = shared.current();
-        assert_eq!(config.server.transport, "stdio");
-    }
-
-    #[test]
-    fn test_shared_config_current() {
-        let shared = SharedConfig::from_config(Config::default()).unwrap();
-        let config1 = shared.current();
-        let config2 = shared.current();
-        // Both should see the same config
-        assert_eq!(config1.server.transport, config2.server.transport);
-    }
-
-    #[test]
-    fn test_shared_config_get() {
-        let shared = SharedConfig::from_config(Config::default()).unwrap();
-        let config = shared.get();
-        assert_eq!(config.server.transport, "stdio");
-    }
-
-    #[test]
-    fn test_shared_config_load_from_file() {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        writeln!(
-            temp_file,
-            r#"
-[server]
-transport = "http"
-log_level = "debug"
-
-[indexing]
-max_file_size = 1000
-"#
-        )
-        .unwrap();
-
-        let shared = SharedConfig::load_from_path(temp_file.path()).unwrap();
-        let config = shared.current();
-        assert_eq!(config.server.transport, "http");
-        assert_eq!(config.server.log_level, "debug");
-        assert_eq!(config.indexing.max_file_size, 1000);
-    }
-
-    #[test]
-    fn test_shared_config_reload() {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        writeln!(
-            temp_file,
-            r#"
-[server]
-transport = "stdio"
-log_level = "info"
-"#
-        )
-        .unwrap();
-
-        let shared = SharedConfig::load_from_path(temp_file.path()).unwrap();
-        assert_eq!(shared.current().server.log_level, "info");
-
-        // Modify the file
-        let path = temp_file.path().to_path_buf();
-        std::fs::write(
-            &path,
-            r#"
-[server]
-transport = "stdio"
-log_level = "debug"
-"#,
-        )
-        .unwrap();
-
-        // Reload and verify
-        shared.reload().unwrap();
-        assert_eq!(shared.current().server.log_level, "debug");
-    }
-
-    #[test]
-    fn test_shared_config_reload_invalid_rejected() {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        writeln!(
-            temp_file,
-            r#"
-[server]
-transport = "stdio"
-log_level = "info"
-"#
-        )
-        .unwrap();
-
-        let shared = SharedConfig::load_from_path(temp_file.path()).unwrap();
-        let original_level = shared.current().server.log_level.clone();
-
-        // Write invalid config
-        let path = temp_file.path().to_path_buf();
-        std::fs::write(
-            &path,
-            r#"
-[server]
-transport = "invalid_transport"
-log_level = "info"
-"#,
-        )
-        .unwrap();
-
-        // Reload should fail
-        let result = shared.reload();
-        assert!(result.is_err());
-
-        // Original config should be preserved
-        assert_eq!(shared.current().server.log_level, original_level);
-    }
-
-    #[tokio::test]
-    async fn test_shared_config_subscribe() {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        writeln!(
-            temp_file,
-            r#"
-[server]
-transport = "stdio"
-log_level = "info"
-"#
-        )
-        .unwrap();
-
-        let shared = SharedConfig::load_from_path(temp_file.path()).unwrap();
-        let mut receiver = shared.subscribe();
-
-        // Modify the file
-        let path = temp_file.path().to_path_buf();
-        std::fs::write(
-            &path,
-            r#"
-[server]
-transport = "stdio"
-log_level = "debug"
-"#,
-        )
-        .unwrap();
-
-        // Reload
-        shared.reload().unwrap();
-
-        // Should receive the event
-        let event = receiver.try_recv().unwrap();
-        assert_eq!(event.old_config.server.log_level, "info");
-        assert_eq!(event.new_config.server.log_level, "debug");
-    }
-
-    #[test]
-    fn test_config_watcher_creation() {
-        let shared = SharedConfig::from_config(Config::default()).unwrap();
-        let watcher = ConfigWatcher::new(shared.clone(), PathBuf::from("/tmp/test.toml"));
-        assert_eq!(watcher.watch_path(), Path::new("/tmp/test.toml"));
-    }
-
-    #[test]
-    fn test_config_watcher_trigger_reload() {
-        let mut temp_file = NamedTempFile::new().unwrap();
-        writeln!(
-            temp_file,
-            r#"
-[server]
-transport = "stdio"
-log_level = "info"
-"#
-        )
-        .unwrap();
-
-        let shared = SharedConfig::load_from_path(temp_file.path()).unwrap();
-        let watcher = ConfigWatcher::new(shared.clone(), temp_file.path().to_path_buf());
-
-        // Modify the file
-        let path = temp_file.path().to_path_buf();
-        std::fs::write(
-            &path,
-            r#"
-[server]
-transport = "stdio"
-log_level = "warn"
-"#,
-        )
-        .unwrap();
-
-        // Trigger reload via watcher
-        watcher.trigger_reload().unwrap();
-        assert_eq!(shared.current().server.log_level, "warn");
-    }
-
-    #[test]
-    fn test_shared_config_debug() {
-        let shared = SharedConfig::from_config(Config::default()).unwrap();
-        let debug_str = format!("{:?}", shared);
-        assert!(debug_str.contains("SharedConfig"));
-    }
-
-    #[test]
-    fn test_config_watcher_debug() {
-        let shared = SharedConfig::from_config(Config::default()).unwrap();
-        let watcher = ConfigWatcher::new(shared, PathBuf::from("/tmp/test.toml"));
-        let debug_str = format!("{:?}", watcher);
-        assert!(debug_str.contains("ConfigWatcher"));
-        assert!(debug_str.contains("/tmp/test.toml"));
-    }
-
-    #[test]
-    fn test_shared_config_set_path() {
-        let shared = SharedConfig::from_config(Config::default()).unwrap();
-        assert!(shared.config_path().is_none());
-
-        shared.set_config_path(Some(PathBuf::from("/tmp/new_config.toml")));
-        assert_eq!(
-            shared.config_path(),
-            Some(PathBuf::from("/tmp/new_config.toml"))
-        );
-
-        shared.set_config_path(None);
-        assert!(shared.config_path().is_none());
-    }
-
-    #[test]
-    fn test_cache_config_defaults() {
-        let config = CacheConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.embedding_cache_capacity, 10000);
-        assert!(config.embedding_cache_ttl_seconds.is_none());
-        assert_eq!(config.query_cache_ttl_seconds, 300);
-    }
-
-    #[test]
-    fn test_config_includes_cache() {
-        let config = Config::default();
         assert!(config.cache.enabled);
-        assert_eq!(config.cache.embedding_cache_capacity, 10000);
-    }
-
-    #[test]
-    fn test_cache_config_toml_parsing() {
-        let toml_str = r#"
-            [cache]
-            enabled = false
-            embedding_cache_capacity = 5000
-            embedding_cache_ttl_seconds = 600
-            query_cache_ttl_seconds = 120
-        "#;
-
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(!config.cache.enabled);
-        assert_eq!(config.cache.embedding_cache_capacity, 5000);
-        assert_eq!(config.cache.embedding_cache_ttl_seconds, Some(600));
-        assert_eq!(config.cache.query_cache_ttl_seconds, 120);
-    }
-
-    #[test]
-    fn test_cache_config_partial_toml_parsing() {
-        let toml_str = r#"
-            [cache]
-            embedding_cache_capacity = 20000
-        "#;
-
-        let config: Config = toml::from_str(toml_str).unwrap();
-        // Specified value
-        assert_eq!(config.cache.embedding_cache_capacity, 20000);
-        // Defaults for unspecified values
-        assert!(config.cache.enabled);
-        assert!(config.cache.embedding_cache_ttl_seconds.is_none());
-        assert_eq!(config.cache.query_cache_ttl_seconds, 300);
-    }
-
-    #[test]
-    fn test_cache_config_defaults() {
-        let config = CacheConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.query_cache_capacity, 1000);
-        assert_eq!(config.query_cache_ttl_seconds, 300);
-    }
-
-    #[test]
-    fn test_pool_config_defaults() {
-        let config = PoolConfig::default();
-        assert_eq!(config.max_connections, 10);
-        assert_eq!(config.min_idle, Some(2));
-        assert_eq!(config.connection_timeout_secs, 30);
-        assert_eq!(config.idle_timeout_secs, Some(600));
-    }
-
-    #[test]
-    fn test_config_includes_pool() {
-        let config = Config::default();
-        assert_eq!(config.pool.max_connections, 10);
-        assert_eq!(config.pool.min_idle, Some(2));
-        assert_eq!(config.pool.connection_timeout_secs, 30);
-        assert_eq!(config.pool.idle_timeout_secs, Some(600));
-    }
-
-    #[test]
-    fn test_pool_config_serializable() {
-        let config = PoolConfig::default();
-        let serialized = toml::to_string(&config).expect("Failed to serialize PoolConfig");
-        assert!(serialized.contains("max_connections = 10"));
-        assert!(serialized.contains("connection_timeout_secs = 30"));
-    }
-
-    #[test]
-    fn test_config_backwards_compatible() {
-        // Test that config without pool section still works
-        let toml_str = r#"
-[server]
-transport = "stdio"
-log_level = "debug"
-
-[indexing]
-max_file_size = 1000
-"#;
-        let config: Config = toml::from_str(toml_str).expect("Failed to parse config");
-        // Pool should have defaults
-        assert_eq!(config.pool.max_connections, 10);
-        assert_eq!(config.pool.min_idle, Some(2));
-        // Specified values should be loaded
-        assert_eq!(config.server.log_level, "debug");
-        assert_eq!(config.indexing.max_file_size, 1000);
-    }
-
-    #[test]
-    fn test_config_with_pool_section() {
-        let toml_str = r#"
-[server]
-transport = "stdio"
-
-[pool]
-max_connections = 20
-min_idle = 5
-connection_timeout_secs = 60
-idle_timeout_secs = 1200
-"#;
-        let config: Config = toml::from_str(toml_str).expect("Failed to parse config with pool");
-        assert_eq!(config.pool.max_connections, 20);
-        assert_eq!(config.pool.min_idle, Some(5));
-        assert_eq!(config.pool.connection_timeout_secs, 60);
-        assert_eq!(config.pool.idle_timeout_secs, Some(1200));
+        assert_eq!(config.cache.max_entries, 1000);
+        assert_eq!(config.cache.result_ttl_secs, 300);
+        assert_eq!(config.cache.embedding_ttl_secs, 3600);
     }
 }

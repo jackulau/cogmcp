@@ -19,6 +19,8 @@ use tracing::{debug, info, instrument};
 
 use crate::hnsw::{HnswConfig, HnswIndex};
 
+use crate::cache::{CacheStats, SearchCache, SearchCacheConfig, make_cache_key};
+
 /// Chunk type for categorizing search results
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChunkType {
@@ -118,7 +120,7 @@ impl SemanticSearchOptions {
 }
 
 /// Semantic search result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SemanticSearchResult {
     /// File path containing the match
     pub path: String,
@@ -208,28 +210,29 @@ pub struct SemanticSearch {
     query_cache: LruCacheWithTtl<String, Vec<f32>>,
     /// Cached embeddings from database for in-memory search
     embeddings_cache: RwLock<Option<Vec<EmbeddingRecord>>>,
-    /// HNSW index for approximate nearest neighbor search
-    hnsw_index: RwLock<Option<HnswIndex>>,
-    /// Whether to use HNSW search
-    use_hnsw: bool,
-    /// Path to persist HNSW index
-    hnsw_path: Option<PathBuf>,
+    /// Multi-level search cache for results and embeddings
+    search_cache: Arc<SearchCache>,
 }
 
 impl SemanticSearch {
-    /// Create a new semantic search instance with cache configuration
-    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>, cache_config: &CacheConfig) -> Self {
-        let ttl = Duration::from_secs(cache_config.query_cache_ttl_seconds);
-        let capacity = cache_config.query_cache_capacity;
+    /// Create a new semantic search instance
+    pub fn new(engine: Arc<Mutex<EmbeddingEngine>>, db: Arc<Database>) -> Self {
+        Self::with_cache_config(engine, db, SearchCacheConfig::default())
+    }
 
+    /// Create a new semantic search instance with custom cache configuration
+    pub fn with_cache_config(
+        engine: Arc<Mutex<EmbeddingEngine>>,
+        db: Arc<Database>,
+        cache_config: SearchCacheConfig,
+    ) -> Self {
         Self {
             engine,
             db,
-            query_cache: LruCacheWithTtl::new(capacity, ttl),
+            // Cache query embeddings for 5 minutes (legacy cache, kept for backward compat)
+            query_cache: Cache::new(Duration::from_secs(300)),
             embeddings_cache: RwLock::new(None),
-            hnsw_index: RwLock::new(None),
-            use_hnsw: true,
-            hnsw_path: None,
+            search_cache: Arc::new(SearchCache::new(cache_config)),
         }
     }
 
@@ -261,11 +264,24 @@ impl SemanticSearch {
         query: &str,
         options: SemanticSearchOptions,
     ) -> Result<Vec<SemanticSearchResult>> {
-        // Get query embedding (from cache or compute)
-        let query_embedding = self.get_or_compute_embedding(query)?;
+        // Create cache key from query and options
+        let cache_key = make_cache_key(query, options.limit, options.min_similarity);
+
+        // Use search cache for results
+        self.search_cache.get_or_compute_results(&cache_key, || {
+            self.search_uncached(query, &options)
+        })
+    }
+
+    /// Perform search without caching (internal implementation)
+    fn search_uncached(&self, query: &str, options: &SemanticSearchOptions) -> Result<Vec<SemanticSearchResult>> {
+        // Get query embedding using the search cache for embeddings
+        let query_embedding = self.search_cache.get_or_compute_embedding(query, || {
+            self.engine.lock().embed(query)
+        })?;
 
         // Search with the embedding
-        self.search_by_embedding(&query_embedding, options)
+        self.search_by_embedding_internal(&query_embedding, options)
     }
 
     /// Search using a pre-computed embedding vector
@@ -274,6 +290,15 @@ impl SemanticSearch {
         &self,
         query_embedding: &[f32],
         options: SemanticSearchOptions,
+    ) -> Result<Vec<SemanticSearchResult>> {
+        self.search_by_embedding_internal(query_embedding, &options)
+    }
+
+    /// Internal search using a pre-computed embedding vector
+    fn search_by_embedding_internal(
+        &self,
+        query_embedding: &[f32],
+        options: &SemanticSearchOptions,
     ) -> Result<Vec<SemanticSearchResult>> {
         // Load embeddings from database if not cached
         self.ensure_embeddings_loaded()?;
@@ -431,23 +456,6 @@ impl SemanticSearch {
         Ok(results)
     }
 
-    /// Get or compute embedding for a query string
-    fn get_or_compute_embedding(&self, query: &str) -> Result<Vec<f32>> {
-        // Check cache first
-        if let Some(cached) = self.query_cache.get(&query.to_string()) {
-            debug!("Using cached embedding for query");
-            return Ok(cached);
-        }
-
-        // Compute embedding
-        let embedding = self.engine.lock().embed(query)?;
-
-        // Cache the result
-        self.query_cache.insert(query.to_string(), embedding.clone());
-
-        Ok(embedding)
-    }
-
     /// Ensure embeddings are loaded from the database
     fn ensure_embeddings_loaded(&self) -> Result<()> {
         // Check if already loaded
@@ -525,12 +533,18 @@ impl SemanticSearch {
         let mut cache = self.embeddings_cache.write();
         *cache = None;
         self.query_cache.clear();
+        // Also invalidate search cache on index change
+        self.search_cache.invalidate_on_index_change();
+    }
 
-        // Clear the HNSW index (it needs to be rebuilt with new embeddings)
-        let mut hnsw = self.hnsw_index.write();
-        if let Some(ref mut idx) = *hnsw {
-            idx.clear();
-        }
+    /// Get cache statistics for monitoring
+    pub fn cache_stats(&self) -> CacheStats {
+        self.search_cache.stats()
+    }
+
+    /// Get the search cache for external use
+    pub fn search_cache(&self) -> &Arc<SearchCache> {
+        &self.search_cache
     }
 
     /// Index text and store its embedding
@@ -654,9 +668,10 @@ impl SemanticSearch {
 
 impl Default for SemanticSearch {
     fn default() -> Self {
-        Self::with_default_cache(
+        Self::with_cache_config(
             Arc::new(Mutex::new(EmbeddingEngine::without_model())),
             Arc::new(Database::in_memory().expect("Failed to create in-memory database")),
+            SearchCacheConfig::default(),
         )
     }
 }
@@ -720,7 +735,7 @@ mod tests {
         // Create a mock embedding engine (without model)
         let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
 
-        SemanticSearch::with_default_cache(engine, db)
+        SemanticSearch::with_cache_config(engine, db, SearchCacheConfig::default())
     }
 
     #[test]
@@ -1091,40 +1106,24 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_search_with_custom_cache_config() {
-        // Test that custom CacheConfig is respected
-        let db = Arc::new(Database::in_memory().unwrap());
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+    fn test_cache_stats() {
+        let search = create_test_search();
 
-        let cache_config = CacheConfig {
-            enabled: true,
-            query_cache_capacity: 50,
-            query_cache_ttl_seconds: 60,
-        };
-
-        let search = SemanticSearch::new(engine, db, &cache_config);
-
-        // Verify search was created successfully
-        assert!(!search.is_available()); // No model loaded
-        assert_eq!(search.embedding_dim(), 384);
+        // Initial stats should be zero
+        let stats = search.cache_stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.result_cache_size, 0);
     }
 
     #[test]
-    fn test_lru_cache_capacity_limit() {
-        // Test that query cache respects capacity limits
-        let db = Arc::new(Database::in_memory().unwrap());
-        let engine = Arc::new(Mutex::new(EmbeddingEngine::without_model()));
+    fn test_cache_invalidation_increments_version() {
+        let search = create_test_search();
 
-        let cache_config = CacheConfig {
-            enabled: true,
-            query_cache_capacity: 2, // Small capacity
-            query_cache_ttl_seconds: 300,
-        };
+        let initial_version = search.cache_stats().index_version;
+        search.invalidate_cache();
+        let new_version = search.cache_stats().index_version;
 
-        let search = SemanticSearch::new(engine, db, &cache_config);
-
-        // The cache is internal, but we can verify search still works
-        // The LRU eviction will handle capacity management automatically
-        assert_eq!(search.query_cache.capacity(), 2);
+        assert_eq!(new_version, initial_version + 1);
     }
 }

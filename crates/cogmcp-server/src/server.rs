@@ -844,7 +844,19 @@ impl CogMcpServer {
                     ));
                 }
 
-                Ok(output)
+                // Add search cache statistics
+                if let Some(ref semantic) = self.semantic_search {
+                    let cache_stats = semantic.cache_stats();
+                    output.push_str("\n### Search Cache\n\n");
+                    output.push_str(&format!("- Cache hits: {}\n", cache_stats.hits));
+                    output.push_str(&format!("- Cache misses: {}\n", cache_stats.misses));
+                    output.push_str(&format!("- Hit rate: {:.1}%\n", cache_stats.hit_rate() * 100.0));
+                    output.push_str(&format!("- Result cache size: {}\n", cache_stats.result_cache_size));
+                    output.push_str(&format!("- Embedding cache size: {}\n", cache_stats.embedding_cache_size));
+                    output.push_str(&format!("- Index version: {}\n", cache_stats.index_version));
+                }
+
+                output
             }
             Err(e) => format_error(
                 "Failed to retrieve index statistics.",
