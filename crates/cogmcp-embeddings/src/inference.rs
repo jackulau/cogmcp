@@ -3,7 +3,6 @@
 use std::fs;
 use std::path::Path;
 
-use ndarray::Array2;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tracing::{debug, info};
@@ -117,28 +116,15 @@ impl EmbeddingEngine {
         let seq_len = encoded.input_ids.len();
         let attention_mask_clone = encoded.attention_mask.clone();
 
-        // Create input tensors with shape [1, seq_len]
-        let input_ids: Array2<i64> =
-            Array2::from_shape_vec((1, seq_len), encoded.input_ids).map_err(|e| {
-                Error::Embedding(format!("Failed to create input_ids tensor: {}", e))
-            })?;
+        // Create input tensors with shape [1, seq_len] using Vec-based API
+        let shape = [1, seq_len as i64];
 
-        let attention_mask: Array2<i64> =
-            Array2::from_shape_vec((1, seq_len), encoded.attention_mask).map_err(|e| {
-                Error::Embedding(format!("Failed to create attention_mask tensor: {}", e))
-            })?;
-
-        let token_type_ids: Array2<i64> =
-            Array2::from_shape_vec((1, seq_len), encoded.token_type_ids).map_err(|e| {
-                Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e))
-            })?;
-
-        // Create Tensor values for ort using ndarray
-        let input_ids_tensor = Tensor::from_array(input_ids)
+        // Create Tensor values for ort using (shape, Vec) tuple
+        let input_ids_tensor = Tensor::from_array((shape, encoded.input_ids))
             .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
-        let attention_mask_tensor = Tensor::from_array(attention_mask)
+        let attention_mask_tensor = Tensor::from_array((shape, encoded.attention_mask.clone()))
             .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
-        let token_type_ids_tensor = Tensor::from_array(token_type_ids)
+        let token_type_ids_tensor = Tensor::from_array((shape, encoded.token_type_ids))
             .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;
 
         // Run inference and extract data in a block to limit borrows

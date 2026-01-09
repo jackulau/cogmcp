@@ -1,19 +1,93 @@
 //! Main MCP server implementation
 
+use cogmcp_context::{ContextPrioritizer, prioritizer::PriorityWeights};
 use cogmcp_core::{Config, Result};
 use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
-use cogmcp_index::{CodeParser, CodebaseIndexer};
+use cogmcp_index::{git::GitRepo, CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
-use cogmcp_storage::{Database, FullTextIndex};
+use cogmcp_storage::{Database, FileRow, FullTextIndex};
 use parking_lot::Mutex;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Custom weights for priority scoring
+#[derive(Debug, Clone, Default)]
+pub struct CustomWeights {
+    pub recency: Option<f32>,
+    pub relevance: Option<f32>,
+    pub centrality: Option<f32>,
+    pub git_activity: Option<f32>,
+}
+
+/// Priority tier classification
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PriorityTier {
+    High,
+    Medium,
+    Low,
+}
+
+impl PriorityTier {
+    fn from_score(score: f32) -> Self {
+        if score >= 0.7 {
+            PriorityTier::High
+        } else if score >= 0.4 {
+            PriorityTier::Medium
+        } else {
+            PriorityTier::Low
+        }
+    }
+
+    #[allow(dead_code)]
+    fn emoji(&self) -> &'static str {
+        match self {
+            PriorityTier::High => "",
+            PriorityTier::Medium => "",
+            PriorityTier::Low => "",
+        }
+    }
+}
+
+impl std::fmt::Display for PriorityTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PriorityTier::High => write!(f, "HIGH"),
+            PriorityTier::Medium => write!(f, "MEDIUM"),
+            PriorityTier::Low => write!(f, "LOW"),
+        }
+    }
+}
+
+/// Score breakdown for a prioritized file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreBreakdown {
+    pub recency: f32,
+    pub relevance: f32,
+    pub centrality: f32,
+    pub git_activity: f32,
+    pub total: f32,
+}
+
+/// A prioritized context result
+#[derive(Debug, Clone)]
+pub struct PrioritizedContext {
+    pub path: String,
+    pub score: ScoreBreakdown,
+    pub tier: PriorityTier,
+    pub language: Option<String>,
+    pub last_modified: Option<i64>,
+    pub recent_commits: usize,
+    pub symbol_count: usize,
+    pub content: Option<String>,
+}
 
 /// MCP server for context management
 #[derive(Clone)]
@@ -260,6 +334,46 @@ impl CogMcpServer {
                     "required": ["query"]
                 }),
             ),
+            make_tool(
+                "get_relevant_context",
+                "Get prioritized context based on recency, centrality, and git activity",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Optional: Natural language query to filter by relevance"
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional: File paths to score (if empty, scores all indexed files)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum results to return (default: 20)"
+                        },
+                        "min_score": {
+                            "type": "number",
+                            "description": "Minimum priority score threshold (0.0-1.0, default: 0.1)"
+                        },
+                        "include_content": {
+                            "type": "boolean",
+                            "description": "Include file content in results (default: false)"
+                        },
+                        "weights": {
+                            "type": "object",
+                            "properties": {
+                                "recency": { "type": "number", "description": "Weight for recency score (default: 0.25)" },
+                                "relevance": { "type": "number", "description": "Weight for relevance score (default: 0.30)" },
+                                "centrality": { "type": "number", "description": "Weight for centrality score (default: 0.20)" },
+                                "git_activity": { "type": "number", "description": "Weight for git activity score (default: 0.15)" }
+                            },
+                            "description": "Custom weights for scoring factors"
+                        }
+                    }
+                }),
+            ),
         ]
     }
 
@@ -319,6 +433,41 @@ impl CogMcpServer {
                     .to_string();
                 let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
                 Ok(self.semantic_search(&query, limit))
+            }
+            "get_relevant_context" => {
+                let query = arguments["query"].as_str().map(|s| s.to_string());
+                let paths: Vec<String> = arguments["paths"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let limit = arguments["limit"].as_u64().unwrap_or(20) as usize;
+                let min_score = arguments["min_score"].as_f64().unwrap_or(0.1) as f32;
+                let include_content = arguments["include_content"].as_bool().unwrap_or(false);
+
+                // Parse custom weights if provided
+                let weights = if let Some(w) = arguments["weights"].as_object() {
+                    Some(CustomWeights {
+                        recency: w.get("recency").and_then(|v| v.as_f64()).map(|v| v as f32),
+                        relevance: w.get("relevance").and_then(|v| v.as_f64()).map(|v| v as f32),
+                        centrality: w.get("centrality").and_then(|v| v.as_f64()).map(|v| v as f32),
+                        git_activity: w.get("git_activity").and_then(|v| v.as_f64()).map(|v| v as f32),
+                    })
+                } else {
+                    None
+                };
+
+                Ok(self.get_relevant_context(
+                    query.as_deref(),
+                    &paths,
+                    limit,
+                    min_score,
+                    include_content,
+                    weights,
+                ))
             }
             _ => Err(format!("Unknown tool: {}", name)),
         }
@@ -721,6 +870,439 @@ impl CogMcpServer {
             }
             Err(e) => format!("Semantic search failed: {}", e),
         }
+    }
+
+    /// Get prioritized context based on recency, centrality, and git activity
+    fn get_relevant_context(
+        &self,
+        query: Option<&str>,
+        paths: &[String],
+        limit: usize,
+        min_score: f32,
+        include_content: bool,
+        custom_weights: Option<CustomWeights>,
+    ) -> String {
+        // Build priority weights
+        let weights = self.build_priority_weights(custom_weights);
+        let prioritizer = ContextPrioritizer::new(weights.clone());
+
+        // Get files to score
+        let files_to_score: Vec<FileRow> = if paths.is_empty() {
+            match self.db.get_all_files() {
+                Ok(files) => files,
+                Err(e) => return format!("Failed to get files: {}", e),
+            }
+        } else {
+            let mut files = Vec::new();
+            for path in paths {
+                match self.db.get_file_by_path(path) {
+                    Ok(Some(file)) => files.push(file),
+                    Ok(None) => {}
+                    Err(e) => return format!("Failed to get file '{}': {}", path, e),
+                }
+            }
+            files
+        };
+
+        if files_to_score.is_empty() {
+            return "No indexed files found. Run 'reindex' first.".to_string();
+        }
+
+        // Calculate git activity scores
+        let git_activity_scores = self.calculate_git_activity_scores(&files_to_score);
+
+        // Calculate relevance scores if query is provided
+        let relevance_scores = if let Some(q) = query {
+            self.calculate_relevance_scores(q, &files_to_score)
+        } else {
+            HashMap::new()
+        };
+
+        // Calculate centrality scores (based on symbol count and imports)
+        let centrality_scores = self.calculate_centrality_scores(&files_to_score);
+
+        // Build prioritized context list
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut contexts: Vec<PrioritizedContext> = files_to_score
+            .iter()
+            .filter_map(|file| {
+                // Calculate individual scores
+                let recency_score = self.calculate_recency_score(file.modified_at, now);
+                let relevance_score = relevance_scores.get(&file.path).copied().unwrap_or(0.5);
+                let centrality_score = centrality_scores.get(&file.path).copied().unwrap_or(0.3);
+                let git_activity_score = git_activity_scores.get(&file.path).copied().unwrap_or(0.0);
+
+                // Calculate total score using prioritizer
+                let total = prioritizer.calculate_priority(
+                    recency_score,
+                    relevance_score,
+                    centrality_score,
+                    git_activity_score,
+                    0.0, // user_focus - not used in this context
+                );
+
+                // Filter by minimum score
+                if total < min_score {
+                    return None;
+                }
+
+                // Get symbol count for this file
+                let symbol_count = match self.db.get_file_symbols(file.id) {
+                    Ok(symbols) => symbols.len(),
+                    Err(_) => 0,
+                };
+
+                // Get recent commit count
+                let recent_commits = git_activity_scores
+                    .get(&file.path)
+                    .map(|_| self.get_recent_commit_count(&file.path))
+                    .unwrap_or(0);
+
+                // Optionally read file content
+                let content = if include_content {
+                    let full_path = self.root.join(&file.path);
+                    std::fs::read_to_string(&full_path).ok()
+                } else {
+                    None
+                };
+
+                Some(PrioritizedContext {
+                    path: file.path.clone(),
+                    score: ScoreBreakdown {
+                        recency: recency_score,
+                        relevance: relevance_score,
+                        centrality: centrality_score,
+                        git_activity: git_activity_score,
+                        total,
+                    },
+                    tier: PriorityTier::from_score(total),
+                    language: file.language.clone(),
+                    last_modified: Some(file.modified_at),
+                    recent_commits,
+                    symbol_count,
+                    content,
+                })
+            })
+            .collect();
+
+        // Sort by total score (highest first)
+        contexts.sort_by(|a, b| {
+            b.score
+                .total
+                .partial_cmp(&a.score.total)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Apply limit
+        contexts.truncate(limit);
+
+        // Format output
+        self.format_prioritized_context(&contexts, query, &weights)
+    }
+
+    /// Build priority weights from custom weights or defaults
+    fn build_priority_weights(&self, custom: Option<CustomWeights>) -> PriorityWeights {
+        let mut weights = PriorityWeights::default();
+
+        if let Some(c) = custom {
+            if let Some(r) = c.recency {
+                weights.recency = r;
+            }
+            if let Some(r) = c.relevance {
+                weights.relevance = r;
+            }
+            if let Some(c_val) = c.centrality {
+                weights.centrality = c_val;
+            }
+            if let Some(g) = c.git_activity {
+                weights.git_activity = g;
+            }
+        }
+
+        weights
+    }
+
+    /// Calculate recency score based on modification time
+    fn calculate_recency_score(&self, modified_at: i64, now: i64) -> f32 {
+        let age_hours = (now - modified_at).max(0) as f32 / 3600.0;
+
+        // Exponential decay: score of 1.0 for files modified now,
+        // decays to ~0.5 at 24 hours, ~0.1 at ~77 hours
+        (-age_hours / 24.0).exp()
+    }
+
+    /// Calculate git activity scores for files
+    fn calculate_git_activity_scores(&self, files: &[FileRow]) -> HashMap<String, f32> {
+        let mut scores = HashMap::new();
+
+        // Try to open git repo
+        let git_repo = match GitRepo::open(&self.root) {
+            Ok(repo) => repo,
+            Err(_) => {
+                // No git repo, return empty scores
+                return scores;
+            }
+        };
+
+        // Get recently changed files (last 7 days)
+        let recent_files: std::collections::HashSet<String> =
+            match git_repo.recently_changed_files(7 * 24) {
+                Ok(files) => files.into_iter().collect(),
+                Err(_) => std::collections::HashSet::new(),
+            };
+
+        for file in files {
+            let mut score = 0.0f32;
+
+            // Check if file was recently changed
+            if recent_files.contains(&file.path) {
+                score += 0.5;
+            }
+
+            // Get commit count for more detailed scoring
+            if let Ok(commits) = git_repo.get_file_commits(&file.path, 10) {
+                // Score based on number of recent commits
+                let commit_score = (commits.len() as f32 / 10.0).min(0.5);
+                score += commit_score;
+            }
+
+            scores.insert(file.path.clone(), score.min(1.0));
+        }
+
+        scores
+    }
+
+    /// Get recent commit count for a file
+    fn get_recent_commit_count(&self, path: &str) -> usize {
+        match GitRepo::open(&self.root) {
+            Ok(repo) => repo.get_file_commits(path, 10).map(|c| c.len()).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Calculate relevance scores using text search
+    fn calculate_relevance_scores(&self, query: &str, files: &[FileRow]) -> HashMap<String, f32> {
+        let mut scores = HashMap::new();
+
+        // Use text search to find matching files
+        if let Ok(results) = self.text_index.search(query, 100) {
+            for hit in results {
+                // Normalize score to 0-1 range
+                let normalized_score = (hit.score.min(10.0) / 10.0).min(1.0);
+                scores
+                    .entry(hit.path.clone())
+                    .and_modify(|s: &mut f32| *s = (*s).max(normalized_score))
+                    .or_insert(normalized_score);
+            }
+        }
+
+        // Also try semantic search if available
+        if let Some(ref semantic) = self.semantic_search {
+            if semantic.is_available() {
+                if let Ok(results) = semantic.search(query, 50) {
+                    for result in results {
+                        let path = result.path.clone();
+                        if !path.is_empty() {
+                            // Combine with existing score
+                            scores
+                                .entry(path)
+                                .and_modify(|s: &mut f32| *s = (*s + result.similarity) / 2.0)
+                                .or_insert(result.similarity);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Default score for files not found in search
+        for file in files {
+            scores.entry(file.path.clone()).or_insert(0.3);
+        }
+
+        scores
+    }
+
+    /// Calculate centrality scores based on symbol count and structure
+    fn calculate_centrality_scores(&self, files: &[FileRow]) -> HashMap<String, f32> {
+        let mut scores = HashMap::new();
+
+        // Get total symbol count for normalization (unused, but kept for potential future use)
+        let _total_symbols: usize = files
+            .iter()
+            .filter_map(|f| self.db.get_file_symbols(f.id).ok())
+            .map(|s| s.len())
+            .sum();
+
+        let max_symbols = files
+            .iter()
+            .filter_map(|f| self.db.get_file_symbols(f.id).ok())
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(1);
+
+        for file in files {
+            let symbol_count = self
+                .db
+                .get_file_symbols(file.id)
+                .map(|s| s.len())
+                .unwrap_or(0);
+
+            // Score based on relative symbol count
+            // Files with more symbols are considered more "central"
+            let symbol_score = if max_symbols > 0 {
+                symbol_count as f32 / max_symbols as f32
+            } else {
+                0.0
+            };
+
+            // Boost for certain file types (main entry points, configs)
+            let path_lower = file.path.to_lowercase();
+            let path_boost = if path_lower.contains("main.")
+                || path_lower.contains("lib.")
+                || path_lower.contains("index.")
+                || path_lower.contains("mod.")
+            {
+                0.2
+            } else if path_lower.contains("config") || path_lower.contains("settings") {
+                0.1
+            } else {
+                0.0
+            };
+
+            scores.insert(file.path.clone(), (symbol_score * 0.8 + path_boost).min(1.0));
+        }
+
+        scores
+    }
+
+    /// Format prioritized context results as markdown
+    fn format_prioritized_context(
+        &self,
+        contexts: &[PrioritizedContext],
+        query: Option<&str>,
+        weights: &PriorityWeights,
+    ) -> String {
+        if contexts.is_empty() {
+            return "No files match the criteria.".to_string();
+        }
+
+        let mut output = String::new();
+
+        // Header
+        output.push_str("## Prioritized Context\n\n");
+
+        if let Some(q) = query {
+            output.push_str(&format!("**Query:** {}\n\n", q));
+        }
+
+        // Show weights being used
+        output.push_str(&format!(
+            "**Weights:** recency={:.2}, relevance={:.2}, centrality={:.2}, git_activity={:.2}\n\n",
+            weights.recency, weights.relevance, weights.centrality, weights.git_activity
+        ));
+
+        // Group by tier
+        let high_priority: Vec<_> = contexts
+            .iter()
+            .filter(|c| c.tier == PriorityTier::High)
+            .collect();
+        let medium_priority: Vec<_> = contexts
+            .iter()
+            .filter(|c| c.tier == PriorityTier::Medium)
+            .collect();
+        let low_priority: Vec<_> = contexts
+            .iter()
+            .filter(|c| c.tier == PriorityTier::Low)
+            .collect();
+
+        // High priority files
+        if !high_priority.is_empty() {
+            output.push_str("### HIGH Priority\n\n");
+            for ctx in high_priority {
+                self.format_context_item(&mut output, ctx);
+            }
+        }
+
+        // Medium priority files
+        if !medium_priority.is_empty() {
+            output.push_str("### MEDIUM Priority\n\n");
+            for ctx in medium_priority {
+                self.format_context_item(&mut output, ctx);
+            }
+        }
+
+        // Low priority files
+        if !low_priority.is_empty() {
+            output.push_str("### LOW Priority\n\n");
+            for ctx in low_priority {
+                self.format_context_item(&mut output, ctx);
+            }
+        }
+
+        output
+    }
+
+    /// Format a single context item
+    fn format_context_item(&self, output: &mut String, ctx: &PrioritizedContext) {
+        // Path and total score
+        output.push_str(&format!(
+            "#### `{}` (score: {:.3})\n\n",
+            ctx.path, ctx.score.total
+        ));
+
+        // Score breakdown
+        output.push_str(&format!(
+            "- **Score breakdown:** recency={:.2}, relevance={:.2}, centrality={:.2}, git={:.2}\n",
+            ctx.score.recency, ctx.score.relevance, ctx.score.centrality, ctx.score.git_activity
+        ));
+
+        // Metadata
+        if let Some(ref lang) = ctx.language {
+            output.push_str(&format!("- **Language:** {}\n", lang));
+        }
+
+        if ctx.symbol_count > 0 {
+            output.push_str(&format!("- **Symbols:** {}\n", ctx.symbol_count));
+        }
+
+        if ctx.recent_commits > 0 {
+            output.push_str(&format!("- **Recent commits:** {}\n", ctx.recent_commits));
+        }
+
+        if let Some(modified) = ctx.last_modified {
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - modified;
+            let age_str = if age < 3600 {
+                format!("{} minutes ago", age / 60)
+            } else if age < 86400 {
+                format!("{} hours ago", age / 3600)
+            } else {
+                format!("{} days ago", age / 86400)
+            };
+            output.push_str(&format!("- **Last modified:** {}\n", age_str));
+        }
+
+        // Content (if included)
+        if let Some(ref content) = ctx.content {
+            output.push_str("\n```\n");
+            // Truncate content to avoid huge outputs
+            let truncated = if content.len() > 2000 {
+                format!("{}...\n[truncated, {} more bytes]", &content[..2000], content.len() - 2000)
+            } else {
+                content.clone()
+            };
+            output.push_str(&truncated);
+            output.push_str("\n```\n");
+        }
+
+        output.push('\n');
     }
 }
 

@@ -27,8 +27,8 @@ fn test_list_tools_returns_all_tools() {
     let server = create_test_server();
     let tools = server.list_tools();
 
-    // Verify we have the expected 7 tools
-    assert_eq!(tools.len(), 8, "Should have 8 tools");
+    // Verify we have the expected 9 tools
+    assert_eq!(tools.len(), 9, "Should have 9 tools");
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
 
@@ -54,6 +54,10 @@ fn test_list_tools_returns_all_tools() {
         "Should have index_status tool"
     );
     assert!(tool_names.contains(&"reindex"), "Should have reindex tool");
+    assert!(
+        tool_names.contains(&"get_relevant_context"),
+        "Should have get_relevant_context tool"
+    );
 }
 
 #[test]
@@ -251,12 +255,12 @@ mod e2e_tests {
     }
 
     #[test]
-    fn test_e2e_tools_list_returns_7_tools() {
+    fn test_e2e_tools_list_returns_9_tools() {
         let server = create_test_server();
 
         // List tools through the server's list_tools method
         let tools = server.list_tools();
-        assert_eq!(tools.len(), 8, "Should return 8 tools");
+        assert_eq!(tools.len(), 9, "Should return 9 tools");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(tool_names.contains(&"ping"));
@@ -266,6 +270,8 @@ mod e2e_tests {
         assert!(tool_names.contains(&"get_file_outline"));
         assert!(tool_names.contains(&"index_status"));
         assert!(tool_names.contains(&"reindex"));
+        assert!(tool_names.contains(&"semantic_search"));
+        assert!(tool_names.contains(&"get_relevant_context"));
     }
 
     #[test]
@@ -506,5 +512,67 @@ mod e2e_tests {
                 limit
             );
         }
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_basic() {
+        let server = create_test_server();
+
+        // Test with no arguments (should work with defaults)
+        let result = server.call_tool("get_relevant_context", json!({}));
+        assert!(result.is_ok(), "get_relevant_context should succeed with no args");
+        let output = result.unwrap();
+        // With no indexed files, should return appropriate message
+        assert!(
+            output.contains("No indexed files") || output.contains("Prioritized Context") || output.contains("No files match"),
+            "Should return meaningful output"
+        );
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_with_query() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "get_relevant_context",
+            json!({
+                "query": "test function",
+                "limit": 10,
+                "min_score": 0.1
+            }),
+        );
+        assert!(result.is_ok(), "get_relevant_context with query should succeed");
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_with_custom_weights() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "get_relevant_context",
+            json!({
+                "weights": {
+                    "recency": 0.5,
+                    "relevance": 0.3,
+                    "centrality": 0.1,
+                    "git_activity": 0.1
+                }
+            }),
+        );
+        assert!(result.is_ok(), "get_relevant_context with custom weights should succeed");
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_with_paths() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "get_relevant_context",
+            json!({
+                "paths": ["src/main.rs", "src/lib.rs"],
+                "include_content": false
+            }),
+        );
+        assert!(result.is_ok(), "get_relevant_context with paths should succeed");
     }
 }
