@@ -27,11 +27,13 @@
 //! ```
 
 pub mod inference;
+pub mod lazy;
 pub mod model;
 pub mod quantize;
 pub mod tokenizer;
 
-pub use inference::{BatchProgress, EmbeddingEngine, EmbeddingMetrics, MetricsSnapshot};
+pub use inference::EmbeddingEngine;
+pub use lazy::LazyEmbeddingEngine;
 pub use model::{ModelConfig, ModelManager};
 pub use quantize::{
     dequantize_vector, quantization_error, quantize_batch, quantize_vector,
