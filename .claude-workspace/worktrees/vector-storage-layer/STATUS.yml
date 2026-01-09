@@ -1,11 +1,2 @@
-id: vector-storage-layer
-status: pending
-branch: parallel/vector-storage-layer
-worktree_path: null
-assigned_to: null
-started_at: null
-completed_at: null
-dependencies_met: true
-conflicts: []
-commit_sha: null
-tests_passing: null
+status: in_progress
+started_at: 2026-01-07T00:22:17Z

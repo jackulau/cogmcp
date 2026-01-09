@@ -1,2 +1,11 @@
-status: complete
-completed_at: 2026-01-07T01:05:48Z
+id: subtask-4-indexer-hookup
+status: pending
+branch: parallel/subtask-4-indexer-hookup
+worktree_path: null
+assigned_to: null
+started_at: null
+completed_at: null
+dependencies_met: false
+conflicts: []
+commit_sha: null
+tests_passing: null
