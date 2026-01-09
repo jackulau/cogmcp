@@ -469,9 +469,14 @@ pub struct IndexingConfig {
     pub enable_embeddings: bool,
     /// Path to embedding model
     pub embedding_model: Option<String>,
-    /// Use int8 quantization for embeddings to reduce storage by ~75%
-    /// while maintaining >99% search accuracy
-    pub quantize_embeddings: bool,
+    /// Enable parallel indexing for improved performance
+    pub enable_parallel: bool,
+    /// Number of threads for parallel operations (0 = auto-detect based on CPU count)
+    pub parallel_threads: usize,
+    /// Batch size for database operations during parallel indexing
+    pub batch_size: usize,
+    /// Batch size for embedding generation during parallel indexing
+    pub embedding_batch_size: usize,
 }
 
 impl Default for IndexingConfig {
@@ -505,7 +510,10 @@ impl Default for IndexingConfig {
             ],
             enable_embeddings: true,
             embedding_model: None,
-            quantize_embeddings: true, // Enabled by default for 75% storage savings
+            enable_parallel: true,
+            parallel_threads: 0, // 0 means auto-detect based on CPU count
+            batch_size: 100,
+            embedding_batch_size: 32,
         }
     }
 }

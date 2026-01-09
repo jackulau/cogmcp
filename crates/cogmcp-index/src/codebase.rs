@@ -1,5 +1,6 @@
 //! Codebase file indexing
 
+use crate::parallel_indexer::{ParallelIndexConfig, ParallelIndexer, ProgressReport};
 use crate::parser::{CodeParser, ExtractedSymbol};
 use cogmcp_core::types::Language;
 use cogmcp_core::{Config, Error, Result};
@@ -254,6 +255,81 @@ impl CodebaseIndexer {
         }
 
         Ok(result)
+    }
+
+    /// Index all files, automatically choosing parallel or sequential indexing based on config
+    ///
+    /// When `config.indexing.enable_parallel` is true, this uses the `ParallelIndexer` for
+    /// significantly improved performance (typically 3-5x faster). Otherwise, it falls back
+    /// to the sequential `index_all` method.
+    pub fn index_all_smart(&self, db: &Database, text_index: &FullTextIndex) -> Result<IndexResult> {
+        if self.config.indexing.enable_parallel {
+            self.index_all_parallel(db, text_index, None::<fn(ProgressReport)>)
+        } else {
+            self.index_all(db, text_index)
+        }
+    }
+
+    /// Index all files using the parallel indexer with optional progress callback
+    ///
+    /// This method provides high-performance parallel indexing:
+    /// - Phase 1: Parallel file discovery and reading
+    /// - Phase 2: Parallel parsing with batching
+    /// - Phase 3: Batch database writes
+    /// - Phase 4: Parallel embedding generation (if enabled)
+    /// - Phase 5: Full-text index updates
+    pub fn index_all_parallel<F>(
+        &self,
+        db: &Database,
+        text_index: &FullTextIndex,
+        progress_callback: Option<F>,
+    ) -> Result<IndexResult>
+    where
+        F: Fn(crate::parallel_indexer::ProgressReport) + Send + Sync + 'static,
+    {
+        let parallel_config = ParallelIndexConfig {
+            num_threads: if self.config.indexing.parallel_threads > 0 {
+                self.config.indexing.parallel_threads
+            } else {
+                num_cpus::get()
+            },
+            batch_size: self.config.indexing.batch_size,
+            embedding_batch_size: self.config.indexing.embedding_batch_size,
+            parallel_walking: true,
+        };
+
+        let mut parallel_indexer = if let Some(engine) = &self.embedding_engine {
+            ParallelIndexer::with_embedding_engine(
+                self.root.clone(),
+                self.config.clone(),
+                parallel_config,
+                self.parser.clone(),
+                engine.clone(),
+            )?
+        } else {
+            ParallelIndexer::new(
+                self.root.clone(),
+                self.config.clone(),
+                parallel_config,
+                self.parser.clone(),
+            )?
+        };
+
+        if let Some(callback) = progress_callback {
+            parallel_indexer.set_progress_callback(callback);
+        }
+
+        let parallel_result = parallel_indexer.index_all(db, text_index)?;
+
+        // Convert ParallelIndexResult to IndexResult
+        Ok(IndexResult {
+            indexed: parallel_result.files_indexed,
+            skipped: parallel_result.files_skipped,
+            errors: parallel_result.files_errored,
+            symbols_extracted: parallel_result.symbols_extracted,
+            symbols_by_kind: parallel_result.symbols_by_kind,
+            symbols_with_visibility: parallel_result.symbols_with_visibility,
+        })
     }
 
     /// Index a single file and update statistics
