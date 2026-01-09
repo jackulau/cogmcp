@@ -370,6 +370,29 @@ impl Database {
         Ok(())
     }
 
+    /// Delete a file and all its associated data (symbols, embeddings)
+    pub fn delete_file(&self, file_id: i64) -> Result<()> {
+        // Delete symbols first (foreign key constraint)
+        self.delete_symbols_for_file(file_id)?;
+        // Delete embeddings
+        let _ = self.delete_embeddings_for_file(file_id);
+        // Delete the file record
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])
+            .map_err(|e| Error::Storage(format!("Failed to delete file: {}", e)))?;
+        Ok(())
+    }
+
+    /// Delete a file by its path
+    pub fn delete_file_by_path(&self, path: &str) -> Result<bool> {
+        if let Some(file) = self.get_file_by_path(path)? {
+            self.delete_file(file.id)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Update a symbol's parent reference
     pub fn update_symbol_parent(&self, symbol_id: i64, parent_id: i64) -> Result<()> {
         let conn = self.conn.lock();

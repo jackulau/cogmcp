@@ -761,22 +761,20 @@ impl CodeParser {
     fn find_python_docstring(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
         // Look for string as first child of body
         if let Some(body) = node.child_by_field_name("body") {
-            let mut cursor = body.walk();
-            for child in body.children(&mut cursor) {
-                if child.kind() == "expression_statement" {
-                    let mut inner_cursor = child.walk();
-                    for inner in child.children(&mut inner_cursor) {
-                        if inner.kind() == "string" {
-                            return inner.utf8_text(content.as_bytes()).ok().map(|s| {
-                                s.trim_matches('"')
-                                    .trim_matches('\'')
-                                    .trim()
-                                    .to_string()
-                            });
-                        }
+            // Only check first statement for docstring
+            let first_child = body.child(0)?;
+            if first_child.kind() == "expression_statement" {
+                let mut inner_cursor = first_child.walk();
+                for inner in first_child.children(&mut inner_cursor) {
+                    if inner.kind() == "string" {
+                        return inner.utf8_text(content.as_bytes()).ok().map(|s| {
+                            s.trim_matches('"')
+                                .trim_matches('\'')
+                                .trim()
+                                .to_string()
+                        });
                     }
                 }
-                break; // Only check first statement
             }
         }
         None

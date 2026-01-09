@@ -5,13 +5,14 @@ use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
 use cogmcp_storage::{Database, FullTextIndex};
+use cogmcp_watcher::{FileDebouncer, FilePrioritizer, FileWatcher};
 use parking_lot::Mutex;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -25,6 +26,12 @@ pub struct CogMcpServer {
     pub parser: Arc<CodeParser>,
     pub embedding_engine: Option<Arc<Mutex<EmbeddingEngine>>>,
     pub semantic_search: Option<Arc<SemanticSearch>>,
+    /// File watcher for real-time file change monitoring
+    pub watcher: Option<Arc<FileWatcher>>,
+    /// File prioritizer for determining Hot/Warm/Cold tiers
+    pub prioritizer: Option<Arc<FilePrioritizer>>,
+    /// File debouncer for Warm-tier files
+    pub debouncer: Option<Arc<FileDebouncer>>,
 }
 
 impl CogMcpServer {
@@ -49,6 +56,23 @@ impl CogMcpServer {
             (None, None)
         };
 
+        // Initialize watcher components if enabled
+        let (watcher, prioritizer, debouncer) = if config.watching.enabled {
+            match Self::init_watcher(&root, &config) {
+                Ok((w, p, d)) => {
+                    info!("File watcher initialized for {}", root.display());
+                    (Some(w), Some(p), Some(d))
+                }
+                Err(e) => {
+                    warn!("Failed to initialize file watcher: {}. File watching disabled.", e);
+                    (None, None, None)
+                }
+            }
+        } else {
+            debug!("File watching disabled in configuration");
+            (None, None, None)
+        };
+
         Ok(Self {
             root,
             config,
@@ -57,6 +81,9 @@ impl CogMcpServer {
             parser,
             embedding_engine,
             semantic_search,
+            watcher,
+            prioritizer,
+            debouncer,
         })
     }
 
@@ -75,6 +102,9 @@ impl CogMcpServer {
             parser,
             embedding_engine: None,
             semantic_search: None,
+            watcher: None,
+            prioritizer: None,
+            debouncer: None,
         })
     }
 
@@ -110,6 +140,38 @@ impl CogMcpServer {
         Ok((engine, semantic))
     }
 
+    /// Initialize the file watcher components
+    fn init_watcher(
+        root: &Path,
+        config: &Config,
+    ) -> Result<(Arc<FileWatcher>, Arc<FilePrioritizer>, Arc<FileDebouncer>)> {
+        let watcher = Arc::new(FileWatcher::new(root)?);
+        let prioritizer = Arc::new(FilePrioritizer::new(config.watching.hot_threshold_seconds));
+        let debouncer = Arc::new(FileDebouncer::new(config.watching.debounce_ms));
+
+        Ok((watcher, prioritizer, debouncer))
+    }
+
+    /// Check if file watching is enabled and available
+    pub fn has_watcher(&self) -> bool {
+        self.watcher.is_some()
+    }
+
+    /// Get the file prioritizer if available
+    pub fn prioritizer(&self) -> Option<&Arc<FilePrioritizer>> {
+        self.prioritizer.as_ref()
+    }
+
+    /// Get the file debouncer if available
+    pub fn debouncer(&self) -> Option<&Arc<FileDebouncer>> {
+        self.debouncer.as_ref()
+    }
+
+    /// Get the file watcher if available
+    pub fn watcher(&self) -> Option<&Arc<FileWatcher>> {
+        self.watcher.as_ref()
+    }
+
     /// Check if semantic search is available
     pub fn has_semantic_search(&self) -> bool {
         self.semantic_search
@@ -141,6 +203,66 @@ impl CogMcpServer {
             semantic.invalidate_cache();
         }
 
+        Ok(())
+    }
+
+    /// Index a single file incrementally
+    ///
+    /// This is called by the watcher when a Hot file is modified,
+    /// or when a debounced Warm file is ready to be processed.
+    pub fn index_file_incremental(&self, path: &Path) -> Result<()> {
+        let full_path = self.root.join(path);
+        debug!(path = %path.display(), "Starting incremental index for file");
+
+        let indexer = if let Some(ref engine) = self.embedding_engine {
+            CodebaseIndexer::with_embedding_engine(
+                self.root.clone(),
+                self.config.clone(),
+                self.parser.clone(),
+                engine.clone(),
+            )?
+        } else {
+            CodebaseIndexer::new(self.root.clone(), self.config.clone(), self.parser.clone())?
+        };
+
+        // Index the single file
+        indexer.index_file(&full_path, &self.db, &self.text_index)?;
+        self.text_index.commit()?;
+
+        // Invalidate semantic search cache
+        if let Some(ref semantic) = self.semantic_search {
+            semantic.invalidate_cache();
+        }
+
+        info!(path = %path.display(), "Incremental index complete for file");
+        Ok(())
+    }
+
+    /// Remove a file from the index
+    ///
+    /// This is called by the watcher when a file is deleted.
+    pub fn remove_file_from_index(&self, path: &Path) -> Result<()> {
+        let path_str = path.to_string_lossy().to_string();
+        debug!(path = %path_str, "Removing file from index");
+
+        // Remove from database (this also removes associated symbols and embeddings)
+        let removed = self.db.delete_file_by_path(&path_str)?;
+        if removed {
+            info!(path = %path_str, "Removed file from database");
+        } else {
+            debug!(path = %path_str, "File not found in database (may not have been indexed)");
+        }
+
+        // Remove from full-text index
+        self.text_index.delete_file(&path_str)?;
+        self.text_index.commit()?;
+
+        // Invalidate semantic search cache
+        if let Some(ref semantic) = self.semantic_search {
+            semantic.invalidate_cache();
+        }
+
+        info!(path = %path_str, "File removed from index");
         Ok(())
     }
 
