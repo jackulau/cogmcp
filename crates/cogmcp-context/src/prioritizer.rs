@@ -87,6 +87,44 @@ impl ContextPrioritizer {
     fn estimate_tokens(text: &str) -> u32 {
         (text.len() / 4) as u32
     }
+
+    /// Get the priority score for a file given its metadata scores
+    ///
+    /// This is a convenience method that wraps `calculate_priority` for use
+    /// with file information structs.
+    ///
+    /// # Arguments
+    ///
+    /// * `recency_score` - Score based on how recently the file was accessed (0.0-1.0)
+    /// * `relevance_score` - Score based on semantic relevance to query (0.0-1.0)
+    /// * `centrality_score` - Score based on import graph position (0.0-1.0)
+    /// * `git_activity_score` - Score based on recent git activity (0.0-1.0)
+    /// * `user_focus_score` - Score based on user interaction patterns (0.0-1.0)
+    ///
+    /// # Returns
+    ///
+    /// A weighted priority score (0.0-1.0)
+    pub fn get_file_priority_score(
+        &self,
+        recency_score: f32,
+        relevance_score: f32,
+        centrality_score: f32,
+        git_activity_score: f32,
+        user_focus_score: f32,
+    ) -> f32 {
+        self.calculate_priority(
+            recency_score,
+            relevance_score,
+            centrality_score,
+            git_activity_score,
+            user_focus_score,
+        )
+    }
+
+    /// Get the current priority weights
+    pub fn weights(&self) -> &PriorityWeights {
+        &self.weights
+    }
 }
 
 impl Default for ContextPrioritizer {
