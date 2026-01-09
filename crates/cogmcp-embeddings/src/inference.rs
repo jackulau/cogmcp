@@ -336,11 +336,13 @@ impl EmbeddingEngine {
         let seq_len = encoded.input_ids.len();
         let attention_mask_clone = encoded.attention_mask.clone();
 
-        // Create input tensors with shape [1, seq_len] using (shape, Vec) tuple format
-        let shape = [1, seq_len];
+        // Create input tensors with shape [1, seq_len] using Vec-based API
+        let shape = [1, seq_len as i64];
+
+        // Create Tensor values for ort using (shape, Vec) tuple
         let input_ids_tensor = Tensor::from_array((shape, encoded.input_ids))
             .map_err(|e| Error::Embedding(format!("Failed to create input_ids tensor: {}", e)))?;
-        let attention_mask_tensor = Tensor::from_array((shape, encoded.attention_mask))
+        let attention_mask_tensor = Tensor::from_array((shape, encoded.attention_mask.clone()))
             .map_err(|e| Error::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?;
         let token_type_ids_tensor = Tensor::from_array((shape, encoded.token_type_ids))
             .map_err(|e| Error::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?;

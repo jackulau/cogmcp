@@ -55,8 +55,8 @@ fn test_list_tools_returns_all_tools() {
     );
     assert!(tool_names.contains(&"reindex"), "Should have reindex tool");
     assert!(
-        tool_names.contains(&"reload_config"),
-        "Should have reload_config tool"
+        tool_names.contains(&"get_relevant_context"),
+        "Should have get_relevant_context tool"
     );
 }
 
@@ -282,7 +282,8 @@ mod e2e_tests {
         assert!(tool_names.contains(&"get_file_outline"));
         assert!(tool_names.contains(&"index_status"));
         assert!(tool_names.contains(&"reindex"));
-        assert!(tool_names.contains(&"reload_config"));
+        assert!(tool_names.contains(&"semantic_search"));
+        assert!(tool_names.contains(&"get_relevant_context"));
     }
 
     #[test]
@@ -537,6 +538,68 @@ mod e2e_tests {
                 limit
             );
         }
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_basic() {
+        let server = create_test_server();
+
+        // Test with no arguments (should work with defaults)
+        let result = server.call_tool("get_relevant_context", json!({}));
+        assert!(result.is_ok(), "get_relevant_context should succeed with no args");
+        let output = result.unwrap();
+        // With no indexed files, should return appropriate message
+        assert!(
+            output.contains("No indexed files") || output.contains("Prioritized Context") || output.contains("No files match"),
+            "Should return meaningful output"
+        );
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_with_query() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "get_relevant_context",
+            json!({
+                "query": "test function",
+                "limit": 10,
+                "min_score": 0.1
+            }),
+        );
+        assert!(result.is_ok(), "get_relevant_context with query should succeed");
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_with_custom_weights() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "get_relevant_context",
+            json!({
+                "weights": {
+                    "recency": 0.5,
+                    "relevance": 0.3,
+                    "centrality": 0.1,
+                    "git_activity": 0.1
+                }
+            }),
+        );
+        assert!(result.is_ok(), "get_relevant_context with custom weights should succeed");
+    }
+
+    #[test]
+    fn test_e2e_get_relevant_context_with_paths() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "get_relevant_context",
+            json!({
+                "paths": ["src/main.rs", "src/lib.rs"],
+                "include_content": false
+            }),
+        );
+        assert!(result.is_ok(), "get_relevant_context with paths should succeed");
     }
 }
 
