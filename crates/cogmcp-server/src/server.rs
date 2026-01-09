@@ -2,11 +2,10 @@
 
 use cogmcp_context::{ContextPrioritizer, prioritizer::PriorityWeights};
 use cogmcp_core::{Config, Result};
-use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
-use cogmcp_index::{git::GitRepo, CodeParser, CodebaseIndexer};
+use cogmcp_embeddings::{LazyEmbeddingEngine, ModelConfig};
+use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
-use cogmcp_storage::{Database, FileRow, FullTextIndex};
-use parking_lot::Mutex;
+use cogmcp_storage::{Database, FullTextIndex};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
@@ -203,21 +202,6 @@ impl CogMcpServer {
         self.embedding_engine
             .as_ref()
             .map_or(false, |e| e.is_available())
-    }
-
-    /// Check if index has any content and return an error message if empty
-    fn check_index_status(&self) -> Option<String> {
-        match self.db.get_stats() {
-            Ok(stats) if stats.file_count == 0 => Some(format_error(
-                "The code index is empty.",
-                &[
-                    "Run the `reindex` tool to index the codebase",
-                    "Check that the root directory contains source files",
-                    "Verify .gitignore isn't excluding all files",
-                ],
-            )),
-            _ => None,
-        }
     }
 
     /// Index the codebase
