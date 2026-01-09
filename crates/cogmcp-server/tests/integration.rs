@@ -508,3 +508,271 @@ mod e2e_tests {
         }
     }
 }
+
+// ============================================================================
+// Streaming Integration Tests
+// ============================================================================
+//
+// These tests verify streaming functionality for large result sets.
+
+mod streaming_tests {
+    use super::*;
+    use cogmcp_core::config::StreamingConfigOptions;
+
+    #[test]
+    fn test_streaming_config_default() {
+        let server = create_test_server();
+        let config = server.get_streaming_config();
+
+        assert!(config.enabled, "Streaming should be enabled by default");
+        assert_eq!(config.auto_stream_threshold, 50, "Default threshold should be 50");
+        assert_eq!(config.chunk_size, 10, "Default chunk size should be 10");
+    }
+
+    #[test]
+    fn test_context_search_with_streaming_disabled() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": false
+            }),
+        );
+
+        assert!(result.is_ok(), "Search with streaming disabled should succeed");
+        let output = result.unwrap();
+        // Non-streaming output should not contain streaming markers
+        assert!(!output.contains("Streaming"), "Should not contain streaming markers");
+    }
+
+    #[test]
+    fn test_context_search_with_streaming_enabled() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": true
+            }),
+        );
+
+        assert!(result.is_ok(), "Search with streaming enabled should succeed");
+        // Note: If there are no results, streaming markers won't appear
+    }
+
+    #[test]
+    fn test_context_search_with_custom_chunk_size() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test query",
+                "limit": 20,
+                "streaming": true,
+                "chunk_size": 5
+            }),
+        );
+
+        assert!(result.is_ok(), "Search with custom chunk size should succeed");
+    }
+
+    #[test]
+    fn test_semantic_search_with_streaming_disabled() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "semantic_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": false
+            }),
+        );
+
+        assert!(result.is_ok(), "Semantic search with streaming disabled should succeed");
+    }
+
+    #[test]
+    fn test_semantic_search_with_streaming_enabled() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "semantic_search",
+            json!({
+                "query": "test query",
+                "limit": 10,
+                "streaming": true
+            }),
+        );
+
+        assert!(result.is_ok(), "Semantic search with streaming enabled should succeed");
+    }
+
+    #[test]
+    fn test_semantic_search_with_custom_chunk_size() {
+        let server = create_test_server();
+
+        let result = server.call_tool(
+            "semantic_search",
+            json!({
+                "query": "test query",
+                "limit": 20,
+                "streaming": true,
+                "chunk_size": 5
+            }),
+        );
+
+        assert!(result.is_ok(), "Semantic search with custom chunk size should succeed");
+    }
+
+    #[test]
+    fn test_streaming_config_modification() {
+        let mut server = create_test_server();
+
+        // Verify default
+        assert!(server.is_streaming_enabled());
+
+        // Disable streaming
+        let new_config = StreamingConfigOptions {
+            enabled: false,
+            auto_stream_threshold: 100,
+            chunk_size: 20,
+            yield_interval_ms: 200,
+        };
+        server.set_streaming_config(new_config);
+
+        // Verify change
+        assert!(!server.is_streaming_enabled());
+        assert_eq!(server.get_streaming_config().auto_stream_threshold, 100);
+        assert_eq!(server.get_streaming_config().chunk_size, 20);
+    }
+
+    #[test]
+    fn test_auto_stream_threshold() {
+        let server = create_test_server();
+        let config = server.get_streaming_config();
+
+        // Test threshold behavior
+        assert!(!config.should_auto_stream(49), "Should not auto-stream with 49 results");
+        assert!(config.should_auto_stream(50), "Should auto-stream with 50 results");
+        assert!(config.should_auto_stream(100), "Should auto-stream with 100 results");
+    }
+
+    #[test]
+    fn test_streaming_results_in_different_modes() {
+        let server = create_test_server();
+
+        // Test streaming with keyword mode
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "mode": "keyword",
+                "streaming": true
+            }),
+        );
+        assert!(result.is_ok(), "Keyword search with streaming should succeed");
+
+        // Test streaming with hybrid mode
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "mode": "hybrid",
+                "streaming": true
+            }),
+        );
+        assert!(result.is_ok(), "Hybrid search with streaming should succeed");
+
+        // Test streaming with semantic mode
+        let result = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "mode": "semantic",
+                "streaming": true
+            }),
+        );
+        assert!(result.is_ok(), "Semantic search with streaming should succeed");
+    }
+
+    #[test]
+    fn test_context_search_tool_schema_includes_streaming() {
+        let server = create_test_server();
+        let tools = server.list_tools();
+
+        let context_search = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "context_search")
+            .expect("context_search tool should exist");
+
+        let schema: Value = serde_json::to_value(&context_search.input_schema)
+            .expect("Schema should serialize");
+
+        let properties = schema.get("properties").expect("Schema should have properties");
+        assert!(
+            properties.get("streaming").is_some(),
+            "context_search should have streaming parameter"
+        );
+        assert!(
+            properties.get("chunk_size").is_some(),
+            "context_search should have chunk_size parameter"
+        );
+    }
+
+    #[test]
+    fn test_semantic_search_tool_schema_includes_streaming() {
+        let server = create_test_server();
+        let tools = server.list_tools();
+
+        let semantic_search = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "semantic_search")
+            .expect("semantic_search tool should exist");
+
+        let schema: Value = serde_json::to_value(&semantic_search.input_schema)
+            .expect("Schema should serialize");
+
+        let properties = schema.get("properties").expect("Schema should have properties");
+        assert!(
+            properties.get("streaming").is_some(),
+            "semantic_search should have streaming parameter"
+        );
+        assert!(
+            properties.get("chunk_size").is_some(),
+            "semantic_search should have chunk_size parameter"
+        );
+    }
+
+    #[test]
+    fn test_streaming_behavior_consistency() {
+        let server = create_test_server();
+
+        // Make the same query with and without streaming
+        let result_no_stream = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "streaming": false
+            }),
+        );
+
+        let result_stream = server.call_tool(
+            "context_search",
+            json!({
+                "query": "test",
+                "streaming": true
+            }),
+        );
+
+        // Both should succeed
+        assert!(result_no_stream.is_ok(), "Non-streaming search should succeed");
+        assert!(result_stream.is_ok(), "Streaming search should succeed");
+    }
+}

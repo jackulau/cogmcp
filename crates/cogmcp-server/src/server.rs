@@ -1,5 +1,6 @@
 //! Main MCP server implementation
 
+use cogmcp_core::config::StreamingConfigOptions;
 use cogmcp_core::{Config, Result};
 use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
@@ -25,6 +26,8 @@ pub struct CogMcpServer {
     pub parser: Arc<CodeParser>,
     pub embedding_engine: Option<Arc<Mutex<EmbeddingEngine>>>,
     pub semantic_search: Option<Arc<SemanticSearch>>,
+    /// Streaming configuration for large result sets
+    pub streaming_config: StreamingConfigOptions,
 }
 
 impl CogMcpServer {
@@ -49,6 +52,8 @@ impl CogMcpServer {
             (None, None)
         };
 
+        let streaming_config = config.streaming.clone();
+
         Ok(Self {
             root,
             config,
@@ -57,6 +62,7 @@ impl CogMcpServer {
             parser,
             embedding_engine,
             semantic_search,
+            streaming_config,
         })
     }
 
@@ -66,6 +72,7 @@ impl CogMcpServer {
         let db = Arc::new(Database::in_memory()?);
         let text_index = Arc::new(FullTextIndex::in_memory()?);
         let parser = Arc::new(CodeParser::new());
+        let streaming_config = config.streaming.clone();
 
         Ok(Self {
             root,
@@ -75,6 +82,7 @@ impl CogMcpServer {
             parser,
             embedding_engine: None,
             semantic_search: None,
+            streaming_config,
         })
     }
 
@@ -197,13 +205,15 @@ impl CogMcpServer {
             ),
             make_tool(
                 "context_search",
-                "Search for code using natural language",
+                "Search for code using natural language. Supports streaming for large result sets.",
                 json!({
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Natural language query" },
                         "limit": { "type": "integer", "description": "Maximum results" },
-                        "mode": { "type": "string", "description": "Search mode: keyword, semantic, or hybrid" }
+                        "mode": { "type": "string", "description": "Search mode: keyword, semantic, or hybrid" },
+                        "streaming": { "type": "boolean", "description": "Enable streaming for large results (auto-enabled when limit > 50)" },
+                        "chunk_size": { "type": "integer", "description": "Number of results per chunk when streaming (default: 10)" }
                     },
                     "required": ["query"]
                 }),
@@ -250,12 +260,14 @@ impl CogMcpServer {
             ),
             make_tool(
                 "semantic_search",
-                "Search for code using semantic similarity (requires embeddings)",
+                "Search for code using semantic similarity (requires embeddings). Supports streaming for large result sets.",
                 json!({
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Natural language search query" },
-                        "limit": { "type": "integer", "description": "Maximum results (default: 10)" }
+                        "limit": { "type": "integer", "description": "Maximum results (default: 10)" },
+                        "streaming": { "type": "boolean", "description": "Enable streaming for large results (auto-enabled when limit > 50)" },
+                        "chunk_size": { "type": "integer", "description": "Number of results per chunk when streaming (default: 10)" }
                     },
                     "required": ["query"]
                 }),
@@ -286,7 +298,9 @@ impl CogMcpServer {
                     .to_string();
                 let limit = arguments["limit"].as_u64().unwrap_or(20) as usize;
                 let mode = arguments["mode"].as_str().unwrap_or("hybrid");
-                Ok(self.context_search(&query, limit, mode))
+                let streaming = arguments["streaming"].as_bool();
+                let chunk_size = arguments["chunk_size"].as_u64().map(|s| s as usize);
+                Ok(self.context_search_with_streaming(&query, limit, mode, streaming, chunk_size))
             }
             "find_symbol" => {
                 let name = arguments["name"]
@@ -318,7 +332,9 @@ impl CogMcpServer {
                     .ok_or("Missing query")?
                     .to_string();
                 let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
-                Ok(self.semantic_search(&query, limit))
+                let streaming = arguments["streaming"].as_bool();
+                let chunk_size = arguments["chunk_size"].as_u64().map(|s| s as usize);
+                Ok(self.semantic_search_with_streaming(&query, limit, streaming, chunk_size))
             }
             _ => Err(format!("Unknown tool: {}", name)),
         }
@@ -355,7 +371,18 @@ impl CogMcpServer {
         }
     }
 
-    fn context_search(&self, query: &str, limit: usize, mode: &str) -> String {
+    /// Context search with streaming support
+    ///
+    /// When streaming is enabled (or auto-enabled for large result sets), results are
+    /// formatted in chunks for incremental delivery to clients.
+    fn context_search_with_streaming(
+        &self,
+        query: &str,
+        limit: usize,
+        mode: &str,
+        streaming: Option<bool>,
+        chunk_size: Option<usize>,
+    ) -> String {
         // Use configured default mode if not specified
         let mode_str = if mode.is_empty() {
             &self.config.search.default_mode
@@ -383,28 +410,78 @@ impl CogMcpServer {
                     return "No matches found.".to_string();
                 }
 
+                // Determine if streaming should be used
+                let use_streaming = streaming.unwrap_or_else(|| {
+                    self.streaming_config.should_auto_stream(results.len())
+                });
+
                 let mode_info = if search.has_semantic() {
                     format!("(mode: {:?}, semantic enabled)", search_mode)
                 } else {
                     format!("(mode: {:?}, semantic disabled)", search_mode)
                 };
 
-                let mut output = String::new();
-                output.push_str(&format!("## Search results for: {} {}\n\n", query, mode_info));
-                for hit in results {
-                    output.push_str(&format!("### `{}`", hit.path));
-                    if let Some(line) = hit.line_number {
-                        output.push_str(&format!(":{}", line));
+                // Format header
+                let header = format!("## Search results for: {} {}\n\n", query, mode_info);
+
+                if use_streaming {
+                    // Use streaming format with progress indicators
+                    self.format_streaming_results(&header, &results, chunk_size)
+                } else {
+                    // Standard format
+                    let mut output = header;
+                    for hit in results {
+                        output.push_str(&format!("### `{}`", hit.path));
+                        if let Some(line) = hit.line_number {
+                            output.push_str(&format!(":{}", line));
+                        }
+                        output.push_str(&format!(" (score: {:.2}, type: {:?})\n", hit.score, hit.match_type));
+                        output.push_str("```\n");
+                        output.push_str(&hit.content);
+                        output.push_str("\n```\n\n");
                     }
-                    output.push_str(&format!(" (score: {:.2}, type: {:?})\n", hit.score, hit.match_type));
-                    output.push_str("```\n");
-                    output.push_str(&hit.content);
-                    output.push_str("\n```\n\n");
+                    output
                 }
-                output
             }
             Err(e) => format!("Search failed: {}", e),
         }
+    }
+
+    /// Format results with streaming-style chunked output
+    fn format_streaming_results(
+        &self,
+        header: &str,
+        results: &[cogmcp_search::HybridSearchResult],
+        chunk_size: Option<usize>,
+    ) -> String {
+        let chunk_size = chunk_size.unwrap_or(self.streaming_config.chunk_size);
+        let total = results.len();
+
+        let mut output = header.to_string();
+        output.push_str(&format!("_Streaming {} results in chunks of {}..._\n\n", total, chunk_size));
+
+        for (i, chunk) in results.chunks(chunk_size).enumerate() {
+            let chunk_start = i * chunk_size + 1;
+            let chunk_end = (chunk_start + chunk.len() - 1).min(total);
+            let progress = (chunk_end as f32 / total as f32 * 100.0) as u32;
+
+            output.push_str(&format!("### Chunk {}-{} of {} ({}% complete)\n\n",
+                chunk_start, chunk_end, total, progress));
+
+            for hit in chunk {
+                output.push_str(&format!("#### `{}`", hit.path));
+                if let Some(line) = hit.line_number {
+                    output.push_str(&format!(":{}", line));
+                }
+                output.push_str(&format!(" (score: {:.2}, type: {:?})\n", hit.score, hit.match_type));
+                output.push_str("```\n");
+                output.push_str(&hit.content);
+                output.push_str("\n```\n\n");
+            }
+        }
+
+        output.push_str("_Streaming complete._\n");
+        output
     }
 
     fn find_symbol_with_visibility(
@@ -683,8 +760,17 @@ impl CogMcpServer {
         }
     }
 
-    /// Semantic search for code using natural language
-    fn semantic_search(&self, query: &str, limit: usize) -> String {
+    /// Semantic search with streaming support
+    ///
+    /// When streaming is enabled (or auto-enabled for large result sets), results are
+    /// formatted in chunks for incremental delivery to clients.
+    fn semantic_search_with_streaming(
+        &self,
+        query: &str,
+        limit: usize,
+        streaming: Option<bool>,
+        chunk_size: Option<usize>,
+    ) -> String {
         let Some(ref semantic) = self.semantic_search else {
             return "Semantic search is not available. Enable embeddings in configuration.".to_string();
         };
@@ -699,28 +785,93 @@ impl CogMcpServer {
                     return "No matches found.".to_string();
                 }
 
-                let mut output = String::new();
-                output.push_str(&format!("## Semantic search results for: {}\n\n", query));
-                for result in results {
-                    output.push_str(&format!(
-                        "### `{}`",
-                        result.path
-                    ));
-                    if let Some(line) = result.start_line {
-                        output.push_str(&format!(":{}", line));
+                // Determine if streaming should be used
+                let use_streaming = streaming.unwrap_or_else(|| {
+                    self.streaming_config.should_auto_stream(results.len())
+                });
+
+                let header = format!("## Semantic search results for: {}\n\n", query);
+
+                if use_streaming {
+                    self.format_semantic_streaming_results(&header, &results, chunk_size)
+                } else {
+                    let mut output = header;
+                    for result in results {
+                        output.push_str(&format!(
+                            "### `{}`",
+                            result.path
+                        ));
+                        if let Some(line) = result.start_line {
+                            output.push_str(&format!(":{}", line));
+                        }
+                        output.push_str(&format!(
+                            " (similarity: {:.2}, type: {:?})\n",
+                            result.similarity, result.chunk_type
+                        ));
+                        output.push_str("```\n");
+                        output.push_str(&result.chunk_text);
+                        output.push_str("\n```\n\n");
                     }
-                    output.push_str(&format!(
-                        " (similarity: {:.2}, type: {:?})\n",
-                        result.similarity, result.chunk_type
-                    ));
-                    output.push_str("```\n");
-                    output.push_str(&result.chunk_text);
-                    output.push_str("\n```\n\n");
+                    output
                 }
-                output
             }
             Err(e) => format!("Semantic search failed: {}", e),
         }
+    }
+
+    /// Format semantic search results with streaming-style chunked output
+    fn format_semantic_streaming_results(
+        &self,
+        header: &str,
+        results: &[cogmcp_search::SemanticSearchResult],
+        chunk_size: Option<usize>,
+    ) -> String {
+        let chunk_size = chunk_size.unwrap_or(self.streaming_config.chunk_size);
+        let total = results.len();
+
+        let mut output = header.to_string();
+        output.push_str(&format!("_Streaming {} results in chunks of {}..._\n\n", total, chunk_size));
+
+        for (i, chunk) in results.chunks(chunk_size).enumerate() {
+            let chunk_start = i * chunk_size + 1;
+            let chunk_end = (chunk_start + chunk.len() - 1).min(total);
+            let progress = (chunk_end as f32 / total as f32 * 100.0) as u32;
+
+            output.push_str(&format!("### Chunk {}-{} of {} ({}% complete)\n\n",
+                chunk_start, chunk_end, total, progress));
+
+            for result in chunk {
+                output.push_str(&format!("#### `{}`", result.path));
+                if let Some(line) = result.start_line {
+                    output.push_str(&format!(":{}", line));
+                }
+                output.push_str(&format!(
+                    " (similarity: {:.2}, type: {:?})\n",
+                    result.similarity, result.chunk_type
+                ));
+                output.push_str("```\n");
+                output.push_str(&result.chunk_text);
+                output.push_str("\n```\n\n");
+            }
+        }
+
+        output.push_str("_Streaming complete._\n");
+        output
+    }
+
+    /// Get the current streaming configuration
+    pub fn get_streaming_config(&self) -> &StreamingConfigOptions {
+        &self.streaming_config
+    }
+
+    /// Update the streaming configuration
+    pub fn set_streaming_config(&mut self, config: StreamingConfigOptions) {
+        self.streaming_config = config;
+    }
+
+    /// Check if streaming is enabled
+    pub fn is_streaming_enabled(&self) -> bool {
+        self.streaming_config.enabled
     }
 }
 
