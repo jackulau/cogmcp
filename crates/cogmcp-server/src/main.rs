@@ -106,6 +106,7 @@ Available Tools:
 - index_status      View indexing stats
 - reindex           Re-index the codebase
 - semantic_search   Semantic code search (if embeddings enabled)
+- reload_config     Reload configuration from disk
 
 "#,
         binary_path = binary_path,

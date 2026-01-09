@@ -316,4 +316,86 @@ mod tests {
         let value = result.unwrap();
         assert_eq!(value["isError"], false);
     }
+
+    #[test]
+    fn test_reload_config_tool_in_list() {
+        let server = create_test_server();
+        let result = handle_tools_list(&server, None);
+
+        assert!(result.is_ok());
+
+        let value = result.unwrap();
+        let tools = value["tools"].as_array().unwrap();
+
+        // Check that reload_config tool exists
+        let reload_tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("reload_config"));
+        assert!(
+            reload_tool.is_some(),
+            "reload_config tool should be in tools list"
+        );
+
+        // Verify the tool has the expected schema
+        let tool = reload_tool.unwrap();
+        assert!(tool.get("description").is_some());
+        assert!(tool.get("inputSchema").is_some());
+
+        let schema = &tool["inputSchema"];
+        assert!(schema.get("properties").is_some());
+        assert!(schema["properties"].get("validate_only").is_some());
+    }
+
+    #[test]
+    fn test_handle_tools_call_reload_config() {
+        let server = create_test_server();
+        let params = Some(json!({
+            "name": "reload_config",
+            "arguments": {}
+        }));
+
+        let result = handle_tools_call(&server, params);
+
+        assert!(result.is_ok());
+
+        let value = result.unwrap();
+        assert_eq!(value["isError"], false);
+
+        let content = value["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+
+        // Check that the response contains expected elements
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("Configuration"), "Should mention configuration");
+    }
+
+    #[test]
+    fn test_handle_tools_call_reload_config_validate_only() {
+        let server = create_test_server();
+        let params = Some(json!({
+            "name": "reload_config",
+            "arguments": {
+                "validate_only": true
+            }
+        }));
+
+        let result = handle_tools_call(&server, params);
+
+        assert!(result.is_ok());
+
+        let value = result.unwrap();
+        assert_eq!(value["isError"], false);
+
+        let content = value["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("validated"),
+            "Should mention validation in output"
+        );
+        assert!(
+            text.contains("validate_only"),
+            "Should mention how to apply config"
+        );
+    }
 }

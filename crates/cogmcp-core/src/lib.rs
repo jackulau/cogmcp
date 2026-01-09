@@ -8,5 +8,5 @@ pub mod config;
 pub mod error;
 pub mod types;
 
-pub use config::{CacheConfig, Config, SearchConfig};
+pub use config::{Config, ReloadResult, SearchConfig, SharedConfig};
 pub use error::{Error, Result};

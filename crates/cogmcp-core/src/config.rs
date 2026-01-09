@@ -1,11 +1,9 @@
 //! Configuration management for CogMCP
 
-use arc_swap::{ArcSwap, Guard};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 
@@ -105,337 +103,121 @@ impl Config {
         Ok(Self::data_dir()?.join("models").join("all-MiniLM-L6-v2.onnx"))
     }
 
-    /// Validate the configuration
-    ///
-    /// Returns Ok(()) if the configuration is valid, or an error describing
-    /// what's invalid.
-    pub fn validate(&self) -> Result<()> {
-        // Validate server config
-        if self.server.transport != "stdio" && self.server.transport != "http" {
-            return Err(Error::Config(format!(
-                "Invalid transport '{}': must be 'stdio' or 'http'",
-                self.server.transport
-            )));
-        }
+    /// Find which config file would be loaded
+    pub fn find_config_path() -> Option<PathBuf> {
+        Self::config_locations().into_iter().find(|p| p.exists())
+    }
 
-        let valid_log_levels = ["trace", "debug", "info", "warn", "error"];
-        if !valid_log_levels.contains(&self.server.log_level.to_lowercase().as_str()) {
-            return Err(Error::Config(format!(
-                "Invalid log_level '{}': must be one of {:?}",
-                self.server.log_level, valid_log_levels
-            )));
-        }
-
-        // Validate context config
-        if self.context.chunk_overlap < 0.0 || self.context.chunk_overlap > 1.0 {
-            return Err(Error::Config(format!(
-                "Invalid chunk_overlap {}: must be between 0.0 and 1.0",
-                self.context.chunk_overlap
-            )));
-        }
-
-        let valid_strategies = ["semantic", "recursive", "fixed"];
-        if !valid_strategies.contains(&self.context.chunking_strategy.as_str()) {
-            return Err(Error::Config(format!(
-                "Invalid chunking_strategy '{}': must be one of {:?}",
-                self.context.chunking_strategy, valid_strategies
-            )));
-        }
-
-        // Validate search config
-        if self.search.min_similarity < 0.0 || self.search.min_similarity > 1.0 {
-            return Err(Error::Config(format!(
-                "Invalid min_similarity {}: must be between 0.0 and 1.0",
-                self.search.min_similarity
-            )));
-        }
-
-        if self.search.keyword_weight < 0.0 || self.search.keyword_weight > 1.0 {
-            return Err(Error::Config(format!(
-                "Invalid keyword_weight {}: must be between 0.0 and 1.0",
-                self.search.keyword_weight
-            )));
-        }
-
-        if self.search.semantic_weight < 0.0 || self.search.semantic_weight > 1.0 {
-            return Err(Error::Config(format!(
-                "Invalid semantic_weight {}: must be between 0.0 and 1.0",
-                self.search.semantic_weight
-            )));
-        }
-
-        let valid_modes = ["keyword", "semantic", "hybrid"];
-        if !valid_modes.contains(&self.search.default_mode.as_str()) {
-            return Err(Error::Config(format!(
-                "Invalid default_mode '{}': must be one of {:?}",
-                self.search.default_mode, valid_modes
-            )));
-        }
-
-        Ok(())
+    /// Generate a summary of key config settings
+    pub fn summary(&self) -> String {
+        format!(
+            "Server: transport={}, log_level={}\n\
+             Indexing: max_file_size={}KB, embeddings={}\n\
+             Search: mode={}, min_similarity={:.2}\n\
+             Watching: enabled={}, debounce={}ms",
+            self.server.transport,
+            self.server.log_level,
+            self.indexing.max_file_size,
+            self.indexing.enable_embeddings,
+            self.search.default_mode,
+            self.search.min_similarity,
+            self.watching.enabled,
+            self.watching.debounce_ms,
+        )
     }
 }
 
-/// Event emitted when configuration changes
-#[derive(Debug, Clone)]
-pub struct ConfigChangeEvent {
-    /// The new configuration after the change
-    pub new_config: Arc<Config>,
-    /// The previous configuration before the change
-    pub old_config: Arc<Config>,
-    /// The path from which the config was reloaded (if any)
-    pub source_path: Option<PathBuf>,
-}
-
-/// Thread-safe shared configuration wrapper
-///
-/// This type provides atomic access to configuration and supports
-/// hot-reloading from disk. Use `current()` to get a read guard
-/// to the current configuration, and `reload()` to refresh from disk.
+/// Thread-safe shared configuration that can be reloaded at runtime
+#[derive(Clone)]
 pub struct SharedConfig {
-    /// The current configuration, wrapped in ArcSwap for atomic updates
-    config: ArcSwap<Config>,
-    /// The path to the config file (if loaded from a file)
-    config_path: parking_lot::RwLock<Option<PathBuf>>,
-    /// Broadcast channel for config change notifications
-    change_sender: broadcast::Sender<ConfigChangeEvent>,
+    inner: Arc<RwLock<Config>>,
+    source_path: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl SharedConfig {
-    /// Load configuration from default locations
-    ///
-    /// This searches for configuration files in the standard locations
-    /// and loads the first one found. If no config file exists, uses defaults.
-    pub fn load() -> Result<Arc<Self>> {
-        let locations = Config::config_locations();
-
-        for path in &locations {
-            if path.exists() {
-                return Self::load_from_path(path);
-            }
+    /// Create a new SharedConfig from an existing Config
+    pub fn new(config: Config) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(config)),
+            source_path: Arc::new(RwLock::new(Config::find_config_path())),
         }
-
-        // No config file found, use defaults
-        info!("No config file found, using defaults");
-        let config = Config::default();
-        config.validate()?;
-
-        let (change_sender, _) = broadcast::channel(16);
-
-        Ok(Arc::new(Self {
-            config: ArcSwap::from_pointee(config),
-            config_path: parking_lot::RwLock::new(None),
-            change_sender,
-        }))
     }
 
-    /// Load configuration from a specific path
-    pub fn load_from_path(path: &Path) -> Result<Arc<Self>> {
-        info!("Loading config from: {}", path.display());
-        let config = Config::load_from_path(path)?;
-        config.validate()?;
-
-        let (change_sender, _) = broadcast::channel(16);
-
-        Ok(Arc::new(Self {
-            config: ArcSwap::from_pointee(config),
-            config_path: parking_lot::RwLock::new(Some(path.to_path_buf())),
-            change_sender,
-        }))
+    /// Load SharedConfig from default locations
+    pub fn load() -> Result<Self> {
+        let source_path = Config::find_config_path();
+        let config = Config::load()?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(config)),
+            source_path: Arc::new(RwLock::new(source_path)),
+        })
     }
 
-    /// Create a SharedConfig from an existing Config
-    pub fn from_config(config: Config) -> Result<Arc<Self>> {
-        config.validate()?;
-
-        let (change_sender, _) = broadcast::channel(16);
-
-        Ok(Arc::new(Self {
-            config: ArcSwap::from_pointee(config),
-            config_path: parking_lot::RwLock::new(None),
-            change_sender,
-        }))
+    /// Get a read-only clone of the current config
+    pub fn get(&self) -> Config {
+        self.inner.read().clone()
     }
 
-    /// Get a read guard to the current configuration
-    ///
-    /// This is very cheap (just an atomic load) and the returned guard
-    /// can be held for as long as needed. The configuration it points
-    /// to will remain valid even if a reload happens.
-    pub fn current(&self) -> Guard<Arc<Config>> {
-        self.config.load()
-    }
-
-    /// Get a clone of the current configuration
-    ///
-    /// This is slightly more expensive than `current()` but returns
-    /// an owned Arc that can be stored or passed around freely.
-    pub fn get(&self) -> Arc<Config> {
-        self.config.load_full()
+    /// Get the path of the config file being used (if any)
+    pub fn source_path(&self) -> Option<PathBuf> {
+        self.source_path.read().clone()
     }
 
     /// Reload configuration from disk
     ///
-    /// If the SharedConfig was created without a file path, this will
-    /// search the default config locations. The new configuration is
-    /// validated before being applied.
-    ///
-    /// Returns the new configuration on success, or an error if the
-    /// file cannot be read or validation fails.
-    pub fn reload(&self) -> Result<Arc<Config>> {
-        let path = self.config_path.read().clone();
+    /// Returns a summary of what changed or an error
+    pub fn reload(&self) -> Result<ReloadResult> {
+        let source_path = Config::find_config_path();
+        let new_config = Config::load()?;
 
-        let (new_config, source_path) = if let Some(ref path) = path {
-            debug!("Reloading config from: {}", path.display());
-            (Config::load_from_path(path)?, Some(path.clone()))
-        } else {
-            // Try to find a config file
-            let locations = Config::config_locations();
-            let mut found_config = None;
-            let mut found_path = None;
+        // Update source path
+        *self.source_path.write() = source_path.clone();
 
-            for location in &locations {
-                if location.exists() {
-                    debug!("Found config at: {}", location.display());
-                    found_config = Some(Config::load_from_path(location)?);
-                    found_path = Some(location.clone());
-                    break;
-                }
-            }
+        // Update config
+        *self.inner.write() = new_config.clone();
 
-            match found_config {
-                Some(config) => (config, found_path),
-                None => {
-                    debug!("No config file found, using defaults");
-                    (Config::default(), None)
-                }
-            }
-        };
-
-        // Validate before applying
-        new_config.validate()?;
-
-        let old_config = self.config.load_full();
-        let new_config = Arc::new(new_config);
-
-        // Atomically swap the configuration
-        self.config.store(Arc::clone(&new_config));
-
-        // Update the path if we found a new one
-        if source_path.is_some() && path.is_none() {
-            *self.config_path.write() = source_path.clone();
-        }
-
-        info!("Configuration reloaded successfully");
-
-        // Broadcast the change event
-        let event = ConfigChangeEvent {
-            new_config: Arc::clone(&new_config),
-            old_config,
+        Ok(ReloadResult {
             source_path,
-        };
-
-        // Ignore send errors (no receivers is fine)
-        let _ = self.change_sender.send(event);
-
-        Ok(new_config)
+            config_summary: new_config.summary(),
+        })
     }
 
-    /// Subscribe to configuration change events
+    /// Validate configuration from disk without applying
     ///
-    /// Returns a receiver that will receive events whenever the
-    /// configuration is reloaded.
-    pub fn subscribe(&self) -> broadcast::Receiver<ConfigChangeEvent> {
-        self.change_sender.subscribe()
-    }
+    /// Returns the config summary if valid, or an error
+    pub fn validate(&self) -> Result<ReloadResult> {
+        let source_path = Config::find_config_path();
+        let new_config = Config::load()?;
 
-    /// Get the path to the config file (if any)
-    pub fn config_path(&self) -> Option<PathBuf> {
-        self.config_path.read().clone()
+        Ok(ReloadResult {
+            source_path,
+            config_summary: new_config.summary(),
+        })
     }
+}
 
-    /// Set the config file path
-    ///
-    /// This updates the path that will be used for future reloads.
-    pub fn set_config_path(&self, path: Option<PathBuf>) {
-        *self.config_path.write() = path;
+impl Default for SharedConfig {
+    fn default() -> Self {
+        Self::new(Config::default())
     }
 }
 
 impl std::fmt::Debug for SharedConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedConfig")
-            .field("config", &*self.config.load())
-            .field("config_path", &*self.config_path.read())
+            .field("config", &*self.inner.read())
+            .field("source_path", &*self.source_path.read())
             .finish()
     }
 }
 
-/// Watches a configuration file for changes and triggers reloads
-///
-/// This struct monitors the config file path and can be used to
-/// trigger reloads when the file changes.
-pub struct ConfigWatcher {
-    /// The shared config to reload
-    shared_config: Arc<SharedConfig>,
-    /// Path to watch
-    watch_path: PathBuf,
-}
-
-impl ConfigWatcher {
-    /// Create a new ConfigWatcher
-    ///
-    /// The watcher will monitor the specified path and can reload
-    /// the shared config when triggered.
-    pub fn new(shared_config: Arc<SharedConfig>, watch_path: PathBuf) -> Self {
-        Self {
-            shared_config,
-            watch_path,
-        }
-    }
-
-    /// Get the path being watched
-    pub fn watch_path(&self) -> &Path {
-        &self.watch_path
-    }
-
-    /// Trigger a reload of the configuration
-    ///
-    /// This should be called when the config file changes.
-    /// Returns the new configuration on success.
-    pub fn trigger_reload(&self) -> Result<Arc<Config>> {
-        info!("Config file change detected, reloading...");
-
-        // Update the path in shared config if different
-        let current_path = self.shared_config.config_path();
-        if current_path.as_ref() != Some(&self.watch_path) {
-            self.shared_config.set_config_path(Some(self.watch_path.clone()));
-        }
-
-        match self.shared_config.reload() {
-            Ok(config) => {
-                info!("Config reloaded successfully");
-                Ok(config)
-            }
-            Err(e) => {
-                warn!("Failed to reload config: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Get a reference to the shared config
-    pub fn shared_config(&self) -> &Arc<SharedConfig> {
-        &self.shared_config
-    }
-}
-
-impl std::fmt::Debug for ConfigWatcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConfigWatcher")
-            .field("watch_path", &self.watch_path)
-            .finish()
-    }
+/// Result of a config reload operation
+#[derive(Debug, Clone)]
+pub struct ReloadResult {
+    /// Path to the config file that was loaded (None if using defaults)
+    pub source_path: Option<PathBuf>,
+    /// Summary of the loaded configuration
+    pub config_summary: String,
 }
 
 /// Server configuration
