@@ -27,9 +27,11 @@
 //! ```
 
 pub mod inference;
+pub mod lazy;
 pub mod model;
 pub mod tokenizer;
 
 pub use inference::EmbeddingEngine;
+pub use lazy::LazyEmbeddingEngine;
 pub use model::{ModelConfig, ModelManager};
 pub use tokenizer::{BatchTokenizedInput, TokenizedInput, Tokenizer};
