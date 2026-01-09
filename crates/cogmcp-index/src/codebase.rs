@@ -4,11 +4,9 @@ use crate::parallel_indexer::{ParallelIndexConfig, ParallelIndexer, ProgressRepo
 use crate::parser::{CodeParser, ExtractedSymbol};
 use cogmcp_core::types::Language;
 use cogmcp_core::{Config, Error, Result};
-use cogmcp_embeddings::EmbeddingEngine;
-use cogmcp_storage::{Database, EmbeddingInput, FullTextIndex};
+use cogmcp_embeddings::LazyEmbeddingEngine;
+use cogmcp_storage::{Database, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use parking_lot::Mutex;
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,7 +60,7 @@ pub struct CodebaseIndexer {
     ignore_patterns: GlobSet,
     include_extensions: HashSet<String>,
     parser: Arc<CodeParser>,
-    embedding_engine: Option<Arc<Mutex<EmbeddingEngine>>>,
+    embedding_engine: Option<Arc<LazyEmbeddingEngine>>,
 }
 
 impl CodebaseIndexer {
@@ -91,7 +89,7 @@ impl CodebaseIndexer {
         root: PathBuf,
         config: Config,
         parser: Arc<CodeParser>,
-        engine: Arc<Mutex<EmbeddingEngine>>,
+        engine: Arc<LazyEmbeddingEngine>,
     ) -> Result<Self> {
         let mut indexer = Self::new(root, config, parser)?;
         indexer.embedding_engine = Some(engine);
@@ -99,14 +97,17 @@ impl CodebaseIndexer {
     }
 
     /// Set the embedding engine
-    pub fn set_embedding_engine(&mut self, engine: Arc<Mutex<EmbeddingEngine>>) {
+    pub fn set_embedding_engine(&mut self, engine: Arc<LazyEmbeddingEngine>) {
         self.embedding_engine = Some(engine);
     }
 
     /// Check if embeddings are enabled and available
+    ///
+    /// Returns true if embeddings are enabled in config and model files exist.
+    /// This does NOT require the model to be loaded.
     pub fn embeddings_enabled(&self) -> bool {
         self.config.indexing.enable_embeddings
-            && self.embedding_engine.as_ref().is_some_and(|e| e.lock().is_loaded())
+            && self.embedding_engine.as_ref().map_or(false, |e| e.is_available())
     }
 
     fn build_ignore_patterns(config: &Config) -> Result<GlobSet> {

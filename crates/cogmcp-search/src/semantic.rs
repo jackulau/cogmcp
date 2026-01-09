@@ -201,7 +201,7 @@ struct EmbeddingRecord {
 /// Uses `LazyEmbeddingEngine` to defer ONNX model loading until the first
 /// actual search query, improving server startup time.
 pub struct SemanticSearch {
-    /// Lazy embedding engine for generating query embeddings (defers model loading)
+    /// Embedding engine for generating query embeddings (lazy loading)
     engine: Arc<LazyEmbeddingEngine>,
     /// Database for storing and retrieving embeddings
     db: Arc<Database>,
@@ -215,9 +215,6 @@ pub struct SemanticSearch {
 
 impl SemanticSearch {
     /// Create a new semantic search instance
-    ///
-    /// The `LazyEmbeddingEngine` defers model loading until the first search query,
-    /// which can significantly improve server startup time.
     pub fn new(engine: Arc<LazyEmbeddingEngine>, db: Arc<Database>) -> Self {
         Self {
             engine,
@@ -229,22 +226,11 @@ impl SemanticSearch {
         }
     }
 
-    /// Check if the embedding model files are available for loading
+    /// Check if the model files exist and are available for loading
     ///
-    /// This returns true if the model files exist, even if they haven't
-    /// been loaded yet (due to lazy loading). Use `is_loaded()` to check
-    /// if the model has actually been loaded.
+    /// This does NOT require the model to be loaded - it only checks file existence.
     pub fn is_available(&self) -> bool {
         self.engine.is_available()
-    }
-
-    /// Check if the embedding model is currently loaded in memory
-    ///
-    /// Returns true only if the model has been loaded (after the first
-    /// embedding request). Returns false if the model is still in its
-    /// lazy/unloaded state.
-    pub fn is_loaded(&self) -> bool {
-        self.engine.is_loaded()
     }
 
     /// Get the embedding dimension
@@ -461,8 +447,7 @@ impl SemanticSearch {
 
     /// Get or compute embedding for a query string
     ///
-    /// On the first call, this will trigger lazy loading of the embedding model
-    /// if it hasn't been loaded yet.
+    /// On the first call, this will trigger lazy loading of the ONNX model.
     fn get_or_compute_embedding(&self, query: &str) -> Result<Vec<f32>> {
         // Check cache first
         if let Some(cached) = self.query_cache.get(&query.to_string()) {
@@ -470,7 +455,7 @@ impl SemanticSearch {
             return Ok(cached);
         }
 
-        // Compute embedding (LazyEmbeddingEngine handles locking internally)
+        // Compute embedding (this triggers lazy model loading on first call)
         let embedding = self.engine.embed(query)?;
 
         // Cache the result
@@ -572,15 +557,14 @@ impl SemanticSearch {
 
     /// Index text and store its embedding
     ///
-    /// On the first call, this will trigger lazy loading of the embedding model
-    /// if it hasn't been loaded yet.
+    /// On the first call, this will trigger lazy loading of the ONNX model.
     pub fn index_chunk(
         &self,
         chunk_text: &str,
         symbol_id: Option<i64>,
         chunk_type: ChunkType,
     ) -> Result<i64> {
-        // LazyEmbeddingEngine handles locking internally
+        // This triggers lazy model loading on first call
         let embedding = self.engine.embed(chunk_text)?;
         let id = self.db.insert_embedding(
             symbol_id,
@@ -761,7 +745,7 @@ mod tests {
         // Create an in-memory database
         let db = Arc::new(Database::in_memory().unwrap());
 
-        // Create a lazy embedding engine with default config (no model files)
+        // Create a mock lazy embedding engine (no model files, will return false for is_available)
         let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
 
         SemanticSearch::with_cache_config(engine, db, SearchCacheConfig::default())
@@ -918,7 +902,7 @@ mod tests {
             "function",
         ).unwrap();
 
-        // Create search with lazy engine (default config, no model files)
+        // Create search with mock engine
         let engine = Arc::new(LazyEmbeddingEngine::new(ModelConfig::default()));
         let search = SemanticSearch::new(engine, db);
 
