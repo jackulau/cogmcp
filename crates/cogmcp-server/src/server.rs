@@ -1,6 +1,6 @@
 //! Main MCP server implementation
 
-use cogmcp_core::{Config, Result};
+use cogmcp_core::{ActionableError, Config, ErrorCode, Result};
 use cogmcp_embeddings::{EmbeddingEngine, ModelConfig};
 use cogmcp_index::{CodeParser, CodebaseIndexer};
 use cogmcp_search::{HybridSearch, SearchMode, SemanticSearch};
@@ -268,59 +268,69 @@ impl CogMcpServer {
         &self,
         name: &str,
         arguments: serde_json::Value,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<String, ActionableError> {
         match name {
             "ping" => Ok(self.ping()),
             "context_grep" => {
                 let pattern = arguments["pattern"]
                     .as_str()
-                    .ok_or("Missing pattern")?
+                    .ok_or_else(|| ActionableError::missing_parameter("pattern")
+                        .with_suggestion("Provide a search pattern string")
+                        .with_suggestion("Example: {\"pattern\": \"TODO\"}"))?
                     .to_string();
                 let limit = arguments["limit"].as_u64().unwrap_or(50) as usize;
-                Ok(self.context_grep(&pattern, limit))
+                self.context_grep(&pattern, limit)
             }
             "context_search" => {
                 let query = arguments["query"]
                     .as_str()
-                    .ok_or("Missing query")?
+                    .ok_or_else(|| ActionableError::missing_parameter("query")
+                        .with_suggestion("Provide a search query string")
+                        .with_suggestion("Example: {\"query\": \"error handling\"}"))?
                     .to_string();
                 let limit = arguments["limit"].as_u64().unwrap_or(20) as usize;
                 let mode = arguments["mode"].as_str().unwrap_or("hybrid");
-                Ok(self.context_search(&query, limit, mode))
+                self.context_search(&query, limit, mode)
             }
             "find_symbol" => {
                 let name = arguments["name"]
                     .as_str()
-                    .ok_or("Missing name")?
+                    .ok_or_else(|| ActionableError::missing_parameter("name")
+                        .with_suggestion("Provide a symbol name to search for")
+                        .with_suggestion("Example: {\"name\": \"MyClass\"}"))?
                     .to_string();
                 let kind = arguments["kind"].as_str().map(|s| s.to_string());
                 let visibility = arguments["visibility"].as_str().map(|s| s.to_string());
                 let fuzzy = arguments["fuzzy"].as_bool().unwrap_or(false);
-                Ok(self.find_symbol_with_visibility(
+                self.find_symbol_with_visibility(
                     &name,
                     kind.as_deref(),
                     visibility.as_deref(),
                     fuzzy,
-                ))
+                )
             }
             "get_file_outline" => {
                 let file_path = arguments["file_path"]
                     .as_str()
-                    .ok_or("Missing file_path")?
+                    .ok_or_else(|| ActionableError::missing_parameter("file_path")
+                        .with_suggestion("Provide a path to the file")
+                        .with_suggestion("Example: {\"file_path\": \"src/main.rs\"}"))?
                     .to_string();
-                Ok(self.get_file_outline(&file_path))
+                self.get_file_outline(&file_path)
             }
-            "index_status" => Ok(self.index_status()),
-            "reindex" => Ok(self.reindex()),
+            "index_status" => self.index_status(),
+            "reindex" => self.reindex(),
             "semantic_search" => {
                 let query = arguments["query"]
                     .as_str()
-                    .ok_or("Missing query")?
+                    .ok_or_else(|| ActionableError::missing_parameter("query")
+                        .with_suggestion("Provide a natural language search query")
+                        .with_suggestion("Example: {\"query\": \"function to parse JSON\"}"))?
                     .to_string();
                 let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
-                Ok(self.semantic_search(&query, limit))
+                self.semantic_search(&query, limit)
             }
-            _ => Err(format!("Unknown tool: {}", name)),
+            _ => Err(ActionableError::unknown_tool(name)),
         }
     }
 
@@ -334,11 +344,16 @@ impl CogMcpServer {
         )
     }
 
-    fn context_grep(&self, pattern: &str, limit: usize) -> String {
+    fn context_grep(&self, pattern: &str, limit: usize) -> std::result::Result<String, ActionableError> {
+        // Check index status first
+        if let Some(err) = self.check_index_status()? {
+            return Err(err);
+        }
+
         match self.text_index.search(pattern, limit) {
             Ok(results) => {
                 if results.is_empty() {
-                    return "No matches found.".to_string();
+                    return Err(ActionableError::no_search_results(pattern));
                 }
                 let mut output = String::new();
                 for hit in results {
@@ -349,13 +364,18 @@ impl CogMcpServer {
                         hit.content.trim()
                     ));
                 }
-                output
+                Ok(output)
             }
-            Err(e) => format!("Search failed: {}", e),
+            Err(e) => Err(ActionableError::search_failed(&e.to_string())),
         }
     }
 
-    fn context_search(&self, query: &str, limit: usize, mode: &str) -> String {
+    fn context_search(&self, query: &str, limit: usize, mode: &str) -> std::result::Result<String, ActionableError> {
+        // Check index status first
+        if let Some(err) = self.check_index_status()? {
+            return Err(err);
+        }
+
         // Use configured default mode if not specified
         let mode_str = if mode.is_empty() {
             &self.config.search.default_mode
@@ -380,7 +400,7 @@ impl CogMcpServer {
         match search.search(query, search_mode, limit) {
             Ok(results) => {
                 if results.is_empty() {
-                    return "No matches found.".to_string();
+                    return Err(ActionableError::no_search_results(query));
                 }
 
                 let mode_info = if search.has_semantic() {
@@ -401,9 +421,9 @@ impl CogMcpServer {
                     output.push_str(&hit.content);
                     output.push_str("\n```\n\n");
                 }
-                output
+                Ok(output)
             }
-            Err(e) => format!("Search failed: {}", e),
+            Err(e) => Err(ActionableError::search_failed(&e.to_string())),
         }
     }
 
@@ -413,11 +433,16 @@ impl CogMcpServer {
         kind: Option<&str>,
         visibility: Option<&str>,
         fuzzy: bool,
-    ) -> String {
+    ) -> std::result::Result<String, ActionableError> {
+        // Check index status first
+        if let Some(err) = self.check_index_status()? {
+            return Err(err);
+        }
+
         match self.db.find_symbols_by_name(name, fuzzy) {
             Ok(symbols) => {
                 if symbols.is_empty() {
-                    return format!("No symbols found matching '{}'", name);
+                    return Err(ActionableError::symbol_not_found(name));
                 }
 
                 // Filter by kind if specified
@@ -446,7 +471,8 @@ impl CogMcpServer {
                 };
 
                 if symbols.is_empty() {
-                    return format!("No symbols found matching '{}' with given filters", name);
+                    return Err(ActionableError::symbol_not_found(name)
+                        .with_cause("No symbols match the specified kind/visibility filters"));
                 }
 
                 let mut output = String::new();
@@ -492,20 +518,23 @@ impl CogMcpServer {
                         output.push_str(&format!("  Returns: `{}`\n", ret_type));
                     }
                 }
-                output
+                Ok(output)
             }
-            Err(e) => format!("Symbol search failed: {}", e),
+            Err(e) => Err(ActionableError::search_failed(&e.to_string())),
         }
     }
 
-    fn get_file_outline(&self, file_path: &str) -> String {
+    fn get_file_outline(&self, file_path: &str) -> std::result::Result<String, ActionableError> {
         use cogmcp_core::types::Language;
 
         let full_path = self.root.join(file_path);
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(e) => return format!("Failed to read file: {}", e),
-        };
+
+        if !full_path.exists() {
+            return Err(ActionableError::file_not_found(file_path));
+        }
+
+        let content = std::fs::read_to_string(&full_path)
+            .map_err(|e| ActionableError::file_read_failed(file_path, &e.to_string()))?;
 
         let ext = full_path
             .extension()
@@ -516,7 +545,12 @@ impl CogMcpServer {
         match self.parser.parse(&content, language) {
             Ok(symbols) => {
                 if symbols.is_empty() {
-                    return format!("No symbols found in {}", file_path);
+                    return Err(ActionableError::new(
+                        ErrorCode::NoSearchResults,
+                        format!("No symbols found in '{}'", file_path),
+                    )
+                    .with_suggestion("This file may not contain parseable code structures")
+                    .with_suggestion("Check if the file type is supported"));
                 }
                 let mut output = String::new();
                 output.push_str(&format!("## Outline: {}\n\n", file_path));
@@ -572,13 +606,13 @@ impl CogMcpServer {
                         output.push_str(&format!("  Returns: `{}`\n", ret_type));
                     }
                 }
-                output
+                Ok(output)
             }
-            Err(e) => format!("Parse failed: {}", e),
+            Err(e) => Err(ActionableError::parse_failed(&e.to_string())),
         }
     }
 
-    fn index_status(&self) -> String {
+    fn index_status(&self) -> std::result::Result<String, ActionableError> {
         match self.db.get_extended_stats() {
             Ok(stats) => {
                 let mut output = format!(
@@ -630,13 +664,13 @@ impl CogMcpServer {
                     ));
                 }
 
-                output
+                Ok(output)
             }
-            Err(e) => format!("Failed to get stats: {}", e),
+            Err(e) => Err(ActionableError::stats_failed(&e.to_string())),
         }
     }
 
-    fn reindex(&self) -> String {
+    fn reindex(&self) -> std::result::Result<String, ActionableError> {
         let indexer_result = if let Some(ref engine) = self.embedding_engine {
             CodebaseIndexer::with_embedding_engine(
                 self.root.clone(),
@@ -675,28 +709,39 @@ impl CogMcpServer {
                         }
                     }
 
-                    output
+                    Ok(output)
                 }
-                Err(e) => format!("Indexing failed: {}", e),
+                Err(e) => Err(ActionableError::index_failed(&e.to_string())),
             },
-            Err(e) => format!("Failed to create indexer: {}", e),
+            Err(e) => Err(ActionableError::index_failed(&e.to_string())
+                .with_cause("Failed to create indexer")),
+        }
+    }
+
+    /// Check if the index is empty and return an actionable error if so
+    fn check_index_status(&self) -> std::result::Result<Option<ActionableError>, ActionableError> {
+        match self.db.get_stats() {
+            Ok(stats) if stats.file_count == 0 => Ok(Some(ActionableError::index_empty())),
+            Ok(_) => Ok(None),
+            Err(e) => Err(ActionableError::stats_failed(&e.to_string())),
         }
     }
 
     /// Semantic search for code using natural language
-    fn semantic_search(&self, query: &str, limit: usize) -> String {
+    fn semantic_search(&self, query: &str, limit: usize) -> std::result::Result<String, ActionableError> {
         let Some(ref semantic) = self.semantic_search else {
-            return "Semantic search is not available. Enable embeddings in configuration.".to_string();
+            return Err(ActionableError::semantic_unavailable());
         };
 
         if !semantic.is_available() {
-            return "Semantic search is not available. Model not loaded.".to_string();
+            return Err(ActionableError::semantic_unavailable()
+                .with_cause("Model not loaded"));
         }
 
         match semantic.search(query, limit) {
             Ok(results) => {
                 if results.is_empty() {
-                    return "No matches found.".to_string();
+                    return Err(ActionableError::no_search_results(query));
                 }
 
                 let mut output = String::new();
@@ -717,9 +762,9 @@ impl CogMcpServer {
                     output.push_str(&result.chunk_text);
                     output.push_str("\n```\n\n");
                 }
-                output
+                Ok(output)
             }
-            Err(e) => format!("Semantic search failed: {}", e),
+            Err(e) => Err(ActionableError::search_failed(&e.to_string())),
         }
     }
 }
@@ -770,12 +815,23 @@ impl ServerHandler for CogMcpServer {
                 meta: None,
                 structured_content: None,
             }),
-            Err(e) => Ok(CallToolResult {
-                content: vec![Content::text(format!("Error: {}", e))],
-                is_error: Some(true),
-                meta: None,
-                structured_content: None,
-            }),
+            Err(actionable_error) => {
+                // Build metadata with error details for programmatic handling
+                let mut meta_obj = serde_json::Map::new();
+                meta_obj.insert("errorCode".to_string(), json!(actionable_error.code.code()));
+                meta_obj.insert("suggestions".to_string(), json!(actionable_error.suggestions));
+                if let Some(cause) = &actionable_error.cause {
+                    meta_obj.insert("cause".to_string(), json!(cause));
+                }
+                let meta = Some(rmcp::model::Meta(meta_obj));
+
+                Ok(CallToolResult {
+                    content: vec![Content::text(actionable_error.to_user_message())],
+                    is_error: Some(true),
+                    meta,
+                    structured_content: None,
+                })
+            }
         }
     }
 }

@@ -7,5 +7,5 @@ pub mod config;
 pub mod error;
 pub mod types;
 
-pub use config::{Config, ConfigChangeEvent, ConfigWatcher, SearchConfig, SharedConfig};
-pub use error::{Error, Result};
+pub use config::{Config, SearchConfig};
+pub use error::{ActionableError, Error, ErrorCode, Result};
