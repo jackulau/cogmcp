@@ -6,8 +6,11 @@
 
 use crate::CogMcpServer;
 use cogmcp_core::Result;
+use cogmcp_watcher::{spawn_debounce_checker, IndexCallback, WatcherEventHandler};
 use rmcp::ServiceExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the server runner
@@ -59,6 +62,35 @@ pub struct ServerRunner {
     server: CogMcpServer,
 }
 
+/// Callback implementation for the watcher event handler
+///
+/// This bridges the watcher events to the server's incremental indexing methods.
+struct ServerIndexCallback {
+    server: CogMcpServer,
+}
+
+impl IndexCallback for ServerIndexCallback {
+    fn index_file(&self, path: &Path) {
+        if let Err(e) = self.server.index_file_incremental(path) {
+            warn!(path = %path.display(), error = %e, "Failed to index file incrementally");
+        }
+    }
+
+    fn queue_file(&self, path: &Path) {
+        // Queue the file for debounced indexing
+        if let Some(debouncer) = self.server.debouncer() {
+            debouncer.mark_pending(path);
+            debug!(path = %path.display(), "File queued for debounced indexing");
+        }
+    }
+
+    fn remove_file(&self, path: &Path) {
+        if let Err(e) = self.server.remove_file_from_index(path) {
+            warn!(path = %path.display(), error = %e, "Failed to remove file from index");
+        }
+    }
+}
+
 impl ServerRunner {
     /// Create a new server runner with the given configuration
     pub fn new(config: RunnerConfig) -> Result<Self> {
@@ -99,9 +131,11 @@ impl ServerRunner {
     ///
     /// This method:
     /// 1. Optionally performs initial indexing
-    /// 2. Starts the MCP protocol over stdio
-    /// 3. Processes requests until EOF or shutdown
-    /// 4. Returns when the service completes
+    /// 2. Starts the file watcher if enabled
+    /// 3. Starts the MCP protocol over stdio
+    /// 4. Processes requests until EOF or shutdown
+    /// 5. Gracefully shuts down the watcher
+    /// 6. Returns when the service completes
     pub async fn run(self) -> std::result::Result<(), anyhow::Error> {
         info!(
             "CogMCP server starting (root: {})",
@@ -121,24 +155,101 @@ impl ServerRunner {
             debug!("  - {}: {}", tool.name, tool.description.unwrap_or_default());
         }
 
+        // Start watcher tasks if file watching is enabled
+        let watcher_tasks = self.start_watcher_tasks();
+
         info!("Starting MCP protocol over stdio...");
 
         // Create stdio transport and start the service
         let transport = rmcp::transport::stdio();
-        let service = self.server.serve(transport).await?;
+        let service = self.server.clone().serve(transport).await?;
 
         info!("MCP server ready, waiting for requests...");
 
         // Wait for the service to complete (EOF or shutdown)
         if let Err(e) = service.waiting().await {
             error!("Service error: {}", e);
+            // Abort watcher tasks on error
+            if let Some((event_handle, debounce_handle, _)) = watcher_tasks {
+                event_handle.abort();
+                debounce_handle.abort();
+            }
             return Err(e.into());
+        }
+
+        // Gracefully shutdown watcher tasks
+        if let Some((event_handle, debounce_handle, _)) = watcher_tasks {
+            info!("Shutting down file watcher...");
+            event_handle.abort();
+            debounce_handle.abort();
         }
 
         info!("CogMCP server shutdown complete.");
         Ok(())
     }
 
+    /// Start the file watcher event handler and debounce checker tasks
+    ///
+    /// Returns the task handles if watching is enabled, None otherwise.
+    fn start_watcher_tasks(
+        &self,
+    ) -> Option<(
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        // Check if watcher components are available
+        let watcher = self.server.watcher()?;
+        let prioritizer = self.server.prioritizer()?;
+        let debouncer = self.server.debouncer()?;
+
+        info!("Starting file watcher for {}", self.config.root.display());
+
+        // Create the callback that bridges watcher events to server indexing
+        let callback = Arc::new(ServerIndexCallback {
+            server: self.server.clone(),
+        });
+
+        // Create and spawn the event handler
+        let event_handler = Arc::new(WatcherEventHandler::new(
+            Arc::clone(prioritizer),
+            callback,
+        ));
+        let event_rx = watcher.subscribe();
+        let event_handle = event_handler.spawn(event_rx);
+
+        // Create channel for debounced files
+        let (debounce_tx, debounce_rx) = mpsc::channel(100);
+
+        // Spawn the debounce checker (polls every 100ms)
+        let debounce_checker_handle =
+            spawn_debounce_checker(Arc::clone(debouncer), debounce_tx, 100);
+
+        // Spawn task to process debounced files
+        let server = self.server.clone();
+        let debounce_processor_handle = tokio::spawn(async move {
+            Self::process_debounced_files(server, debounce_rx).await;
+        });
+
+        info!("File watcher started successfully");
+
+        Some((event_handle, debounce_checker_handle, debounce_processor_handle))
+    }
+
+    /// Process files that have been debounced and are ready for indexing
+    async fn process_debounced_files(server: CogMcpServer, mut rx: mpsc::Receiver<PathBuf>) {
+        while let Some(path) = rx.recv().await {
+            debug!(path = %path.display(), "Processing debounced file");
+            if let Err(e) = server.index_file_incremental(&path) {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to index debounced file"
+                );
+            }
+        }
+        debug!("Debounce processor shutting down");
+    }
 }
 
 #[cfg(test)]

@@ -455,193 +455,26 @@ impl Database {
         Ok(())
     }
 
-    /// Delete symbols for multiple files in a single transaction
-    pub fn delete_symbols_for_files_batch(&self, file_ids: &[i64]) -> Result<()> {
-        if file_ids.is_empty() {
-            return Ok(());
-        }
-
+    /// Delete a file and all its associated data (symbols, embeddings)
+    pub fn delete_file(&self, file_id: i64) -> Result<()> {
+        // Delete symbols first (foreign key constraint)
+        self.delete_symbols_for_file(file_id)?;
+        // Delete embeddings
+        let _ = self.delete_embeddings_for_file(file_id);
+        // Delete the file record
         let conn = self.conn.lock();
-
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| Error::Storage(format!("Failed to begin transaction: {}", e)))?;
-
-        let result = (|| {
-            // Process in chunks to avoid SQL query length limits
-            const CHUNK_SIZE: usize = 500;
-            for chunk in file_ids.chunks(CHUNK_SIZE) {
-                let placeholders: Vec<String> = chunk.iter().enumerate()
-                    .map(|(i, _)| format!("?{}", i + 1))
-                    .collect();
-                let query = format!(
-                    "DELETE FROM symbols WHERE file_id IN ({})",
-                    placeholders.join(", ")
-                );
-
-                let params: Vec<&dyn rusqlite::ToSql> = chunk.iter()
-                    .map(|id| id as &dyn rusqlite::ToSql)
-                    .collect();
-
-                conn.execute(&query, params.as_slice())
-                    .map_err(|e| Error::Storage(format!("Failed to delete symbols: {}", e)))?;
-            }
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute("COMMIT", [])
-                    .map_err(|e| Error::Storage(format!("Failed to commit transaction: {}", e)))?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", []);
-                Err(e)
-            }
-        }
+        conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])
+            .map_err(|e| Error::Storage(format!("Failed to delete file: {}", e)))?;
+        Ok(())
     }
 
-    /// Insert or update multiple files in a single transaction
-    /// Returns vector of file IDs in the same order as input
-    pub fn upsert_files_batch(&self, files: &[FileInsert]) -> Result<Vec<i64>> {
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let conn = self.conn.lock();
-        let mut ids = Vec::with_capacity(files.len());
-
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| Error::Storage(format!("Failed to begin transaction: {}", e)))?;
-
-        let result = (|| {
-            // Prepare statements once for reuse
-            let mut upsert_stmt = conn
-                .prepare(
-                    r#"
-                    INSERT INTO files (path, hash, modified_at, size, language, indexed_at)
-                    VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))
-                    ON CONFLICT(path) DO UPDATE SET
-                        hash = excluded.hash,
-                        modified_at = excluded.modified_at,
-                        size = excluded.size,
-                        language = excluded.language,
-                        indexed_at = excluded.indexed_at
-                    "#,
-                )
-                .map_err(|e| Error::Storage(format!("Failed to prepare upsert statement: {}", e)))?;
-
-            let mut select_stmt = conn
-                .prepare("SELECT id FROM files WHERE path = ?1")
-                .map_err(|e| Error::Storage(format!("Failed to prepare select statement: {}", e)))?;
-
-            // Process in chunks to avoid lock timeouts
-            const CHUNK_SIZE: usize = 500;
-            for chunk in files.chunks(CHUNK_SIZE) {
-                for file in chunk {
-                    upsert_stmt
-                        .execute(params![
-                            file.path,
-                            file.hash,
-                            file.modified_at,
-                            file.size,
-                            file.language
-                        ])
-                        .map_err(|e| Error::Storage(format!("Failed to upsert file: {}", e)))?;
-
-                    let id: i64 = select_stmt
-                        .query_row(params![file.path], |row| row.get(0))
-                        .map_err(|e| Error::Storage(format!("Failed to get file id: {}", e)))?;
-                    ids.push(id);
-                }
-            }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute("COMMIT", [])
-                    .map_err(|e| Error::Storage(format!("Failed to commit transaction: {}", e)))?;
-                Ok(ids)
-            }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", []);
-                Err(e)
-            }
-        }
-    }
-
-    /// Insert multiple symbols in a single transaction
-    /// Returns vector of symbol IDs in the same order as input
-    pub fn insert_symbols_batch(&self, symbols: &[SymbolInsert]) -> Result<Vec<i64>> {
-        if symbols.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let conn = self.conn.lock();
-        let mut ids = Vec::with_capacity(symbols.len());
-
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| Error::Storage(format!("Failed to begin transaction: {}", e)))?;
-
-        let result = (|| {
-            let mut stmt = conn
-                .prepare(
-                    r#"
-                    INSERT INTO symbols (
-                        file_id, name, kind, start_line, end_line, signature, doc_comment,
-                        visibility, is_async, is_static, is_abstract, is_exported, is_const, is_unsafe,
-                        parent_symbol_id, type_parameters, parameters, return_type
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-                    "#,
-                )
-                .map_err(|e| Error::Storage(format!("Failed to prepare statement: {}", e)))?;
-
-            // Process in chunks to avoid lock timeouts
-            const CHUNK_SIZE: usize = 500;
-            for chunk in symbols.chunks(CHUNK_SIZE) {
-                for sym in chunk {
-                    stmt.execute(params![
-                        sym.file_id,
-                        sym.name,
-                        sym.kind,
-                        sym.start_line,
-                        sym.end_line,
-                        sym.signature,
-                        sym.doc_comment,
-                        sym.visibility,
-                        sym.is_async as i32,
-                        sym.is_static as i32,
-                        sym.is_abstract as i32,
-                        sym.is_exported as i32,
-                        sym.is_const as i32,
-                        sym.is_unsafe as i32,
-                        sym.parent_symbol_id,
-                        sym.type_parameters,
-                        sym.parameters,
-                        sym.return_type
-                    ])
-                    .map_err(|e| Error::Storage(format!("Failed to insert symbol: {}", e)))?;
-
-                    ids.push(conn.last_insert_rowid());
-                }
-            }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute("COMMIT", [])
-                    .map_err(|e| Error::Storage(format!("Failed to commit transaction: {}", e)))?;
-                Ok(ids)
-            }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", []);
-                Err(e)
-            }
+    /// Delete a file by its path
+    pub fn delete_file_by_path(&self, path: &str) -> Result<bool> {
+        if let Some(file) = self.get_file_by_path(path)? {
+            self.delete_file(file.id)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 

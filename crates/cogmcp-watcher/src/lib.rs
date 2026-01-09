@@ -4,10 +4,12 @@
 //! for efficient incremental updates, plus config file watching with
 //! automatic reload support.
 
+pub mod debouncer;
 pub mod handler;
 pub mod prioritizer;
 pub mod realtime;
 
+pub use debouncer::{spawn_debounce_checker, FileDebouncer};
 pub use handler::{FnCallback, IndexAction, IndexCallback, WatcherEventHandler};
 pub use prioritizer::FilePrioritizer;
 pub use realtime::{ChangeKind, FileChangeEvent, FileWatcher};

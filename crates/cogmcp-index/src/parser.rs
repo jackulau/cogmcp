@@ -1613,21 +1613,21 @@ impl CodeParser {
     #[allow(clippy::never_loop)]
     fn find_python_docstring(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
         // Look for string as first child of body
-        let body = node.child_by_field_name("body")?;
-        // Only check first statement
-        let child = body.child(0)?;
-        if child.kind() != "expression_statement" {
-            return None;
-        }
-        let mut inner_cursor = child.walk();
-        for inner in child.children(&mut inner_cursor) {
-            if inner.kind() == "string" {
-                return inner.utf8_text(content.as_bytes()).ok().map(|s| {
-                    s.trim_matches('"')
-                        .trim_matches('\'')
-                        .trim()
-                        .to_string()
-                });
+        if let Some(body) = node.child_by_field_name("body") {
+            // Only check first statement for docstring
+            let first_child = body.child(0)?;
+            if first_child.kind() == "expression_statement" {
+                let mut inner_cursor = first_child.walk();
+                for inner in first_child.children(&mut inner_cursor) {
+                    if inner.kind() == "string" {
+                        return inner.utf8_text(content.as_bytes()).ok().map(|s| {
+                            s.trim_matches('"')
+                                .trim_matches('\'')
+                                .trim()
+                                .to_string()
+                        });
+                    }
+                }
             }
         }
         None
