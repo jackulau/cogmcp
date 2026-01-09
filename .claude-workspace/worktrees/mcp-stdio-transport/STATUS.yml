@@ -1,11 +1,2 @@
-id: mcp-stdio-transport
-status: pending
-branch: parallel/mcp-stdio-transport
-worktree_path: null
-assigned_to: null
-started_at: null
-completed_at: null
-dependencies_met: true
-conflicts: []
-commit_sha: null
-tests_passing: null
+status: in_progress
+started_at: 2026-01-07T00:22:10Z
