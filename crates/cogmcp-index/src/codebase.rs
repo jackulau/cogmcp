@@ -4,13 +4,15 @@ use crate::parallel_indexer::{ParallelIndexConfig, ParallelIndexer, ProgressRepo
 use crate::parser::{CodeParser, ExtractedSymbol};
 use cogmcp_core::types::Language;
 use cogmcp_core::{Config, Error, Result};
-use cogmcp_embeddings::{EmbeddingEngine, MetricsSnapshot};
-use cogmcp_storage::{Database, FullTextIndex};
+use cogmcp_embeddings::EmbeddingEngine;
+use cogmcp_storage::{Database, EmbeddingInput, FullTextIndex};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tracing::info;
@@ -123,38 +125,15 @@ impl CodebaseIndexer {
 
     /// Index all files in the codebase
     pub fn index_all(&self, db: &Database, text_index: &FullTextIndex) -> Result<IndexResult> {
-        self.index_all_with_progress(db, text_index, |_| {})
+        if self.config.indexing.enable_parallel_indexing {
+            self.index_all_parallel(db, text_index)
+        } else {
+            self.index_all_sequential(db, text_index)
+        }
     }
 
-    /// Index all files in the codebase with progress callback
-    ///
-    /// The callback receives an `IndexProgress` after each file is processed,
-    /// allowing for progress reporting during long-running operations.
-    ///
-    /// # Arguments
-    /// * `db` - The database to store file and symbol information
-    /// * `text_index` - The full-text index for content search
-    /// * `on_progress` - Callback function invoked after each file
-    ///
-    /// # Example
-    /// ```ignore
-    /// indexer.index_all_with_progress(&db, &text_index, |progress| {
-    ///     info!("{:.1}% complete ({}/{} files)",
-    ///         progress.percentage(),
-    ///         progress.processed_files,
-    ///         progress.total_files);
-    /// })?;
-    /// ```
-    pub fn index_all_with_progress<F>(
-        &self,
-        db: &Database,
-        text_index: &FullTextIndex,
-        mut on_progress: F,
-    ) -> Result<IndexResult>
-    where
-        F: FnMut(IndexProgress),
-    {
-        let start_time = Instant::now();
+    /// Index all files sequentially (original implementation)
+    fn index_all_sequential(&self, db: &Database, text_index: &FullTextIndex) -> Result<IndexResult> {
         let mut result = IndexResult::default();
         let gitignore = self.load_gitignore()?;
 
@@ -257,79 +236,330 @@ impl CodebaseIndexer {
         Ok(result)
     }
 
-    /// Index all files, automatically choosing parallel or sequential indexing based on config
-    ///
-    /// When `config.indexing.enable_parallel` is true, this uses the `ParallelIndexer` for
-    /// significantly improved performance (typically 3-5x faster). Otherwise, it falls back
-    /// to the sequential `index_all` method.
-    pub fn index_all_smart(&self, db: &Database, text_index: &FullTextIndex) -> Result<IndexResult> {
-        if self.config.indexing.enable_parallel {
-            self.index_all_parallel(db, text_index, None::<fn(ProgressReport)>)
-        } else {
-            self.index_all(db, text_index)
+    /// Index all files in parallel using rayon
+    fn index_all_parallel(&self, db: &Database, text_index: &FullTextIndex) -> Result<IndexResult> {
+        let gitignore = self.load_gitignore()?;
+
+        // Configure rayon thread pool if parallel_workers is specified
+        if self.config.indexing.parallel_workers > 0 {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(self.config.indexing.parallel_workers)
+                .build_global()
+                .ok(); // Ignore error if already initialized
         }
+
+        // Phase 1: Collect all valid file paths
+        let mut file_paths: Vec<PathBuf> = Vec::new();
+        let mut skipped = 0u64;
+        let mut walk_errors = 0u64;
+
+        for entry in WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| !self.should_ignore(e.path(), &gitignore))
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Failed to read directory entry: {}", e);
+                    walk_errors += 1;
+                    continue;
+                }
+            };
+
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+
+            // Check file extension
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            if !self.include_extensions.contains(&ext) {
+                skipped += 1;
+                continue;
+            }
+
+            // Check file size
+            let metadata = match fs::metadata(path) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("Failed to get metadata for {:?}: {}", path, e);
+                    walk_errors += 1;
+                    continue;
+                }
+            };
+
+            let size_kb = metadata.len() / 1024;
+            if size_kb > self.config.indexing.max_file_size {
+                skipped += 1;
+                continue;
+            }
+
+            file_paths.push(path.to_path_buf());
+        }
+
+        tracing::info!(
+            "Parallel indexing: collected {} files to process",
+            file_paths.len()
+        );
+
+        // Phase 2: Process files in parallel
+        let indexed = AtomicU64::new(0);
+        let errors = AtomicU64::new(walk_errors);
+        let symbols_extracted = AtomicU64::new(0);
+        let symbols_with_visibility = AtomicU64::new(0);
+        let symbols_by_kind: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        // Collect parsed file data in parallel
+        let parsed_files: Vec<_> = file_paths
+            .par_iter()
+            .filter_map(|path| {
+                match self.parse_file_data(path) {
+                    Ok(data) => Some(data),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse {:?}: {}", path, e);
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        // Get file IDs that already have embeddings for incremental indexing
+        let existing_embeddings = db.get_file_ids_with_embeddings().unwrap_or_default();
+
+        // Phase 3: Insert data sequentially and collect chunks for embedding
+        let mut chunks_for_embedding: Vec<ChunkData> = Vec::new();
+
+        for file_data in &parsed_files {
+            match self.insert_file_data(db, text_index, file_data) {
+                Ok(file_stats) => {
+                    indexed.fetch_add(1, Ordering::Relaxed);
+                    symbols_extracted.fetch_add(file_stats.symbols_extracted, Ordering::Relaxed);
+                    symbols_with_visibility.fetch_add(file_stats.symbols_with_visibility, Ordering::Relaxed);
+
+                    // Merge symbols_by_kind
+                    let mut kind_map = symbols_by_kind.lock();
+                    for (kind, count) in file_stats.symbols_by_kind {
+                        *kind_map.entry(kind).or_insert(0) += count;
+                    }
+
+                    // Collect chunks for embedding if embeddings are enabled
+                    if self.embeddings_enabled() {
+                        // Get the file_id for this file
+                        if let Ok(Some(file_row)) = db.get_file_by_path(&file_data.relative_path) {
+                            // Check for incremental: skip if file already has embeddings
+                            if !existing_embeddings.contains(&file_row.id) {
+                                // Create chunks from file content
+                                let chunk = ChunkData {
+                                    file_id: file_row.id,
+                                    symbol_id: None,
+                                    text: file_data.content.clone(),
+                                    chunk_type: "file".to_string(),
+                                };
+                                chunks_for_embedding.push(chunk);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to insert file data for {:?}: {}", file_data.relative_path, e);
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Commit the text index
+        text_index.commit()?;
+
+        // Phase 4: Generate embeddings in batches
+        if self.embeddings_enabled() && !chunks_for_embedding.is_empty() {
+            let batch_size = self.config.indexing.embedding_batch_size;
+            let total_chunks = chunks_for_embedding.len();
+            tracing::info!(
+                "Generating embeddings for {} chunks in batches of {}",
+                total_chunks,
+                batch_size
+            );
+
+            self.generate_embeddings_batch(db, chunks_for_embedding, batch_size)?;
+        }
+
+        Ok(IndexResult {
+            indexed: indexed.load(Ordering::Relaxed),
+            skipped,
+            errors: errors.load(Ordering::Relaxed),
+            symbols_extracted: symbols_extracted.load(Ordering::Relaxed),
+            symbols_by_kind: Arc::try_unwrap(symbols_by_kind)
+                .map(|mutex| mutex.into_inner())
+                .unwrap_or_else(|arc| arc.lock().clone()),
+            symbols_with_visibility: symbols_with_visibility.load(Ordering::Relaxed),
+        })
     }
 
-    /// Index all files using the parallel indexer with optional progress callback
-    ///
-    /// This method provides high-performance parallel indexing:
-    /// - Phase 1: Parallel file discovery and reading
-    /// - Phase 2: Parallel parsing with batching
-    /// - Phase 3: Batch database writes
-    /// - Phase 4: Parallel embedding generation (if enabled)
-    /// - Phase 5: Full-text index updates
-    pub fn index_all_parallel<F>(
+    /// Generate embeddings for chunks in batches
+    fn generate_embeddings_batch(
+        &self,
+        db: &Database,
+        chunks: Vec<ChunkData>,
+        batch_size: usize,
+    ) -> Result<u64> {
+        let engine = match &self.embedding_engine {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+
+        let mut embeddings_generated = 0u64;
+        let mut embedding_errors = 0u64;
+
+        for batch in chunks.chunks(batch_size) {
+            // Collect texts for batch embedding
+            let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
+
+            // Generate embeddings in batch
+            let embeddings = {
+                let mut engine_guard = engine.lock();
+                match engine_guard.embed_batch(&texts) {
+                    Ok(embs) => embs,
+                    Err(e) => {
+                        tracing::warn!("Failed to generate batch embeddings: {}", e);
+                        embedding_errors += batch.len() as u64;
+                        continue;
+                    }
+                }
+            };
+
+            // Prepare inputs for batch insert
+            let embedding_inputs: Vec<EmbeddingInput> = batch
+                .iter()
+                .zip(embeddings.iter())
+                .map(|(chunk, emb)| EmbeddingInput {
+                    symbol_id: chunk.symbol_id,
+                    file_id: Some(chunk.file_id),
+                    chunk_text: chunk.text.clone(),
+                    embedding: emb.clone(),
+                    chunk_type: chunk.chunk_type.clone(),
+                })
+                .collect();
+
+            // Batch insert embeddings
+            match db.insert_embeddings_batch(&embedding_inputs) {
+                Ok(ids) => {
+                    embeddings_generated += ids.len() as u64;
+                    tracing::debug!("Inserted {} embeddings", ids.len());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to insert batch embeddings: {}", e);
+                    embedding_errors += batch.len() as u64;
+                }
+            }
+        }
+
+        if embedding_errors > 0 {
+            tracing::warn!(
+                "Embedding generation completed with {} errors",
+                embedding_errors
+            );
+        }
+
+        tracing::info!(
+            "Generated {} embeddings successfully",
+            embeddings_generated
+        );
+
+        Ok(embeddings_generated)
+    }
+
+    /// Parse file data without database operations (thread-safe)
+    fn parse_file_data(&self, path: &Path) -> Result<ParsedFileData> {
+        let content = fs::read_to_string(path)?;
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        // Compute file hash
+        let hash = Self::hash_content(&content);
+
+        // Get file metadata
+        let metadata = fs::metadata(path)?;
+        let modified_at = metadata
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let size = metadata.len();
+
+        // Detect language
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let language = Language::from_extension(ext);
+        let language_str = format!("{:?}", language).to_lowercase();
+
+        // Parse and extract symbols
+        let symbols = self.parser.parse(&content, language).unwrap_or_default();
+
+        Ok(ParsedFileData {
+            relative_path,
+            hash,
+            modified_at,
+            size,
+            language_str,
+            content,
+            symbols,
+        })
+    }
+
+    /// Insert parsed file data into database (must be called sequentially)
+    fn insert_file_data(
         &self,
         db: &Database,
         text_index: &FullTextIndex,
-        progress_callback: Option<F>,
-    ) -> Result<IndexResult>
-    where
-        F: Fn(crate::parallel_indexer::ProgressReport) + Send + Sync + 'static,
-    {
-        let parallel_config = ParallelIndexConfig {
-            num_threads: if self.config.indexing.parallel_threads > 0 {
-                self.config.indexing.parallel_threads
-            } else {
-                num_cpus::get()
-            },
-            batch_size: self.config.indexing.batch_size,
-            embedding_batch_size: self.config.indexing.embedding_batch_size,
-            parallel_walking: true,
-        };
+        data: &ParsedFileData,
+    ) -> Result<FileIndexStats> {
+        let mut stats = FileIndexStats::default();
 
-        let mut parallel_indexer = if let Some(engine) = &self.embedding_engine {
-            ParallelIndexer::with_embedding_engine(
-                self.root.clone(),
-                self.config.clone(),
-                parallel_config,
-                self.parser.clone(),
-                engine.clone(),
-            )?
-        } else {
-            ParallelIndexer::new(
-                self.root.clone(),
-                self.config.clone(),
-                parallel_config,
-                self.parser.clone(),
-            )?
-        };
+        // Insert into database
+        let file_id = db.upsert_file(
+            &data.relative_path,
+            &data.hash,
+            data.modified_at,
+            data.size,
+            &data.language_str,
+        )?;
 
-        if let Some(callback) = progress_callback {
-            parallel_indexer.set_progress_callback(callback);
+        // Track statistics
+        for sym in &data.symbols {
+            stats.symbols_extracted += 1;
+            let kind_str = format!("{:?}", sym.kind).to_lowercase();
+            *stats.symbols_by_kind.entry(kind_str).or_insert(0) += 1;
+
+            if sym.visibility != cogmcp_core::types::SymbolVisibility::Unknown {
+                stats.symbols_with_visibility += 1;
+            }
         }
 
-        let parallel_result = parallel_indexer.index_all(db, text_index)?;
+        // Delete old symbols for this file
+        let _ = db.delete_symbols_for_file(file_id);
 
-        // Convert ParallelIndexResult to IndexResult
-        Ok(IndexResult {
-            indexed: parallel_result.files_indexed,
-            skipped: parallel_result.files_skipped,
-            errors: parallel_result.files_errored,
-            symbols_extracted: parallel_result.symbols_extracted,
-            symbols_by_kind: parallel_result.symbols_by_kind,
-            symbols_with_visibility: parallel_result.symbols_with_visibility,
-        })
+        // Insert new symbols with parent relationship handling
+        self.insert_symbols_with_relationships(db, file_id, &data.symbols)?;
+
+        // Index in full-text search
+        text_index.index_file(&data.relative_path, &data.content)?;
+
+        Ok(stats)
     }
 
     /// Index a single file and update statistics
@@ -595,6 +825,35 @@ pub struct IndexResult {
     pub indexing_time: Duration,
     /// Embedding performance metrics (if embeddings were enabled)
     pub embedding_metrics: Option<MetricsSnapshot>,
+}
+
+/// Parsed file data for parallel processing
+#[derive(Debug)]
+struct ParsedFileData {
+    relative_path: String,
+    hash: String,
+    modified_at: i64,
+    size: u64,
+    language_str: String,
+    content: String,
+    symbols: Vec<ExtractedSymbol>,
+}
+
+/// Statistics for a single file's indexing
+#[derive(Debug, Default)]
+struct FileIndexStats {
+    symbols_extracted: u64,
+    symbols_by_kind: HashMap<String, u64>,
+    symbols_with_visibility: u64,
+}
+
+/// Chunk data for batch embedding generation
+#[derive(Debug, Clone)]
+pub struct ChunkData {
+    pub file_id: i64,
+    pub symbol_id: Option<i64>,
+    pub text: String,
+    pub chunk_type: String,
 }
 
 #[cfg(test)]
@@ -875,118 +1134,180 @@ async def async_function():
         assert!(stats.symbols_with_visibility > 0);
     }
 
-    #[test]
-    fn test_index_progress_percentage() {
-        let progress = IndexProgress {
-            total_files: 100,
-            processed_files: 25,
-            current_file: Some("test.rs".to_string()),
-            elapsed_time: Duration::from_secs(5),
-            files_per_second: 5.0,
-        };
+    fn create_parallel_test_indexer(root: PathBuf) -> CodebaseIndexer {
+        let mut config = Config::default();
+        config.indexing.include_types = vec!["rs".to_string(), "ts".to_string(), "py".to_string()];
+        config.indexing.enable_parallel_indexing = true;
+        config.indexing.parallel_workers = 2; // Use 2 workers for testing
+        config.indexing.embedding_batch_size = 2;
+        let parser = Arc::new(CodeParser::new());
+        CodebaseIndexer::new(root, config, parser).unwrap()
+    }
 
-        assert!((progress.percentage() - 25.0).abs() < 1e-6);
+    fn create_sequential_test_indexer(root: PathBuf) -> CodebaseIndexer {
+        let mut config = Config::default();
+        config.indexing.include_types = vec!["rs".to_string(), "ts".to_string(), "py".to_string()];
+        config.indexing.enable_parallel_indexing = false;
+        let parser = Arc::new(CodeParser::new());
+        CodebaseIndexer::new(root, config, parser).unwrap()
     }
 
     #[test]
-    fn test_index_progress_percentage_empty() {
-        let progress = IndexProgress {
-            total_files: 0,
-            processed_files: 0,
-            current_file: None,
-            elapsed_time: Duration::ZERO,
-            files_per_second: 0.0,
-        };
-
-        assert!((progress.percentage() - 100.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_index_progress_estimated_remaining() {
-        let progress = IndexProgress {
-            total_files: 100,
-            processed_files: 50,
-            current_file: Some("test.rs".to_string()),
-            elapsed_time: Duration::from_secs(10),
-            files_per_second: 5.0,
-        };
-
-        // 50 remaining files / 5 files per second = 10 seconds
-        let remaining = progress.estimated_remaining().unwrap();
-        assert!((remaining.as_secs_f64() - 10.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_index_progress_estimated_remaining_complete() {
-        let progress = IndexProgress {
-            total_files: 100,
-            processed_files: 100,
-            current_file: None,
-            elapsed_time: Duration::from_secs(20),
-            files_per_second: 5.0,
-        };
-
-        assert!(progress.estimated_remaining().is_none());
-    }
-
-    #[test]
-    fn test_index_all_with_progress_callback() {
+    fn test_parallel_indexing_produces_same_results_as_sequential() {
         let temp_dir = TempDir::new().unwrap();
         setup_test_files(&temp_dir);
 
-        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
-        let db = Database::in_memory().unwrap();
-        let text_index = FullTextIndex::in_memory().unwrap();
+        // Index with parallel indexer
+        let parallel_indexer = create_parallel_test_indexer(temp_dir.path().to_path_buf());
+        let parallel_db = Database::in_memory().unwrap();
+        let parallel_text_index = FullTextIndex::in_memory().unwrap();
 
-        let mut progress_updates = Vec::new();
+        let parallel_result = parallel_indexer.index_all(&parallel_db, &parallel_text_index).unwrap();
 
-        let result = indexer
-            .index_all_with_progress(&db, &text_index, |progress| {
-                progress_updates.push((progress.processed_files, progress.total_files));
-            })
-            .unwrap();
+        // Index with sequential indexer
+        let sequential_indexer = create_sequential_test_indexer(temp_dir.path().to_path_buf());
+        let sequential_db = Database::in_memory().unwrap();
+        let sequential_text_index = FullTextIndex::in_memory().unwrap();
 
-        // Should have received progress updates for each file
-        assert_eq!(progress_updates.len(), 3, "Should have 3 progress updates");
+        let sequential_result = sequential_indexer.index_all(&sequential_db, &sequential_text_index).unwrap();
 
-        // Final progress should be complete
-        let (processed, total) = progress_updates.last().unwrap();
-        assert_eq!(*processed, *total);
-        assert_eq!(*total, 3);
+        // Verify same number of indexed files
+        assert_eq!(
+            parallel_result.indexed, sequential_result.indexed,
+            "Parallel and sequential should index same number of files"
+        );
 
-        // Result should have indexing time
-        assert!(result.indexing_time.as_millis() > 0);
+        // Verify same number of symbols extracted
+        assert_eq!(
+            parallel_result.symbols_extracted, sequential_result.symbols_extracted,
+            "Parallel and sequential should extract same number of symbols"
+        );
 
-        // Verify files were indexed
-        assert_eq!(result.indexed, 3);
+        // Verify same symbols by kind
+        assert_eq!(
+            parallel_result.symbols_by_kind, sequential_result.symbols_by_kind,
+            "Parallel and sequential should have same symbols by kind"
+        );
+
+        // Verify no errors
+        assert_eq!(parallel_result.errors, 0, "Parallel indexing should have no errors");
+        assert_eq!(sequential_result.errors, 0, "Sequential indexing should have no errors");
     }
 
     #[test]
-    fn test_index_result_includes_timing() {
+    fn test_parallel_indexing_handles_many_files() {
         let temp_dir = TempDir::new().unwrap();
-        setup_test_files(&temp_dir);
 
-        let indexer = create_test_indexer(temp_dir.path().to_path_buf());
+        // Create many small files to test parallelism
+        for i in 0..20 {
+            let rust_file = temp_dir.path().join(format!("file_{}.rs", i));
+            let mut file = fs::File::create(&rust_file).unwrap();
+            writeln!(file, "pub fn function_{}() {{}}", i).unwrap();
+        }
+
+        let indexer = create_parallel_test_indexer(temp_dir.path().to_path_buf());
         let db = Database::in_memory().unwrap();
         let text_index = FullTextIndex::in_memory().unwrap();
 
         let result = indexer.index_all(&db, &text_index).unwrap();
 
-        // Indexing time should be recorded
-        assert!(result.indexing_time > Duration::ZERO);
+        // Verify all files were indexed
+        assert_eq!(result.indexed, 20, "Should have indexed all 20 files");
+        assert_eq!(result.errors, 0, "Should have no errors");
+
+        // Verify symbols were extracted from each file
+        assert_eq!(result.symbols_by_kind.get("function"), Some(&20), "Should have 20 functions");
     }
 
     #[test]
-    fn test_index_result_default() {
-        let result = IndexResult::default();
+    fn test_parallel_indexing_with_custom_workers() {
+        let temp_dir = TempDir::new().unwrap();
+        setup_test_files(&temp_dir);
 
-        assert_eq!(result.indexed, 0);
-        assert_eq!(result.skipped, 0);
-        assert_eq!(result.errors, 0);
-        assert_eq!(result.symbols_extracted, 0);
-        assert!(result.symbols_by_kind.is_empty());
-        assert_eq!(result.symbols_with_visibility, 0);
-        assert_eq!(result.indexing_time, Duration::ZERO);
-        assert!(result.embedding_metrics.is_none());
+        let mut config = Config::default();
+        config.indexing.include_types = vec!["rs".to_string(), "ts".to_string(), "py".to_string()];
+        config.indexing.enable_parallel_indexing = true;
+        config.indexing.parallel_workers = 4; // Use 4 workers
+        let parser = Arc::new(CodeParser::new());
+
+        let indexer = CodebaseIndexer::new(temp_dir.path().to_path_buf(), config, parser).unwrap();
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        let result = indexer.index_all(&db, &text_index).unwrap();
+
+        // Should successfully index files with custom worker count
+        assert_eq!(result.indexed, 3, "Should have indexed 3 files");
+        assert_eq!(result.errors, 0, "Should have no errors");
+    }
+
+    #[test]
+    fn test_parallel_indexing_graceful_error_handling() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a valid file
+        let valid_file = temp_dir.path().join("valid.rs");
+        let mut file = fs::File::create(&valid_file).unwrap();
+        writeln!(file, "pub fn valid_fn() {{}}").unwrap();
+
+        // Create a directory that looks like a file (edge case)
+        let subdir = temp_dir.path().join("subdir.rs");
+        fs::create_dir(&subdir).unwrap();
+
+        let indexer = create_parallel_test_indexer(temp_dir.path().to_path_buf());
+        let db = Database::in_memory().unwrap();
+        let text_index = FullTextIndex::in_memory().unwrap();
+
+        let result = indexer.index_all(&db, &text_index).unwrap();
+
+        // Should have indexed the valid file
+        assert_eq!(result.indexed, 1, "Should have indexed 1 valid file");
+    }
+
+    #[test]
+    fn test_parallel_indexing_config_defaults() {
+        let config = Config::default();
+
+        // Verify parallel indexing defaults
+        assert!(config.indexing.enable_parallel_indexing, "Parallel indexing should be enabled by default");
+        assert_eq!(config.indexing.parallel_workers, 0, "Workers should default to 0 (auto-detect)");
+        assert_eq!(config.indexing.embedding_batch_size, 64, "Batch size should default to 64");
+    }
+
+    #[test]
+    fn test_chunk_data_creation() {
+        let chunk = ChunkData {
+            file_id: 1,
+            symbol_id: Some(2),
+            text: "test content".to_string(),
+            chunk_type: "file".to_string(),
+        };
+
+        assert_eq!(chunk.file_id, 1);
+        assert_eq!(chunk.symbol_id, Some(2));
+        assert_eq!(chunk.text, "test content");
+        assert_eq!(chunk.chunk_type, "file");
+    }
+
+    #[test]
+    fn test_incremental_embedding_file_ids_tracking() {
+        let db = Database::in_memory().unwrap();
+
+        // Initially no files have embeddings
+        let file_ids = db.get_file_ids_with_embeddings().unwrap();
+        assert!(file_ids.is_empty(), "Initially no files should have embeddings");
+
+        // Insert a file
+        let file_id = db.upsert_file("test.rs", "hash123", 0, 100, "rust").unwrap();
+
+        // Insert an embedding for this file
+        db.insert_embedding(None, Some(file_id), "test content", &vec![0.1, 0.2, 0.3], "file").unwrap();
+
+        // Now the file should be in the set
+        let file_ids = db.get_file_ids_with_embeddings().unwrap();
+        assert!(file_ids.contains(&file_id), "File with embedding should be in the set");
+
+        // Check individual file
+        assert!(db.file_has_embeddings(file_id).unwrap(), "File should have embeddings");
     }
 }

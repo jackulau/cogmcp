@@ -471,13 +471,11 @@ pub struct IndexingConfig {
     pub enable_embeddings: bool,
     /// Path to embedding model
     pub embedding_model: Option<String>,
-    /// Enable parallel indexing for improved performance
-    pub enable_parallel: bool,
-    /// Number of threads for parallel operations (0 = auto-detect based on CPU count)
-    pub parallel_threads: usize,
-    /// Batch size for database operations during parallel indexing
-    pub batch_size: usize,
-    /// Batch size for embedding generation during parallel indexing
+    /// Enable parallel file processing during indexing
+    pub enable_parallel_indexing: bool,
+    /// Number of parallel workers for file processing (0 = auto-detect based on CPU cores)
+    pub parallel_workers: usize,
+    /// Number of chunks to accumulate before generating embeddings in batch
     pub embedding_batch_size: usize,
 }
 
@@ -512,10 +510,9 @@ impl Default for IndexingConfig {
             ],
             enable_embeddings: true,
             embedding_model: None,
-            enable_parallel: true,
-            parallel_threads: 0, // 0 means auto-detect based on CPU count
-            batch_size: 100,
-            embedding_batch_size: 32,
+            enable_parallel_indexing: true,
+            parallel_workers: 0, // 0 = auto-detect based on CPU cores
+            embedding_batch_size: 64,
         }
     }
 }

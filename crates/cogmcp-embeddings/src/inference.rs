@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ndarray::Array2;
+use ndarray_017::Array2;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use tracing::{debug, info};

@@ -1170,6 +1170,34 @@ impl Database {
         Ok(deleted as u64)
     }
 
+    /// Get file IDs that already have embeddings
+    pub fn get_file_ids_with_embeddings(&self) -> Result<std::collections::HashSet<i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT file_id FROM embeddings WHERE file_id IS NOT NULL")
+            .map_err(|e| Error::Storage(format!("Failed to prepare statement: {}", e)))?;
+
+        let ids: std::result::Result<std::collections::HashSet<i64>, _> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| Error::Storage(format!("Failed to query file IDs: {}", e)))?
+            .collect();
+
+        ids.map_err(|e| Error::Storage(format!("Failed to collect file IDs: {}", e)))
+    }
+
+    /// Check if a specific file has embeddings
+    pub fn file_has_embeddings(&self, file_id: i64) -> Result<bool> {
+        let conn = self.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE file_id = ?1 LIMIT 1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("Failed to check embeddings: {}", e)))?;
+        Ok(count > 0)
+    }
+
     /// Get the count of embeddings in the database
     pub fn get_embedding_count(&self) -> Result<u64> {
         let conn = self.conn.lock();
