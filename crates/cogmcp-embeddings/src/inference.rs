@@ -381,6 +381,7 @@ impl EmbeddingEngine {
             let tensor_view = output_value.1
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::Embedding(format!("Failed to extract output tensor: {}", e)))?;
+            let shape = tensor_view.shape().to_vec();
 
             let shape = tensor_view.shape();
 
@@ -396,7 +397,8 @@ impl EmbeddingEngine {
 
             let hidden_dim = shape[2];
             // Copy the data to owned Vec before dropping outputs
-            (hidden_dim, tensor_view.iter().copied().collect::<Vec<_>>())
+            let raw_data: Vec<f32> = tensor_view.iter().cloned().collect();
+            (hidden_dim, raw_data)
         };
 
         // Apply mean pooling over the sequence dimension

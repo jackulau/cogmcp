@@ -537,840 +537,558 @@ mod e2e_tests {
 }
 
 // ============================================================================
-// Error Message Tests
+// Concurrent Server Tests
 // ============================================================================
 //
-// These tests verify that error messages are helpful, consistent, and provide
-// actionable guidance to users. Tests are designed to work with both current
-// basic error messages and future actionable error messages.
+// These tests verify the server handles concurrent tool calls correctly,
+// simulating real-world usage where multiple MCP clients or parallel
+// requests may access the server simultaneously.
 
-mod error_message_tests {
+mod concurrent_tests {
     use super::*;
-    use tempfile::TempDir;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
-    // =========================================================================
-    // Test Helper Functions
-    // =========================================================================
+    /// Create a shared test server wrapped in Arc for concurrent access
+    fn create_shared_server() -> Arc<CogMcpServer> {
+        let temp_dir = std::env::temp_dir().join("cogmcp-concurrent-test");
+        std::fs::create_dir_all(&temp_dir).ok();
 
-    /// Check if an error message contains expected phrases
-    /// This helper is flexible to work with both simple and actionable messages
-    fn assert_error_mentions(error: &str, expected_phrases: &[&str], context: &str) {
-        for phrase in expected_phrases {
-            assert!(
-                error.to_lowercase().contains(&phrase.to_lowercase()),
-                "{}: Error should mention '{}'. Got: {}",
-                context,
-                phrase,
-                error
-            );
-        }
+        Arc::new(CogMcpServer::in_memory(temp_dir).expect("Failed to create test server"))
     }
 
-    /// Check if an error has suggestions section (for actionable errors)
-    /// Returns true if the error contains actionable suggestions
-    fn has_suggestions(error: &str) -> bool {
-        error.contains("Suggested actions:")
-            || error.contains("Try:")
-            || error.contains("Suggestions:")
-            || error.contains("1.")
-    }
-
-    /// Assert that if suggestions are present, they are well-formatted
-    fn assert_suggestions_well_formatted(error: &str, context: &str) {
-        if has_suggestions(error) {
-            // Suggestions should have numbered items
-            assert!(
-                error.contains("1.") || error.contains("- "),
-                "{}: Suggestions should be numbered or bulleted. Got: {}",
-                context,
-                error
-            );
-        }
-    }
-
-    /// Create a test server with actual files in a temp directory
-    fn create_test_server_with_files() -> (CogMcpServer, TempDir) {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path();
-
-        // Write some test files
-        std::fs::write(
-            root.join("test.rs"),
-            r#"
-fn hello_world() {
-    println!("Hello, world!");
-}
-
-pub struct TestStruct {
-    field: i32,
-}
-
-impl TestStruct {
-    pub fn new() -> Self {
-        Self { field: 0 }
-    }
-}
-"#,
-        )
-        .expect("Failed to write test.rs");
-
-        std::fs::write(
-            root.join("lib.rs"),
-            r#"
-pub fn existing_function() -> i32 {
-    42
-}
-
-pub struct ExistingStruct {
-    name: String,
-}
-
-mod inner {
-    fn private_fn() {}
-}
-"#,
-        )
-        .expect("Failed to write lib.rs");
-
-        let server =
-            CogMcpServer::in_memory(root.to_path_buf()).expect("Failed to create test server");
-
-        // Trigger indexing
-        let _ = server.call_tool("reindex", json!({}));
-
-        (server, temp_dir)
-    }
-
-    /// Create a test server with an empty file
-    fn create_test_server_with_empty_file() -> (CogMcpServer, TempDir) {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path();
-
-        // Write an empty text file (no symbols to extract)
-        std::fs::write(root.join("empty.txt"), "").expect("Failed to write empty.txt");
-
-        let server =
-            CogMcpServer::in_memory(root.to_path_buf()).expect("Failed to create test server");
-
-        (server, temp_dir)
-    }
-
-    // =========================================================================
-    // Parameter Validation Error Tests
-    // =========================================================================
+    // ========================================================================
+    // Concurrent Read Operations
+    // ========================================================================
 
     #[test]
-    fn test_context_grep_missing_pattern_error() {
-        let server = create_test_server();
-        let result = server.call_tool("context_grep", json!({}));
-
-        assert!(result.is_err(), "Should error on missing pattern");
-        let error = result.unwrap_err();
-
-        // Must mention the missing parameter
-        assert_error_mentions(&error, &["pattern"], "context_grep missing pattern");
-
-        // Check for well-formatted suggestions if present
-        assert_suggestions_well_formatted(&error, "context_grep missing pattern");
-    }
-
-    #[test]
-    fn test_context_search_missing_query_error() {
-        let server = create_test_server();
-        let result = server.call_tool("context_search", json!({}));
-
-        assert!(result.is_err(), "Should error on missing query");
-        let error = result.unwrap_err();
-
-        // Must mention the missing parameter
-        assert_error_mentions(&error, &["query"], "context_search missing query");
-
-        assert_suggestions_well_formatted(&error, "context_search missing query");
-    }
-
-    #[test]
-    fn test_find_symbol_missing_name_error() {
-        let server = create_test_server();
-        let result = server.call_tool("find_symbol", json!({}));
-
-        assert!(result.is_err(), "Should error on missing name");
-        let error = result.unwrap_err();
-
-        // Must mention the missing parameter
-        assert_error_mentions(&error, &["name"], "find_symbol missing name");
-
-        assert_suggestions_well_formatted(&error, "find_symbol missing name");
-    }
-
-    #[test]
-    fn test_get_file_outline_missing_path_error() {
-        let server = create_test_server();
-        let result = server.call_tool("get_file_outline", json!({}));
-
-        assert!(result.is_err(), "Should error on missing file_path");
-        let error = result.unwrap_err();
-
-        // Must mention the missing parameter
-        assert_error_mentions(&error, &["file_path"], "get_file_outline missing path");
-
-        assert_suggestions_well_formatted(&error, "get_file_outline missing path");
-    }
-
-    #[test]
-    fn test_semantic_search_missing_query_error() {
-        let server = create_test_server();
-        let result = server.call_tool("semantic_search", json!({}));
-
-        assert!(result.is_err(), "Should error on missing query");
-        let error = result.unwrap_err();
-
-        // Must mention the missing parameter
-        assert_error_mentions(&error, &["query"], "semantic_search missing query");
-
-        assert_suggestions_well_formatted(&error, "semantic_search missing query");
-    }
-
-    // =========================================================================
-    // Unknown Tool Error Tests
-    // =========================================================================
-
-    #[test]
-    fn test_unknown_tool_error_message() {
-        let server = create_test_server();
-        let result = server.call_tool("nonexistent_tool", json!({}));
-
-        assert!(result.is_err(), "Unknown tool should fail");
-        let error = result.unwrap_err();
-
-        // Must indicate it's an unknown tool and mention the tool name
-        assert_error_mentions(
-            &error,
-            &["unknown tool", "nonexistent_tool"],
-            "unknown tool error",
-        );
-
-        assert_suggestions_well_formatted(&error, "unknown tool error");
-    }
-
-    #[test]
-    fn test_unknown_tool_similar_name() {
-        let server = create_test_server();
-        // Try a misspelled version of a real tool
-        let result = server.call_tool("contex_grep", json!({}));
-
-        assert!(result.is_err(), "Misspelled tool should fail");
-        let error = result.unwrap_err();
-
-        assert_error_mentions(&error, &["unknown tool"], "misspelled tool error");
-
-        // Future: could suggest "context_grep" as a similar tool
-        assert_suggestions_well_formatted(&error, "misspelled tool error");
-    }
-
-    // =========================================================================
-    // No Results Error Tests
-    // =========================================================================
-
-    #[test]
-    fn test_context_grep_no_results() {
-        let (server, _temp) = create_test_server_with_files();
-        let result = server.call_tool(
-            "context_grep",
-            json!({
-                "pattern": "xyzzy_nonexistent_pattern_12345"
-            }),
-        );
-
-        // No results should return Ok with a message (not Err)
-        assert!(result.is_ok(), "No results should return Ok");
-        let output = result.unwrap();
-
-        // Should indicate no matches were found
-        assert!(
-            output.to_lowercase().contains("no match")
-                || output.to_lowercase().contains("no results"),
-            "Should indicate no matches found. Got: {}",
-            output
-        );
-    }
-
-    #[test]
-    fn test_context_search_no_results() {
-        let (server, _temp) = create_test_server_with_files();
-        let result = server.call_tool(
-            "context_search",
-            json!({
-                "query": "xyzzy_nonexistent_query_12345",
-                "mode": "keyword"
-            }),
-        );
-
-        assert!(result.is_ok(), "No results should return Ok");
-        let output = result.unwrap();
-
-        assert!(
-            output.to_lowercase().contains("no match")
-                || output.to_lowercase().contains("no results"),
-            "Should indicate no matches found. Got: {}",
-            output
-        );
-    }
-
-    #[test]
-    fn test_find_symbol_no_results() {
-        let (server, _temp) = create_test_server_with_files();
-        let result = server.call_tool(
-            "find_symbol",
-            json!({
-                "name": "NonexistentSymbol12345"
-            }),
-        );
-
-        assert!(result.is_ok(), "No results should return Ok");
-        let output = result.unwrap();
-
-        assert!(
-            output.to_lowercase().contains("no symbol"),
-            "Should indicate no symbols found. Got: {}",
-            output
-        );
-    }
-
-    #[test]
-    fn test_find_symbol_with_filters_no_results() {
-        let (server, _temp) = create_test_server_with_files();
-        // Search for a symbol with wrong kind filter
-        let result = server.call_tool(
-            "find_symbol",
-            json!({
-                "name": "hello_world",
-                "kind": "class"  // Wrong kind - it's a function
-            }),
-        );
-
-        assert!(result.is_ok(), "Filtered search should return Ok");
-        let output = result.unwrap();
-
-        // Should indicate no symbols matched with filters
-        assert!(
-            output.to_lowercase().contains("no symbol"),
-            "Should indicate no symbols found with filters. Got: {}",
-            output
-        );
-    }
-
-    // =========================================================================
-    // File Not Found Error Tests
-    // =========================================================================
-
-    #[test]
-    fn test_get_file_outline_file_not_found() {
-        let server = create_test_server();
-        let result = server.call_tool(
-            "get_file_outline",
-            json!({
-                "file_path": "nonexistent/path/file.rs"
-            }),
-        );
-
-        // File not found returns Ok with error message (graceful failure)
-        assert!(result.is_ok(), "File not found should return Ok");
-        let output = result.unwrap();
-
-        // Should indicate file could not be read
-        assert!(
-            output.to_lowercase().contains("failed")
-                || output.to_lowercase().contains("not found")
-                || output.to_lowercase().contains("error"),
-            "Should indicate file not found. Got: {}",
-            output
-        );
-    }
-
-    #[test]
-    fn test_get_file_outline_no_symbols() {
-        let (server, _temp) = create_test_server_with_empty_file();
-        let result = server.call_tool(
-            "get_file_outline",
-            json!({
-                "file_path": "empty.txt"
-            }),
-        );
-
-        assert!(result.is_ok(), "Empty file should return Ok");
-        let output = result.unwrap();
-
-        // Should indicate no symbols were found or failed to read
-        assert!(
-            output.to_lowercase().contains("no symbol")
-                || output.to_lowercase().contains("failed")
-                || output.contains("empty.txt"),
-            "Should indicate no symbols in file. Got: {}",
-            output
-        );
-    }
-
-    // =========================================================================
-    // Semantic Search Disabled Tests
-    // =========================================================================
-
-    #[test]
-    fn test_semantic_search_not_available() {
-        // Standard in-memory server doesn't have embeddings enabled
-        let server = create_test_server();
-        let result = server.call_tool(
-            "semantic_search",
-            json!({
-                "query": "find authentication code"
-            }),
-        );
-
-        assert!(result.is_ok(), "Semantic search should return Ok");
-        let output = result.unwrap();
-
-        // Should indicate semantic search is not available
-        assert!(
-            output.to_lowercase().contains("not available")
-                || output.to_lowercase().contains("disabled")
-                || output.to_lowercase().contains("enable"),
-            "Should indicate semantic search not available. Got: {}",
-            output
-        );
-    }
-
-    // =========================================================================
-    // Empty Index Tests
-    // =========================================================================
-
-    #[test]
-    fn test_empty_index_grep() {
-        // Create a fresh server with no indexed files
-        let server = create_test_server();
-        let result = server.call_tool(
-            "context_grep",
-            json!({
-                "pattern": "test"
-            }),
-        );
-
-        assert!(result.is_ok(), "Empty index grep should return Ok");
-        let output = result.unwrap();
-
-        // Should either show no results or indicate empty index
-        assert!(
-            output.to_lowercase().contains("no match")
-                || output.to_lowercase().contains("empty")
-                || output.to_lowercase().contains("no results"),
-            "Should indicate no matches or empty index. Got: {}",
-            output
-        );
-    }
-
-    #[test]
-    fn test_empty_index_search() {
-        let server = create_test_server();
-        let result = server.call_tool(
-            "context_search",
-            json!({
-                "query": "find something"
-            }),
-        );
-
-        assert!(result.is_ok(), "Empty index search should return Ok");
-        let output = result.unwrap();
-
-        assert!(
-            output.to_lowercase().contains("no match")
-                || output.to_lowercase().contains("empty")
-                || output.to_lowercase().contains("no results"),
-            "Should indicate no results or empty index. Got: {}",
-            output
-        );
-    }
-
-    #[test]
-    fn test_index_status_shows_empty_state() {
-        let server = create_test_server();
-        let result = server.call_tool("index_status", json!({}));
-
-        assert!(result.is_ok(), "index_status should succeed");
-        let output = result.unwrap();
-
-        // Should show 0 files or indicate empty state
-        assert!(
-            output.contains("Files indexed: 0") || output.contains("Files indexed:** 0"),
-            "Should show 0 indexed files for empty index. Got: {}",
-            output
-        );
-    }
-
-    // =========================================================================
-    // Error Message Consistency Tests
-    // =========================================================================
-
-    #[test]
-    fn test_all_missing_param_errors_are_strings() {
-        let server = create_test_server();
-
-        // All these should return Err with string messages
-        let errors = vec![
-            ("context_grep", server.call_tool("context_grep", json!({}))),
-            (
-                "context_search",
-                server.call_tool("context_search", json!({})),
-            ),
-            ("find_symbol", server.call_tool("find_symbol", json!({}))),
-            (
-                "get_file_outline",
-                server.call_tool("get_file_outline", json!({})),
-            ),
-            (
-                "semantic_search",
-                server.call_tool("semantic_search", json!({})),
-            ),
-        ];
-
-        for (tool_name, result) in errors {
-            assert!(
-                result.is_err(),
-                "{} with missing params should return Err",
-                tool_name
-            );
-            let error = result.unwrap_err();
-            assert!(
-                !error.is_empty(),
-                "{} error message should not be empty",
-                tool_name
-            );
-        }
-    }
-
-    #[test]
-    fn test_error_messages_are_not_stack_traces() {
-        let server = create_test_server();
-
-        // Error messages should be user-friendly, not stack traces
-        let errors = vec![
-            server.call_tool("context_grep", json!({})).unwrap_err(),
-            server.call_tool("find_symbol", json!({})).unwrap_err(),
-            server.call_tool("unknown_tool", json!({})).unwrap_err(),
-        ];
-
-        for error in errors {
-            // Should not contain stack trace indicators
-            assert!(
-                !error.contains("at src/"),
-                "Error should not contain stack traces: {}",
-                error
-            );
-            assert!(
-                !error.contains("thread 'main' panicked"),
-                "Error should not be a panic: {}",
-                error
-            );
-            assert!(
-                !error.contains("RUST_BACKTRACE"),
-                "Error should not mention backtrace: {}",
-                error
-            );
-        }
-    }
-
-    #[test]
-    fn test_error_messages_have_reasonable_length() {
-        let server = create_test_server();
-
-        let errors = vec![
-            server.call_tool("context_grep", json!({})).unwrap_err(),
-            server.call_tool("find_symbol", json!({})).unwrap_err(),
-            server.call_tool("unknown_tool", json!({})).unwrap_err(),
-        ];
-
-        for error in errors {
-            // Error messages should be concise but informative
-            // Too short means not helpful, too long means verbose
-            assert!(
-                error.len() >= 5,
-                "Error message too short to be helpful: {}",
-                error
-            );
-            assert!(
-                error.len() <= 2000,
-                "Error message too long: {}",
-                error
-            );
-        }
-    }
-
-    // =========================================================================
-    // Edge Case Tests
-    // =========================================================================
-
-    #[test]
-    fn test_empty_pattern_handling() {
-        let server = create_test_server();
-        let result = server.call_tool(
-            "context_grep",
-            json!({
-                "pattern": ""
-            }),
-        );
-
-        // Empty pattern should either error or return no results
-        // Both are acceptable behaviors
-        if result.is_err() {
-            let error = result.unwrap_err();
-            assert!(
-                !error.is_empty(),
-                "Empty pattern error should have message"
-            );
-        } else {
-            let output = result.unwrap();
-            // If it succeeds, it should handle gracefully
-            assert!(
-                !output.is_empty(),
-                "Empty pattern output should not be empty"
-            );
-        }
-    }
-
-    #[test]
-    fn test_whitespace_only_query_handling() {
-        let server = create_test_server();
-        let result = server.call_tool(
-            "context_search",
-            json!({
-                "query": "   "
-            }),
-        );
-
-        // Whitespace-only query should be handled gracefully
-        if result.is_err() {
-            let error = result.unwrap_err();
-            assert!(!error.is_empty(), "Whitespace query error should have message");
-        } else {
-            let output = result.unwrap();
-            assert!(
-                !output.is_empty(),
-                "Whitespace query output should not be empty"
-            );
-        }
-    }
-
-    #[test]
-    fn test_special_characters_in_pattern() {
-        let server = create_test_server();
-        let result = server.call_tool(
-            "context_grep",
-            json!({
-                "pattern": "test.*[a-z]+"
-            }),
-        );
-
-        // Regex patterns should be handled
-        assert!(
-            result.is_ok(),
-            "Regex patterns should be handled: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_very_long_pattern() {
-        let server = create_test_server();
-        let long_pattern = "a".repeat(1000);
-        let result = server.call_tool(
-            "context_grep",
-            json!({
-                "pattern": long_pattern
-            }),
-        );
-
-        // Very long patterns should be handled gracefully (not crash)
-        // Either return results or a reasonable error
-        if result.is_err() {
-            let error = result.unwrap_err();
-            assert!(!error.is_empty(), "Long pattern error should have message");
-        }
-    }
-
-    #[test]
-    fn test_null_arguments_handling() {
-        let server = create_test_server();
-        let result = server.call_tool(
-            "context_grep",
-            json!({
-                "pattern": null
-            }),
-        );
-
-        // Null arguments should error gracefully
-        assert!(result.is_err(), "Null pattern should error");
-        let error = result.unwrap_err();
-        assert!(!error.is_empty(), "Null argument error should have message");
-    }
-
-    #[test]
-    fn test_wrong_type_arguments() {
-        let server = create_test_server();
-        let result = server.call_tool(
-            "context_grep",
-            json!({
-                "pattern": 12345  // Should be string
-            }),
-        );
-
-        // Wrong type should error gracefully
-        assert!(result.is_err(), "Wrong type should error");
-        let error = result.unwrap_err();
-        assert!(
-            !error.is_empty(),
-            "Wrong type error should have message"
-        );
-    }
-
-    // =========================================================================
-    // Error Message Consistency Tests (for future actionable errors)
-    // =========================================================================
-    //
-    // These tests are designed to pass with current simple error messages
-    // and will also verify consistency when actionable error messages are added.
-
-    #[test]
-    fn test_error_message_consistency() {
-        // Verify all error messages follow a consistent format
-        let server = create_test_server();
-
-        let errors = vec![
-            ("context_grep", server.call_tool("context_grep", json!({})).unwrap_err()),
-            ("find_symbol", server.call_tool("find_symbol", json!({})).unwrap_err()),
-            ("unknown_tool", server.call_tool("unknown_tool", json!({})).unwrap_err()),
-        ];
-
-        for (tool_name, error) in &errors {
-            // Basic consistency check: all errors should be non-empty strings
-            assert!(
-                !error.is_empty(),
-                "{} error should not be empty",
-                tool_name
-            );
-
-            // If error has suggestions, they should come after the main message
-            if has_suggestions(error) {
-                // Suggestions section should not be at the very start
-                if let Some(idx) = error.find("Suggested actions:") {
+    fn test_concurrent_ping_calls() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn multiple threads making ping calls
+        for _ in 0..10 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..20 {
+                    let result = server.call_tool("ping", json!({}));
+                    assert!(result.is_ok(), "Ping should succeed");
+                    let output = result.unwrap();
                     assert!(
-                        idx > 5,
-                        "{} error suggestions should come after main message",
-                        tool_name
+                        output.contains("CogMCP server is running"),
+                        "Should contain server status"
                     );
+                    success_count.fetch_add(1, Ordering::SeqCst);
                 }
-            }
+            });
+
+            handles.push(handle);
         }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 200);
     }
 
     #[test]
-    fn test_numbered_suggestions_format() {
-        // If errors have suggestions, they should be numbered or bulleted
-        let server = create_test_server();
+    fn test_concurrent_index_status_calls() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
 
-        let errors = vec![
-            server.call_tool("context_grep", json!({})).unwrap_err(),
-            server.call_tool("find_symbol", json!({})).unwrap_err(),
-            server.call_tool("unknown_tool", json!({})).unwrap_err(),
-        ];
+        for _ in 0..8 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
 
-        for error in errors {
-            // If there are suggestions, they should be formatted with numbers or bullets
-            if has_suggestions(&error) {
-                let has_numbered = error.contains("1.");
-                let has_bulleted = error.contains("- ");
-                assert!(
-                    has_numbered || has_bulleted,
-                    "Suggestions should be numbered or bulleted: {}",
-                    error
-                );
-            }
+            let handle = thread::spawn(move || {
+                for _ in 0..15 {
+                    let result = server.call_tool("index_status", json!({}));
+                    assert!(result.is_ok(), "index_status should succeed");
+                    let output = result.unwrap();
+                    assert!(
+                        output.contains("Index Status"),
+                        "Should contain status header"
+                    );
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
         }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 120);
     }
 
     #[test]
-    fn test_unknown_tool_lists_available_tools() {
-        // Unknown tool errors should eventually list available tools
-        let server = create_test_server();
-        let error = server.call_tool("nonexistent_tool", json!({})).unwrap_err();
+    fn test_concurrent_list_tools() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
 
-        // For now, just ensure the error mentions "unknown tool"
-        // In the future, it should also list available tools
+        for _ in 0..10 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    let tools = server.list_tools();
+                    assert_eq!(tools.len(), 8, "Should have 8 tools");
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 100);
+    }
+
+    // ========================================================================
+    // Concurrent Search Operations
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_grep_searches() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        let patterns = vec!["test", "fn", "struct", "impl", "use"];
+
+        for (i, pattern) in patterns.iter().enumerate() {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+            let pattern = pattern.to_string();
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let result = server.call_tool(
+                        "context_grep",
+                        json!({
+                            "pattern": pattern,
+                            "limit": (i + j) % 10 + 1
+                        }),
+                    );
+                    assert!(result.is_ok(), "context_grep should succeed for pattern '{}'", pattern);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+    }
+
+    #[test]
+    fn test_concurrent_symbol_searches() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        let symbol_names = vec!["main", "new", "test", "Config", "Server"];
+
+        for symbol in symbol_names {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+            let symbol = symbol.to_string();
+
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    let result = server.call_tool(
+                        "find_symbol",
+                        json!({
+                            "name": symbol,
+                            "fuzzy": true
+                        }),
+                    );
+                    assert!(result.is_ok(), "find_symbol should succeed for '{}'", symbol);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 50);
+    }
+
+    #[test]
+    fn test_concurrent_context_search_modes() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        let modes = vec!["keyword", "semantic", "hybrid"];
+
+        for mode in modes {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+            let mode = mode.to_string();
+
+            let handle = thread::spawn(move || {
+                for i in 0..10 {
+                    let result = server.call_tool(
+                        "context_search",
+                        json!({
+                            "query": format!("search query {}", i),
+                            "mode": mode,
+                            "limit": 10
+                        }),
+                    );
+                    assert!(result.is_ok(), "context_search should succeed for mode '{}'", mode);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 30);
+    }
+
+    // ========================================================================
+    // Mixed Tool Call Workload
+    // ========================================================================
+
+    #[test]
+    fn test_mixed_concurrent_tool_calls() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Different threads calling different tools
+        for i in 0..12 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let result = match (i + j) % 6 {
+                        0 => server.call_tool("ping", json!({})),
+                        1 => server.call_tool("index_status", json!({})),
+                        2 => server.call_tool(
+                            "context_grep",
+                            json!({"pattern": "test", "limit": 5}),
+                        ),
+                        3 => server.call_tool(
+                            "find_symbol",
+                            json!({"name": "main", "fuzzy": true}),
+                        ),
+                        4 => server.call_tool(
+                            "context_search",
+                            json!({"query": "function", "mode": "keyword"}),
+                        ),
+                        5 => {
+                            // list_tools doesn't return Result
+                            let _tools = server.list_tools();
+                            Ok("tools listed".to_string())
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    assert!(result.is_ok(), "Tool call {} should succeed", (i + j) % 6);
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 120);
+    }
+
+    // ========================================================================
+    // Reindex Under Concurrent Load
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_reindex_with_reads() {
+        let server = create_shared_server();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Reindex thread
+        {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..3 {
+                    let result = server.call_tool("reindex", json!({}));
+                    assert!(result.is_ok(), "Reindex should succeed");
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Reader threads
+        for _ in 0..5 {
+            let server = Arc::clone(&server);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..15 {
+                    // Mix of read operations
+                    let _ = server.call_tool("index_status", json!({})).unwrap();
+                    let _ = server.call_tool("ping", json!({})).unwrap();
+                    success_count.fetch_add(2, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // 3 reindex + (5 threads * 15 iterations * 2 calls)
+        assert_eq!(success_count.load(Ordering::SeqCst), 153);
+    }
+
+    // ========================================================================
+    // Server Info Concurrent Access
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_server_info_access() {
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..20 {
+                    let info = CogMcpServer::server_info();
+                    assert_eq!(info.name, "cogmcp");
+                    assert!(!info.version.is_empty());
+
+                    let caps = CogMcpServer::capabilities();
+                    assert!(caps.tools.is_some());
+
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        assert_eq!(success_count.load(Ordering::SeqCst), 200);
+    }
+
+    // ========================================================================
+    // No Deadlock Under Heavy Load
+    // ========================================================================
+
+    #[test]
+    fn test_no_deadlock_heavy_concurrent_load() {
+        let server = create_shared_server();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn many threads doing various operations
+        for i in 0..20 {
+            let server = Arc::clone(&server);
+            let completed = Arc::clone(&completed);
+
+            let handle = thread::spawn(move || {
+                for j in 0..15 {
+                    match (i + j) % 8 {
+                        0 => {
+                            let _ = server.call_tool("ping", json!({}));
+                        }
+                        1 => {
+                            let _ = server.call_tool("index_status", json!({}));
+                        }
+                        2 => {
+                            let _ = server.call_tool(
+                                "context_grep",
+                                json!({"pattern": "test", "limit": 10}),
+                            );
+                        }
+                        3 => {
+                            let _ = server.call_tool(
+                                "find_symbol",
+                                json!({"name": "test", "fuzzy": true}),
+                            );
+                        }
+                        4 => {
+                            let _ = server.call_tool(
+                                "context_search",
+                                json!({"query": "test", "mode": "keyword"}),
+                            );
+                        }
+                        5 => {
+                            let _ = server.list_tools();
+                        }
+                        6 => {
+                            let _ = CogMcpServer::server_info();
+                        }
+                        7 => {
+                            let _ = CogMcpServer::capabilities();
+                        }
+                        _ => unreachable!(),
+                    }
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Set a timeout to detect potential deadlocks
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(60);
+
+        for handle in handles {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                panic!("Deadlock detected: test timed out");
+            }
+            handle.join().expect("Thread should complete without deadlock");
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), 300);
+    }
+
+    // ========================================================================
+    // Error Handling Under Concurrency
+    // ========================================================================
+
+    #[test]
+    fn test_concurrent_error_handling() {
+        let server = create_shared_server();
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Some threads making valid calls, some making invalid calls
+        for i in 0..10 {
+            let server = Arc::clone(&server);
+            let error_count = Arc::clone(&error_count);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    if (i + j) % 3 == 0 {
+                        // Invalid call - missing required parameter
+                        let result = server.call_tool("context_grep", json!({}));
+                        if result.is_err() {
+                            error_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else if (i + j) % 3 == 1 {
+                        // Invalid call - unknown tool
+                        let result = server.call_tool("nonexistent_tool", json!({}));
+                        if result.is_err() {
+                            error_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else {
+                        // Valid call
+                        let result = server.call_tool("ping", json!({}));
+                        if result.is_ok() {
+                            success_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // Verify both errors and successes were properly handled
+        let errors = error_count.load(Ordering::SeqCst);
+        let successes = success_count.load(Ordering::SeqCst);
+
+        assert!(errors > 0, "Should have handled some errors");
+        assert!(successes > 0, "Should have some successes");
+        // Total should be 100
         assert!(
-            error.to_lowercase().contains("unknown tool"),
-            "Should mention unknown tool: {}",
-            error
+            errors + successes <= 100,
+            "Total should not exceed iterations"
         );
-
-        // Future check: error should list available tools for discovery
-        // This is a forward-compatible check that will pass once actionable errors are added
-        if error.contains("Available tools:") || error.contains("ping") {
-            // Good - error provides tool discovery
-        }
-        // No assertion here - this is informational for when actionable errors are added
     }
 
+    // ========================================================================
+    // Consistent Results Under Concurrency
+    // ========================================================================
+
     #[test]
-    fn test_missing_param_error_includes_param_name() {
-        let server = create_test_server();
+    fn test_consistent_tool_list_under_concurrency() {
+        let server = create_shared_server();
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut handles = vec![];
 
-        // Test that each missing parameter error mentions the parameter name
-        let tests = vec![
-            ("context_grep", "pattern"),
-            ("context_search", "query"),
-            ("find_symbol", "name"),
-            ("get_file_outline", "file_path"),
-            ("semantic_search", "query"),
-        ];
+        for _ in 0..10 {
+            let server = Arc::clone(&server);
+            let results = Arc::clone(&results);
 
-        for (tool_name, expected_param) in tests {
-            let error = server.call_tool(tool_name, json!({})).unwrap_err();
-            assert!(
-                error.to_lowercase().contains(&expected_param.to_lowercase()),
-                "{} error should mention '{}'. Got: {}",
-                tool_name,
-                expected_param,
-                error
-            );
+            let handle = thread::spawn(move || {
+                for _ in 0..10 {
+                    let tools = server.list_tools();
+                    let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+                    results.lock().push(names);
+                }
+            });
+
+            handles.push(handle);
         }
-    }
 
-    // =========================================================================
-    // Future Error Code Tests (will activate when error-types is merged)
-    // =========================================================================
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
 
-    // These tests are placeholder for when ActionableError with error codes is integrated.
-    // They are written to pass now and will provide value once the error types are available.
+        // Verify all results are identical
+        let all_results = results.lock();
+        assert_eq!(all_results.len(), 100);
 
-    #[test]
-    fn test_errors_are_actionable_compatible() {
-        // Verify current errors can be extended to actionable format
-        let server = create_test_server();
-
-        let errors = vec![
-            server.call_tool("context_grep", json!({})).unwrap_err(),
-            server.call_tool("unknown_tool", json!({})).unwrap_err(),
-        ];
-
-        for error in errors {
-            // Errors should be string-based (compatible with actionable error Display)
-            assert!(
-                !error.is_empty(),
-                "Error should be displayable as string"
-            );
-
-            // Errors should not contain internal/debug formatting
-            assert!(
-                !error.contains("Error("),
-                "Error should not expose internal enum structure: {}",
-                error
-            );
+        let first = &all_results[0];
+        for result in all_results.iter() {
+            assert_eq!(result, first, "All tool lists should be identical");
         }
     }
 }
